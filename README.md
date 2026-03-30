@@ -12,7 +12,7 @@ Current capabilities include:
 - Space, search, page, blog, attachment, label, comment, and property commands
 - Markdown-backed `pull`, `plan`, and `apply` workflows
 - Local frontmatter plus sidecar metadata for sync safety
-- Confluence-aware Markdown conversion for headings, lists, tables, task lists, attachment links/images, page links, user mentions, panel macros, and code macros
+- Confluence-aware Markdown conversion for headings, lists, tables, task lists, attachment links/images, page links, user mentions, panel macros, expand macros, and code macros
 
 ## Installation
 
@@ -82,9 +82,9 @@ make test-e2e
 ## Notes
 
 - Remote canonical content format is Confluence storage format.
-- Markdown conversion now covers common editable storage content directly, including page links, user mentions, panel macros, and code macros; unsupported Confluence XML is preserved as raw storage blocks instead of forcing whole-page raw exports.
+- Markdown conversion now covers common editable storage content directly, including page links, user mentions, panel macros, expand macros, and code macros; unsupported Confluence XML is preserved as raw storage blocks instead of forcing whole-page raw exports.
 - The ignored e2e lifecycle suite now runs against real Cloud and Data Center instances, including untouched `pull -> plan`, untouched `pull -> apply`, and fresh local-link reconciliation cases.
-- The main remaining fidelity gap is richer Confluence-aware conversion for page layouts and other advanced macros beyond the currently supported page-link, mention, panel, and code cases; unsupported nodes are preserved safely rather than rendered into editable Markdown.
+- The main remaining fidelity gap is richer Confluence-aware conversion for page layouts and other advanced macros beyond the currently supported page-link, mention, panel, expand, and code cases; unsupported nodes are preserved safely rather than rendered into editable Markdown.
 
 ## License
 

@@ -503,6 +503,9 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "code" {
         return render_code_macro_block(node);
     }
+    if name == "expand" {
+        return render_expand_macro_block(node, source);
+    }
     if !matches!(name, "info" | "note" | "tip" | "warning") {
         return Some(confluence_raw_block(raw_xml_fragment(node, source)));
     }
@@ -515,6 +518,29 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
             ":::confluence-{name}\n{}\n:::",
             body_markdown.trim()
         ))
+    }
+}
+
+fn render_expand_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let parameters = collect_macro_parameters(node);
+    if parameters.keys().any(|name| name != "title") {
+        return Some(confluence_raw_block(raw_xml_fragment(node, source)));
+    }
+    let title = parameters
+        .get("title")
+        .map(|value| value.trim())
+        .unwrap_or("");
+    let body = namespaced_child(node, AC_NS, "rich-text-body")?;
+    let body_markdown = storage_to_markdown(&inner_xml_fragment(body, source));
+    let header = if title.is_empty() {
+        ":::confluence-expand".to_string()
+    } else {
+        format!(":::confluence-expand {title}")
+    };
+    if body_markdown.trim().is_empty() {
+        Some(format!("{header}\n:::"))
+    } else {
+        Some(format!("{header}\n{}\n:::", body_markdown.trim()))
     }
 }
 
@@ -1006,16 +1032,47 @@ fn replace_confluence_macro_blocks(
     }
     normalized.push_str(&markdown[last..]);
 
-    let code_macro_re = Regex::new(
-        r"(?ms)^~~~confluence-code(?:[ \t]+([^\n~]+))?[ \t]*\n(.*?)\n~~~[ \t]*(?:\n|$)",
+    let expand_macro_re = Regex::new(
+        r"(?ms)^:::confluence-expand(?:[ \t]+([^\n]+))?[ \t]*\n(.*?)\n:::[ \t]*(?:\n|$)",
     )?;
-    let mut code_normalized = String::with_capacity(normalized.len());
+    let mut expanded = String::with_capacity(normalized.len());
     last = 0;
-    for captures in code_macro_re.captures_iter(&normalized) {
+    for captures in expand_macro_re.captures_iter(&normalized) {
         let Some(full_match) = captures.get(0) else {
             continue;
         };
-        code_normalized.push_str(&normalized[last..full_match.start()]);
+        expanded.push_str(&normalized[last..full_match.start()]);
+        let title = captures.get(1).map(|m| m.as_str().trim());
+        let body_markdown = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let body_storage = markdown_to_storage(body_markdown, allow_lossy)?.storage;
+        let idx = fragments.len();
+        let title_param = title
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                format!(
+                    r#"<ac:parameter ac:name="title">{}</ac:parameter>"#,
+                    escape_xml(value)
+                )
+            })
+            .unwrap_or_default();
+        fragments.push(format!(
+            r#"<ac:structured-macro ac:name="expand">{title_param}<ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:structured-macro>"#
+        ));
+        expanded.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
+        last = full_match.end();
+    }
+    expanded.push_str(&normalized[last..]);
+
+    let code_macro_re = Regex::new(
+        r"(?ms)^~~~confluence-code(?:[ \t]+([^\n~]+))?[ \t]*\n(.*?)\n~~~[ \t]*(?:\n|$)",
+    )?;
+    let mut code_normalized = String::with_capacity(expanded.len());
+    last = 0;
+    for captures in code_macro_re.captures_iter(&expanded) {
+        let Some(full_match) = captures.get(0) else {
+            continue;
+        };
+        code_normalized.push_str(&expanded[last..full_match.start()]);
         let language = captures.get(1).map(|m| m.as_str().trim());
         let block_body = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
         let (parameters, code) = parse_code_macro_block(language, block_body)?;
@@ -1024,7 +1081,7 @@ fn replace_confluence_macro_blocks(
         code_normalized.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
         last = full_match.end();
     }
-    code_normalized.push_str(&normalized[last..]);
+    code_normalized.push_str(&expanded[last..]);
 
     Ok((code_normalized, fragments))
 }
@@ -1330,6 +1387,15 @@ mod tests {
     }
 
     #[test]
+    fn expand_macros_export_to_expand_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">Details</ac:parameter><ac:rich-text-body><p>Hello</p><ul><li>World</li></ul></ac:rich-text-body></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-expand Details"));
+        assert!(markdown.contains("Hello"));
+        assert!(markdown.contains("- World"));
+    }
+
+    #[test]
     fn macro_blocks_round_trip_back_to_structured_macros() {
         let markdown = ":::confluence-warning\n## Heads up\n\nBody text.\n:::";
         let rendered = markdown_to_storage(markdown, false).expect("macro block converts");
@@ -1337,6 +1403,25 @@ mod tests {
             rendered
                 .storage
                 .contains(r#"<ac:structured-macro ac:name="warning">"#)
+        );
+        assert!(rendered.storage.contains("<ac:rich-text-body>"));
+        assert!(rendered.storage.contains("<h2>Heads up</h2>"));
+        assert!(rendered.storage.contains("<p>Body text.</p>"));
+    }
+
+    #[test]
+    fn expand_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-expand Details\n## Heads up\n\nBody text.\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("expand block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="expand">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="title">Details</ac:parameter>"#)
         );
         assert!(rendered.storage.contains("<ac:rich-text-body>"));
         assert!(rendered.storage.contains("<h2>Heads up</h2>"));
