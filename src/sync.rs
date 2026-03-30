@@ -9,9 +9,10 @@ use regex::Regex;
 use walkdir::WalkDir;
 
 use crate::markdown::{
-    Frontmatter, LocalDocument, PageLinkPlaceholder, Sidecar, document_dir_name, load_document,
-    markdown_to_storage, parse_page_placeholder_url, save_document, scan_local_documents,
-    sha256_hex, storage_to_markdown,
+    Frontmatter, LocalDocument, PageLinkPlaceholder, Sidecar, UserMentionPlaceholder,
+    document_dir_name, load_document, markdown_to_storage, parse_page_placeholder_url,
+    parse_user_placeholder_url, save_document, scan_local_documents, sha256_hex,
+    storage_to_markdown,
 };
 use crate::model::{AttachmentState, ContentItem, ContentKind, PlanActionKind, PlanItem, SyncPlan};
 use crate::provider::ConfluenceProvider;
@@ -579,7 +580,7 @@ fn rewrite_local_links_to_remote(
     link_index: &LinkIndex,
     web_path_prefix: &str,
 ) -> String {
-    let rewritten_placeholders = rewrite_placeholder_page_links_to_storage(storage);
+    let rewritten_placeholders = rewrite_placeholder_links_to_storage(storage);
     let link_re = Regex::new(r#"<a([^>]*?)href="([^"]+)"([^>]*)>"#).expect("valid anchor regex");
     let image_re = Regex::new(r#"<img([^>]*?)src="([^"]+)"([^>]*)>"#).expect("valid image regex");
 
@@ -609,6 +610,9 @@ fn rewrite_local_target_url(
 ) -> Option<String> {
     if let Some(link) = parse_page_placeholder_url(target) {
         return placeholder_to_remote_url(&link, web_path_prefix);
+    }
+    if parse_user_placeholder_url(target).is_some() {
+        return None;
     }
     if !is_local_target(target) {
         return None;
@@ -873,9 +877,10 @@ fn rewrite_attachment_links(
     rewritten
 }
 
-fn rewrite_placeholder_page_links_to_storage(storage: &str) -> String {
-    let re = Regex::new(r#"(?s)<a([^>]*?)href="(confluence-page://page[^"]+)"([^>]*)>(.*?)</a>"#)
-        .expect("valid placeholder link regex");
+fn rewrite_placeholder_links_to_storage(storage: &str) -> String {
+    let re =
+        Regex::new(r#"(?s)<a([^>]*?)href="(confluence-(?:page|user)://[^"]+)"([^>]*)>(.*?)</a>"#)
+            .expect("valid placeholder link regex");
     re.replace_all(storage, |captures: &regex::Captures<'_>| {
         let target = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
         let body = captures.get(4).map(|m| m.as_str()).unwrap_or_default();
@@ -885,30 +890,55 @@ fn rewrite_placeholder_page_links_to_storage(storage: &str) -> String {
 }
 
 fn placeholder_to_storage_macro(target: &str, body_html: &str) -> Option<String> {
-    let placeholder = parse_page_placeholder_url(target)?;
-    let anchor_attr = placeholder
-        .anchor
-        .as_deref()
-        .map(|anchor| format!(r#" ac:anchor="{}""#, escape_xml_attr(anchor)))
-        .unwrap_or_default();
-    let resource = if let Some(title) = placeholder.content_title.as_deref() {
-        let mut attrs = vec![format!(r#"ri:content-title="{}""#, escape_xml_attr(title))];
-        if let Some(space_key) = placeholder.space_key.as_deref() {
-            attrs.push(format!(r#"ri:space-key="{}""#, escape_xml_attr(space_key)));
-        }
-        format!(r#"<ri:page {} />"#, attrs.join(" "))
-    } else if let Some(content_id) = placeholder.content_id.as_deref() {
-        format!(
-            r#"<ri:page ri:content-id="{}" />"#,
-            escape_xml_attr(content_id)
-        )
-    } else {
-        return None;
-    };
+    if let Some(placeholder) = parse_page_placeholder_url(target) {
+        let anchor_attr = placeholder
+            .anchor
+            .as_deref()
+            .map(|anchor| format!(r#" ac:anchor="{}""#, escape_xml_attr(anchor)))
+            .unwrap_or_default();
+        let resource = if let Some(title) = placeholder.content_title.as_deref() {
+            let mut attrs = vec![format!(r#"ri:content-title="{}""#, escape_xml_attr(title))];
+            if let Some(space_key) = placeholder.space_key.as_deref() {
+                attrs.push(format!(r#"ri:space-key="{}""#, escape_xml_attr(space_key)));
+            }
+            format!(r#"<ri:page {} />"#, attrs.join(" "))
+        } else if let Some(content_id) = placeholder.content_id.as_deref() {
+            format!(
+                r#"<ri:page ri:content-id="{}" />"#,
+                escape_xml_attr(content_id)
+            )
+        } else {
+            return None;
+        };
+        let body = build_storage_link_body(body_html);
+        return Some(format!(
+            r#"<ac:link{anchor_attr}>{resource}{body}</ac:link>"#
+        ));
+    }
+
+    let placeholder = parse_user_placeholder_url(target)?;
+    let resource = user_placeholder_to_storage_resource(&placeholder)?;
     let body = build_storage_link_body(body_html);
-    Some(format!(
-        r#"<ac:link{anchor_attr}>{resource}{body}</ac:link>"#
-    ))
+    Some(format!(r#"<ac:link>{resource}{body}</ac:link>"#))
+}
+
+fn user_placeholder_to_storage_resource(placeholder: &UserMentionPlaceholder) -> Option<String> {
+    if let Some(account_id) = placeholder.account_id.as_deref() {
+        return Some(format!(
+            r#"<ri:user ri:account-id="{}" />"#,
+            escape_xml_attr(account_id)
+        ));
+    }
+    if let Some(user_key) = placeholder.user_key.as_deref() {
+        return Some(format!(
+            r#"<ri:user ri:userkey="{}" />"#,
+            escape_xml_attr(user_key)
+        ));
+    }
+    placeholder
+        .username
+        .as_deref()
+        .map(|username| format!(r#"<ri:user ri:username="{}" />"#, escape_xml_attr(username)))
 }
 
 fn build_storage_link_body(body_html: &str) -> String {
@@ -1060,7 +1090,8 @@ mod tests {
 
     use super::*;
     use crate::markdown::{
-        Frontmatter, PageLinkPlaceholder, Sidecar, build_page_placeholder_url, render_document,
+        Frontmatter, PageLinkPlaceholder, Sidecar, UserMentionPlaceholder,
+        build_page_placeholder_url, build_user_placeholder_url, render_document,
     };
     use crate::model::ProviderKind;
 
@@ -1317,6 +1348,45 @@ mod tests {
         assert!(storage.contains(r#"ri:space-key="MFS""#));
         assert!(
             storage.contains("<ac:plain-text-link-body><![CDATA[Docs]]></ac:plain-text-link-body>")
+        );
+    }
+
+    #[test]
+    fn render_body_storage_rewrites_user_placeholders_back_to_storage_links() {
+        let current_dir = PathBuf::from("/tmp/root/current-page--123");
+        let placeholder = build_user_placeholder_url(&UserMentionPlaceholder {
+            account_id: Some("abc123".to_string()),
+            ..UserMentionPlaceholder::default()
+        });
+        let current = LocalDocument {
+            directory: current_dir.clone(),
+            markdown_path: current_dir.join("index.md"),
+            sidecar_path: current_dir.join(".confluence.json"),
+            frontmatter: Frontmatter {
+                title: "Current".to_string(),
+                kind: "page".to_string(),
+                labels: vec![],
+                status: "current".to_string(),
+                parent: None,
+                properties: BTreeMap::new(),
+            },
+            body_markdown: format!("[@Ruben]({placeholder})\n"),
+            sidecar: Sidecar {
+                content_id: Some("123".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                web_path_prefix: Some("/wiki".to_string()),
+                ..Sidecar::default()
+            },
+        };
+
+        let index = build_link_index(&[current.clone()]);
+        let storage =
+            render_body_storage(&current, &index, false, "/wiki").expect("render body storage");
+
+        assert!(storage.contains(r#"<ri:user ri:account-id="abc123" />"#));
+        assert!(
+            storage
+                .contains("<ac:plain-text-link-body><![CDATA[@Ruben]]></ac:plain-text-link-body>")
         );
     }
 }

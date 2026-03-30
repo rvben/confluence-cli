@@ -86,6 +86,7 @@ pub fn storage_to_markdown(storage: &str) -> String {
 const AC_NS: &str = "urn:confluence-ac";
 const RI_NS: &str = "urn:confluence-ri";
 pub(crate) const CONFLUENCE_PAGE_SCHEME: &str = "confluence-page";
+pub(crate) const CONFLUENCE_USER_SCHEME: &str = "confluence-user";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct PageLinkPlaceholder {
@@ -93,6 +94,13 @@ pub(crate) struct PageLinkPlaceholder {
     pub space_key: Option<String>,
     pub content_title: Option<String>,
     pub anchor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct UserMentionPlaceholder {
+    pub account_id: Option<String>,
+    pub user_key: Option<String>,
+    pub username: Option<String>,
 }
 
 fn storage_to_markdown_xml(storage: &str) -> Option<String> {
@@ -492,6 +500,9 @@ fn render_task_list(node: Node<'_, '_>, source: &str) -> Option<String> {
 
 fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
     let name = node.attribute((AC_NS, "name"))?;
+    if name == "code" {
+        return render_code_macro_block(node);
+    }
     if !matches!(name, "info" | "note" | "tip" | "warning") {
         return Some(confluence_raw_block(raw_xml_fragment(node, source)));
     }
@@ -505,6 +516,32 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
             body_markdown.trim()
         ))
     }
+}
+
+fn render_code_macro_block(node: Node<'_, '_>) -> Option<String> {
+    let code_body = namespaced_child(node, AC_NS, "plain-text-body")?;
+    let code = code_body.text().unwrap_or_default().trim_end_matches('\n');
+    let mut parameters = collect_macro_parameters(node);
+    let language = parameters
+        .remove("language")
+        .filter(|value| !value.is_empty());
+
+    let mut markdown = match language {
+        Some(language) => format!("~~~confluence-code {language}\n"),
+        None => "~~~confluence-code\n".to_string(),
+    };
+    if !parameters.is_empty() {
+        for (name, value) in parameters {
+            markdown.push_str(&format!("{name}: {value}\n"));
+        }
+        markdown.push_str("---\n");
+    }
+    markdown.push_str(code);
+    if !code.is_empty() {
+        markdown.push('\n');
+    }
+    markdown.push_str("~~~");
+    Some(markdown)
 }
 
 fn render_inline_children(node: Node<'_, '_>, source: &str) -> Option<String> {
@@ -617,6 +654,26 @@ fn render_confluence_link(node: Node<'_, '_>, source: &str) -> Option<String> {
             .or_else(|| placeholder.content_id.clone())
             .or_else(|| placeholder.anchor.clone())
             .unwrap_or_else(|| "Confluence page".to_string());
+        return Some(format!("[{}]({target})", label.trim()));
+    }
+
+    if let Some(user) = namespaced_child(node, RI_NS, "user") {
+        let placeholder = UserMentionPlaceholder {
+            account_id: user.attribute((RI_NS, "account-id")).map(ToOwned::to_owned),
+            user_key: user.attribute((RI_NS, "userkey")).map(ToOwned::to_owned),
+            username: user.attribute((RI_NS, "username")).map(ToOwned::to_owned),
+        };
+        let target = build_user_placeholder_url(&placeholder);
+        let label = label
+            .or_else(|| {
+                placeholder
+                    .username
+                    .clone()
+                    .map(|value| format!("@{value}"))
+            })
+            .or_else(|| placeholder.account_id.clone())
+            .or_else(|| placeholder.user_key.clone())
+            .unwrap_or_else(|| "@user".to_string());
         return Some(format!("[{}]({target})", label.trim()));
     }
 
@@ -805,6 +862,23 @@ fn confluence_raw_block(raw: &str) -> String {
     format!("```confluence-storage\n{}\n```", raw.trim())
 }
 
+fn collect_macro_parameters(node: Node<'_, '_>) -> BTreeMap<String, String> {
+    node.children()
+        .filter(|child| {
+            child.is_element()
+                && child.tag_name().namespace() == Some(AC_NS)
+                && child.tag_name().name() == "parameter"
+        })
+        .filter_map(|parameter| {
+            let name = parameter.attribute((AC_NS, "name"))?;
+            Some((
+                name.to_string(),
+                parameter.text().unwrap_or_default().trim().to_string(),
+            ))
+        })
+        .collect()
+}
+
 pub(crate) fn build_page_placeholder_url(link: &PageLinkPlaceholder) -> String {
     let mut url = Url::parse(&format!("{CONFLUENCE_PAGE_SCHEME}://page"))
         .expect("valid confluence page placeholder base");
@@ -853,6 +927,49 @@ pub(crate) fn parse_page_placeholder_url(target: &str) -> Option<PageLinkPlaceho
     }
 }
 
+pub(crate) fn build_user_placeholder_url(link: &UserMentionPlaceholder) -> String {
+    let mut url = Url::parse(&format!("{CONFLUENCE_USER_SCHEME}://user"))
+        .expect("valid confluence user placeholder base");
+    {
+        let mut pairs = url.query_pairs_mut();
+        if let Some(account_id) = &link.account_id {
+            pairs.append_pair("account-id", account_id);
+        }
+        if let Some(user_key) = &link.user_key {
+            pairs.append_pair("userkey", user_key);
+        }
+        if let Some(username) = &link.username {
+            pairs.append_pair("username", username);
+        }
+    }
+    url.to_string()
+}
+
+pub(crate) fn parse_user_placeholder_url(target: &str) -> Option<UserMentionPlaceholder> {
+    let normalized = target.replace("&amp;", "&");
+    let url = Url::parse(&normalized).ok()?;
+    if url.scheme() != CONFLUENCE_USER_SCHEME || url.host_str() != Some("user") {
+        return None;
+    }
+    let mut placeholder = UserMentionPlaceholder::default();
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "account-id" => placeholder.account_id = Some(value.into_owned()),
+            "userkey" => placeholder.user_key = Some(value.into_owned()),
+            "username" => placeholder.username = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    if placeholder.account_id.is_none()
+        && placeholder.user_key.is_none()
+        && placeholder.username.is_none()
+    {
+        None
+    } else {
+        Some(placeholder)
+    }
+}
+
 fn raw_xml_fragment<'a>(node: Node<'_, 'a>, source: &'a str) -> &'a str {
     &source[node.range()]
 }
@@ -867,12 +984,12 @@ fn replace_confluence_macro_blocks(
     markdown: &str,
     allow_lossy: bool,
 ) -> Result<(String, Vec<String>)> {
-    let macro_re =
+    let panel_macro_re =
         Regex::new(r"(?ms)^:::confluence-(info|note|tip|warning)[ \t]*\n(.*?)\n:::[ \t]*(?:\n|$)")?;
     let mut fragments = Vec::new();
     let mut normalized = String::with_capacity(markdown.len());
     let mut last = 0;
-    for captures in macro_re.captures_iter(markdown) {
+    for captures in panel_macro_re.captures_iter(markdown) {
         let Some(full_match) = captures.get(0) else {
             continue;
         };
@@ -888,7 +1005,98 @@ fn replace_confluence_macro_blocks(
         last = full_match.end();
     }
     normalized.push_str(&markdown[last..]);
-    Ok((normalized, fragments))
+
+    let code_macro_re = Regex::new(
+        r"(?ms)^~~~confluence-code(?:[ \t]+([^\n~]+))?[ \t]*\n(.*?)\n~~~[ \t]*(?:\n|$)",
+    )?;
+    let mut code_normalized = String::with_capacity(normalized.len());
+    last = 0;
+    for captures in code_macro_re.captures_iter(&normalized) {
+        let Some(full_match) = captures.get(0) else {
+            continue;
+        };
+        code_normalized.push_str(&normalized[last..full_match.start()]);
+        let language = captures.get(1).map(|m| m.as_str().trim());
+        let block_body = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let (parameters, code) = parse_code_macro_block(language, block_body)?;
+        let idx = fragments.len();
+        fragments.push(build_code_macro_storage(&parameters, &code));
+        code_normalized.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
+        last = full_match.end();
+    }
+    code_normalized.push_str(&normalized[last..]);
+
+    Ok((code_normalized, fragments))
+}
+
+fn parse_code_macro_block(
+    language: Option<&str>,
+    block_body: &str,
+) -> Result<(BTreeMap<String, String>, String)> {
+    let mut parameters = BTreeMap::new();
+    if let Some(language) = language.filter(|value| !value.is_empty()) {
+        parameters.insert("language".to_string(), language.to_string());
+    }
+
+    let trimmed_body = block_body.trim_end_matches('\n');
+    if let Some((header, code)) = trimmed_body.split_once("\n---\n") {
+        let parsed_header = parse_code_macro_header(header)?;
+        for (name, value) in parsed_header {
+            parameters.insert(name, value);
+        }
+        Ok((parameters, code.to_string()))
+    } else {
+        Ok((parameters, trimmed_body.to_string()))
+    }
+}
+
+fn parse_code_macro_header(header: &str) -> Result<BTreeMap<String, String>> {
+    let mut parameters = BTreeMap::new();
+    for line in header.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = trimmed.split_once(':') else {
+            bail!("invalid confluence code macro header line: {trimmed}");
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("invalid confluence code macro header line: {trimmed}");
+        }
+        parameters.insert(name.to_string(), value.trim().to_string());
+    }
+    Ok(parameters)
+}
+
+fn build_code_macro_storage(parameters: &BTreeMap<String, String>, code: &str) -> String {
+    let parameters_xml = parameters
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                r#"<ac:parameter ac:name="{}">{}</ac:parameter>"#,
+                escape_xml(name),
+                escape_xml(value)
+            )
+        })
+        .collect::<String>();
+    let body = wrap_cdata(code);
+    format!(
+        r#"<ac:structured-macro ac:name="code">{parameters_xml}<ac:plain-text-body><![CDATA[{body}]]></ac:plain-text-body></ac:structured-macro>"#
+    )
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn wrap_cdata(value: &str) -> String {
+    value.replace("]]>", "]]]]><![CDATA[>")
 }
 
 fn convert_checkbox_lists_to_task_lists(html: &str) -> String {
@@ -1106,6 +1314,13 @@ mod tests {
     }
 
     #[test]
+    fn user_mentions_export_to_placeholders() {
+        let storage = r#"<p><ac:link><ri:user ri:account-id="abc123" /><ac:plain-text-link-body><![CDATA[@Ruben]]></ac:plain-text-link-body></ac:link></p>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains("[@Ruben](confluence-user://user?account-id=abc123)"));
+    }
+
+    #[test]
     fn supported_panel_macros_export_to_macro_blocks() {
         let storage = r#"<ac:structured-macro ac:name="info"><ac:rich-text-body><p>Hello</p><ul><li>World</li></ul></ac:rich-text-body></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
@@ -1126,6 +1341,65 @@ mod tests {
         assert!(rendered.storage.contains("<ac:rich-text-body>"));
         assert!(rendered.storage.contains("<h2>Heads up</h2>"));
         assert!(rendered.storage.contains("<p>Body text.</p>"));
+    }
+
+    #[test]
+    fn code_macros_export_to_confluence_code_fences() {
+        let storage = r#"<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">rust</ac:parameter><ac:parameter ac:name="title">main.rs</ac:parameter><ac:plain-text-body><![CDATA[fn main() {
+    println!("hello");
+}]]></ac:plain-text-body></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains("~~~confluence-code rust"));
+        assert!(markdown.contains("title: main.rs"));
+        assert!(markdown.contains("---"));
+        assert!(markdown.contains("println!(\"hello\");"));
+    }
+
+    #[test]
+    fn code_macro_fences_round_trip_back_to_structured_macros() {
+        let markdown = r#"~~~confluence-code rust
+title: main.rs
+linenumbers: true
+---
+fn main() {
+    println!("hello");
+}
+~~~"#;
+        let rendered = markdown_to_storage(markdown, false).expect("code macro converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="code">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="language">rust</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="title">main.rs</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="linenumbers">true</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains("<ac:plain-text-body><![CDATA[fn main() {")
+        );
+    }
+
+    #[test]
+    fn code_macro_fences_escape_cdata_terminators() {
+        let markdown = r#"~~~confluence-code sql
+SELECT ']]>' AS sentinel;
+~~~"#;
+        let rendered = markdown_to_storage(markdown, false).expect("code macro converts");
+        assert!(rendered.storage.contains("]]]]><![CDATA[>"));
     }
 
     #[test]
