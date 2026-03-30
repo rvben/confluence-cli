@@ -193,9 +193,3 @@ pub struct PlanItem {
 pub struct SyncPlan {
     pub items: Vec<PlanItem>,
 }
-
-impl SyncPlan {
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-}

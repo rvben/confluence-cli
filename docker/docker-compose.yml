@@ -1,0 +1,36 @@
+name: confluencecli
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: confluence
+      POSTGRES_USER: confluence
+      POSTGRES_PASSWORD: confluence
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U confluence"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  confluence:
+    image: atlassian/confluence:latest
+    ports:
+      - "8090:8090"
+    environment:
+      JVM_MINIMUM_MEMORY: 1024m
+      JVM_MAXIMUM_MEMORY: 2048m
+    volumes:
+      - confluence-data:/var/atlassian/application-data/confluence
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  confluence-data:
+    external: true
+    name: docker_confluence-data
+  postgres-data:
+    name: confluencecli_postgres-data

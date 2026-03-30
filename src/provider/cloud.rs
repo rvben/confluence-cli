@@ -18,7 +18,7 @@ use crate::provider::{
     ConfluenceProvider, HttpClient, Results, V1Attachment, V1Comment, V1Content, V1Label,
     V1Property, V1Space, V1SpaceRef, V2Page, build_search_cql, ensure_writable, fetch_all_v1,
     normalize_properties, parse_datetime, property_payload, resolve_reference_via_url_or_search,
-    v1_content_to_item, v2_page_to_item, value_to_string,
+    v1_content_to_item, v1_search_result, v2_page_to_item, value_to_string,
 };
 
 pub struct CloudProvider {
@@ -177,12 +177,12 @@ impl CloudProvider {
 
 #[async_trait]
 impl ConfluenceProvider for CloudProvider {
-    fn profile(&self) -> &ResolvedProfile {
-        &self.http.profile
-    }
-
     fn kind(&self) -> ProviderKind {
         ProviderKind::Cloud
+    }
+
+    fn web_path_prefix(&self) -> String {
+        self.http.profile.web_path_prefix()
     }
 
     async fn ping(&self) -> Result<()> {
@@ -230,20 +230,7 @@ impl ConfluenceProvider for CloudProvider {
         Ok(response
             .results
             .into_iter()
-            .map(|item| SearchResult {
-                id: item.id,
-                title: item.title,
-                excerpt: None,
-                kind: match item.content_type.as_str() {
-                    "blogpost" => ContentKind::BlogPost,
-                    _ => ContentKind::Page,
-                },
-                space_key: item.space.map(|space| space.key),
-                web_url: crate::provider::combine_url(
-                    &self.http.profile.base_url,
-                    item._links.webui.as_deref(),
-                ),
-            })
+            .filter_map(|item| v1_search_result(&self.http.profile.base_url, item))
             .collect())
     }
 
@@ -569,6 +556,7 @@ impl ConfluenceProvider for CloudProvider {
         } else {
             None
         };
+        let replacing_existing = existing.is_some();
         let endpoint = if let Some(existing) = &existing {
             self.http.v1_url(&format!(
                 "/content/{content_id}/child/attachment/{}/data",
@@ -608,23 +596,26 @@ impl ConfluenceProvider for CloudProvider {
             let body = response.text().await.unwrap_or_default();
             bail!("attachment upload failed with {status}: {body}");
         }
-        let payload: Results<V1Attachment> = response.json().await?;
-        payload
-            .results
-            .into_iter()
-            .next()
-            .map(|attachment| self.map_attachment(attachment))
-            .ok_or_else(|| anyhow!("attachment upload returned no attachment metadata"))
+        if replacing_existing {
+            let attachment: V1Attachment = response.json().await?;
+            Ok(self.map_attachment(attachment))
+        } else {
+            let payload: Results<V1Attachment> = response.json().await?;
+            payload
+                .results
+                .into_iter()
+                .next()
+                .map(|attachment| self.map_attachment(attachment))
+                .ok_or_else(|| anyhow!("attachment upload returned no attachment metadata"))
+        }
     }
 
-    async fn delete_attachment(&self, content_id: &str, attachment_id: &str) -> Result<()> {
+    async fn delete_attachment(&self, _content_id: &str, attachment_id: &str) -> Result<()> {
         ensure_writable(&self.http.profile)?;
         self.http
             .empty(
                 Method::DELETE,
-                self.http.v1_url(&format!(
-                    "/content/{content_id}/child/attachment/{attachment_id}"
-                )),
+                self.http.v2_url(&format!("/attachments/{attachment_id}")),
                 None,
             )
             .await
@@ -683,8 +674,7 @@ impl ConfluenceProvider for CloudProvider {
             .http
             .json(
                 Method::POST,
-                self.http
-                    .v1_url(&format!("/content/{content_id}/child/comment")),
+                self.http.v1_url("/content"),
                 Some(json!({
                     "type": "comment",
                     "container": { "type": "page", "id": content_id },

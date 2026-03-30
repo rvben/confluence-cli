@@ -90,10 +90,6 @@ impl AppConfig {
         Ok(())
     }
 
-    pub fn profile_names(&self) -> Vec<String> {
-        self.profiles.keys().cloned().collect()
-    }
-
     pub fn resolved_profile(&self, profile_override: Option<&str>) -> Result<ResolvedProfile> {
         let env_profile = env::var("CONFLUENCE_PROFILE").ok();
         let selected_name = profile_override
@@ -181,6 +177,17 @@ impl ResolvedProfile {
             api_path: self.api_path.clone(),
             auth,
             read_only: self.read_only,
+        }
+    }
+
+    pub fn web_path_prefix(&self) -> String {
+        let trimmed = self.api_path.trim();
+        if let Some(prefix) = trimmed.strip_suffix("/rest/api") {
+            prefix.to_string()
+        } else if let Some(prefix) = trimmed.strip_suffix("rest/api") {
+            prefix.trim_end_matches('/').to_string()
+        } else {
+            String::new()
         }
     }
 }

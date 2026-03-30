@@ -22,8 +22,8 @@ pub mod datacenter;
 
 #[async_trait]
 pub trait ConfluenceProvider: Send + Sync {
-    fn profile(&self) -> &ResolvedProfile;
     fn kind(&self) -> ProviderKind;
+    fn web_path_prefix(&self) -> String;
 
     async fn ping(&self) -> Result<()>;
     async fn resolve_page_ref(&self, reference: &str) -> Result<String>;
@@ -195,6 +195,7 @@ impl HttpClient {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct Results<T> {
     pub results: Vec<T>,
@@ -205,6 +206,7 @@ pub struct Results<T> {
     pub _links: Links,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Default)]
 pub struct Links {
     pub base: Option<String>,
@@ -230,6 +232,7 @@ pub struct SimpleId {
     pub id: Value,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct V1Content {
     pub id: String,
@@ -263,6 +266,7 @@ pub struct V1LastUpdated {
     pub when: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct V1SpaceRef {
     pub id: Option<Value>,
@@ -292,6 +296,7 @@ pub struct V1BodyStorage {
     pub value: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct V1Metadata {
     pub labels: Option<Results<V1Label>>,
@@ -353,6 +358,7 @@ pub struct V1AttachmentExtensions {
     pub file_size: Option<u64>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct V1Comment {
     pub id: String,
@@ -448,6 +454,23 @@ pub fn v1_content_to_item(
                     .and_then(|update| parse_datetime(update.when.as_deref()))
             }),
     }
+}
+
+pub fn v1_search_result(base_url: &str, item: V1Content) -> Option<SearchResult> {
+    let kind = match item.content_type.as_str() {
+        "page" => ContentKind::Page,
+        "blogpost" => ContentKind::BlogPost,
+        _ => return None,
+    };
+
+    Some(SearchResult {
+        id: item.id,
+        title: item.title,
+        excerpt: None,
+        kind,
+        space_key: item.space.map(|space| space.key),
+        web_url: combine_url(base_url, item._links.webui.as_deref()),
+    })
 }
 
 pub fn v2_page_to_item(
@@ -603,4 +626,46 @@ pub fn ensure_writable(profile: &ResolvedProfile) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn search_content(content_type: &str) -> V1Content {
+        V1Content {
+            id: "123".to_string(),
+            content_type: content_type.to_string(),
+            title: "Example".to_string(),
+            status: "current".to_string(),
+            space: Some(V1SpaceRef {
+                id: None,
+                key: "MFS".to_string(),
+                name: None,
+            }),
+            version: None,
+            ancestors: Vec::new(),
+            body: None,
+            metadata: None,
+            _links: Links {
+                webui: Some("/spaces/MFS/pages/123/Example".to_string()),
+                ..Links::default()
+            },
+            history: None,
+        }
+    }
+
+    #[test]
+    fn search_filters_out_attachment_hits() {
+        assert!(
+            v1_search_result(
+                "https://example.atlassian.net",
+                search_content("attachment")
+            )
+            .is_none()
+        );
+        let page = v1_search_result("https://example.atlassian.net", search_content("page"))
+            .expect("page result should be preserved");
+        assert_eq!(page.kind, ContentKind::Page);
+    }
 }

@@ -6,10 +6,12 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use pulldown_cmark::{Options, Parser, html};
 use regex::Regex;
+use roxmltree::{Document, Node, NodeType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use slug::slugify;
+use url::Url;
 use walkdir::WalkDir;
 
 use crate::config::ensure_parent_dir;
@@ -30,17 +32,6 @@ pub struct Frontmatter {
 }
 
 impl Frontmatter {
-    pub fn from_kind(kind: ContentKind, title: String) -> Self {
-        Self {
-            title,
-            kind: kind.file_type().to_string(),
-            labels: Vec::new(),
-            status: "current".to_string(),
-            parent: None,
-            properties: BTreeMap::new(),
-        }
-    }
-
     pub fn content_kind(&self) -> ContentKind {
         match self.kind.as_str() {
             "blog" | "blogpost" => ContentKind::BlogPost,
@@ -49,15 +40,18 @@ impl Frontmatter {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Sidecar {
     pub content_id: Option<String>,
     pub space_key: Option<String>,
     pub provider: Option<ProviderKind>,
+    pub web_path_prefix: Option<String>,
     pub remote_version: Option<u64>,
     pub remote_parent_id: Option<String>,
     pub last_pulled_hash: Option<String>,
     pub storage_hash: Option<String>,
+    pub remote_storage_hash: Option<String>,
     #[serde(default)]
     pub attachment_map: BTreeMap<String, AttachmentState>,
     pub last_sync_at: Option<DateTime<Utc>>,
@@ -73,6 +67,7 @@ pub struct LocalDocument {
     pub sidecar: Sidecar,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct ConversionOutput {
     pub storage: String,
@@ -80,13 +75,42 @@ pub struct ConversionOutput {
 }
 
 pub fn storage_to_markdown(storage: &str) -> String {
+    let trimmed = storage.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    storage_to_markdown_xml(trimmed).unwrap_or_else(|| storage_to_markdown_fallback(trimmed))
+}
+
+const AC_NS: &str = "urn:confluence-ac";
+const RI_NS: &str = "urn:confluence-ri";
+pub(crate) const CONFLUENCE_PAGE_SCHEME: &str = "confluence-page";
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct PageLinkPlaceholder {
+    pub content_id: Option<String>,
+    pub space_key: Option<String>,
+    pub content_title: Option<String>,
+    pub anchor: Option<String>,
+}
+
+fn storage_to_markdown_xml(storage: &str) -> Option<String> {
+    let wrapped = wrap_storage_fragment(storage);
+    let document = Document::parse(&wrapped).ok()?;
+    let mut blocks = Vec::new();
+    for child in document.root_element().children() {
+        let block = render_top_level_block(child, &wrapped)?;
+        if !block.trim().is_empty() {
+            blocks.push(block.trim().to_string());
+        }
+    }
+    Some(blocks.join("\n\n"))
+}
+
+fn storage_to_markdown_fallback(storage: &str) -> String {
     let mut xml_fragments = Vec::new();
     let mut normalized = storage.to_string();
-    let contains_confluence_xml = storage.contains("<ac:") || storage.contains("<ri:");
-
-    if contains_confluence_xml {
-        return format!("```confluence-storage\n{}\n```", storage.trim());
-    }
 
     for pattern in [
         r"(?s)<ac:[\w-]+(?:\s[^>]*)?>.*?</ac:[\w-]+>",
@@ -132,6 +156,7 @@ pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<Conversi
         );
         html_output = html_output.replace(&format!("CONFLUENCE_XML_PLACEHOLDER_{idx}"), &fragment);
     }
+    html_output = convert_checkbox_lists_to_task_lists(&html_output);
 
     let mut lossy = Vec::new();
     if html_output.contains("&lt;ac:") || html_output.contains("&lt;ri:") {
@@ -145,6 +170,697 @@ pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<Conversi
         storage: html_output.trim().to_string(),
         lossy,
     })
+}
+
+fn wrap_storage_fragment(storage: &str) -> String {
+    format!(r#"<root xmlns:ac="{AC_NS}" xmlns:ri="{RI_NS}">{storage}</root>"#)
+}
+
+fn render_top_level_block(node: Node<'_, '_>, source: &str) -> Option<String> {
+    match node.node_type() {
+        NodeType::Text => {
+            let text = normalize_text_node(node.text().unwrap_or_default());
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text.trim().to_string())
+            }
+        }
+        NodeType::Element => Some(
+            render_block_element(node, source)
+                .unwrap_or_else(|| fallback_block_markdown(node, source)),
+        ),
+        _ => None,
+    }
+}
+
+fn render_block_element(node: Node<'_, '_>, source: &str) -> Option<String> {
+    if is_confluence_node(node) {
+        return render_confluence_block(node, source);
+    }
+
+    match node.tag_name().name() {
+        "p" => {
+            let inline = render_inline_children(node, source)?;
+            if inline.trim().is_empty() {
+                None
+            } else {
+                Some(inline.trim().to_string())
+            }
+        }
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            let level = node.tag_name().name()[1..].parse::<usize>().ok()?;
+            let inline = render_inline_children(node, source)?;
+            Some(format!("{} {}", "#".repeat(level), inline.trim()))
+        }
+        "pre" => render_preformatted(node),
+        "blockquote" => {
+            let rendered = render_container_blocks(node, source)?;
+            Some(prefix_markdown_block(&rendered, "> "))
+        }
+        "ul" => render_list(node, source, 0, false),
+        "ol" => render_list(node, source, 0, true),
+        "table" => render_table(node, source),
+        "hr" => Some("---".to_string()),
+        "div" | "section" | "article" | "main" => render_container_blocks(node, source),
+        "img" => render_inline_node(node, source).map(|value| value.trim().to_string()),
+        _ => {
+            if has_block_children(node) {
+                None
+            } else {
+                render_inline_node(node, source).map(|value| value.trim().to_string())
+            }
+        }
+    }
+}
+
+fn render_confluence_block(node: Node<'_, '_>, source: &str) -> Option<String> {
+    if node.tag_name().namespace() != Some(AC_NS) {
+        return Some(confluence_raw_block(raw_xml_fragment(node, source)));
+    }
+
+    match node.tag_name().name() {
+        "task-list" => render_task_list(node, source),
+        "image" | "link" => render_inline_node(node, source).map(|value| value.trim().to_string()),
+        _ => Some(confluence_raw_block(raw_xml_fragment(node, source))),
+    }
+}
+
+fn render_container_blocks(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let mut blocks = Vec::new();
+    let mut inline_buffer = String::new();
+    for child in node.children() {
+        match child.node_type() {
+            NodeType::Text => {
+                let text = normalize_text_node(child.text().unwrap_or_default());
+                if !text.is_empty() {
+                    inline_buffer.push_str(&text);
+                }
+            }
+            NodeType::Element => {
+                if is_inlineish_tag(child) || is_confluence_inline(child) {
+                    inline_buffer.push_str(&render_inline_node(child, source)?);
+                    continue;
+                }
+                if !inline_buffer.trim().is_empty() {
+                    blocks.push(inline_buffer.trim().to_string());
+                    inline_buffer.clear();
+                }
+                let rendered = render_block_element(child, source)
+                    .unwrap_or_else(|| fallback_block_markdown(child, source));
+                if !rendered.trim().is_empty() {
+                    blocks.push(rendered.trim().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    if !inline_buffer.trim().is_empty() {
+        blocks.push(inline_buffer.trim().to_string());
+    }
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks.join("\n\n"))
+    }
+}
+
+fn render_preformatted(node: Node<'_, '_>) -> Option<String> {
+    if contains_confluence_markup(node) {
+        return None;
+    }
+    let code_child = node
+        .children()
+        .find(|child| child.is_element() && child.tag_name().name() == "code");
+    let (language, content) = if let Some(code) = code_child {
+        (
+            code.attribute("class")
+                .and_then(language_from_class)
+                .unwrap_or_default(),
+            code.text()
+                .unwrap_or_default()
+                .trim_end_matches('\n')
+                .to_string(),
+        )
+    } else {
+        (
+            String::new(),
+            node.text()
+                .unwrap_or_default()
+                .trim_end_matches('\n')
+                .to_string(),
+        )
+    };
+    Some(format!("```{language}\n{content}\n```"))
+}
+
+fn language_from_class(class_name: &str) -> Option<String> {
+    class_name
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("language-"))
+        .map(ToOwned::to_owned)
+}
+
+fn render_list(node: Node<'_, '_>, source: &str, indent: usize, ordered: bool) -> Option<String> {
+    let items: Vec<_> = node
+        .children()
+        .filter(|child| child.is_element() && child.tag_name().name() == "li")
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+
+    let mut rendered = Vec::new();
+    for item in items {
+        rendered.push(render_list_item(item, source, indent, ordered)?);
+    }
+    Some(rendered.join("\n"))
+}
+
+fn render_list_item(
+    node: Node<'_, '_>,
+    source: &str,
+    indent: usize,
+    ordered: bool,
+) -> Option<String> {
+    let marker = if ordered { "1." } else { "-" };
+    let prefix = format!("{}{} ", " ".repeat(indent), marker);
+    let mut inline = String::new();
+    let mut nested = Vec::new();
+
+    for child in node.children() {
+        match child.node_type() {
+            NodeType::Text => {
+                inline.push_str(&normalize_text_node(child.text().unwrap_or_default()))
+            }
+            NodeType::Element => {
+                if child.tag_name().name() == "ul" {
+                    nested.push(render_list(child, source, indent + 2, false)?);
+                    continue;
+                }
+                if child.tag_name().name() == "ol" {
+                    nested.push(render_list(child, source, indent + 2, true)?);
+                    continue;
+                }
+                if child.tag_name().name() == "p" {
+                    inline.push_str(render_inline_children(child, source)?.trim());
+                    continue;
+                }
+                if is_inlineish_tag(child) || is_confluence_inline(child) {
+                    inline.push_str(&render_inline_node(child, source)?);
+                    continue;
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = format!("{prefix}{}", inline.trim());
+    for block in nested {
+        if !block.trim().is_empty() {
+            out.push('\n');
+            out.push_str(&block);
+        }
+    }
+    Some(out)
+}
+
+fn render_table(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let rows = collect_table_rows(node);
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut markdown_rows = Vec::new();
+    for row in rows {
+        let mut cells = Vec::new();
+        let mut header_row = false;
+        for cell in row
+            .children()
+            .filter(|child| child.is_element() && matches!(child.tag_name().name(), "th" | "td"))
+        {
+            if cell.attribute("rowspan").is_some() || cell.attribute("colspan").is_some() {
+                return None;
+            }
+            if cell.tag_name().name() == "th" {
+                header_row = true;
+            }
+            let value = render_inline_children(cell, source)?;
+            let value = value.trim().replace('\n', " ").replace('|', r"\|");
+            cells.push(value);
+        }
+        if cells.is_empty() {
+            continue;
+        }
+        markdown_rows.push((header_row, cells));
+    }
+
+    if markdown_rows.is_empty() || !markdown_rows.first()?.0 {
+        return None;
+    }
+
+    let headers = &markdown_rows[0].1;
+    let mut lines = Vec::new();
+    lines.push(format!("| {} |", headers.join(" | ")));
+    lines.push(format!(
+        "| {} |",
+        headers
+            .iter()
+            .map(|_| "---")
+            .collect::<Vec<_>>()
+            .join(" | ")
+    ));
+    for (_, row) in markdown_rows.into_iter().skip(1) {
+        lines.push(format!("| {} |", row.join(" | ")));
+    }
+    Some(lines.join("\n"))
+}
+
+fn collect_table_rows<'a, 'input>(node: Node<'a, 'input>) -> Vec<Node<'a, 'input>> {
+    node.children()
+        .filter(|child| child.is_element())
+        .flat_map(|child| match child.tag_name().name() {
+            "thead" | "tbody" | "tfoot" => child
+                .children()
+                .filter(|row| row.is_element() && row.tag_name().name() == "tr")
+                .collect::<Vec<_>>(),
+            "tr" => vec![child],
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+fn render_task_list(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let tasks: Vec<_> = node
+        .children()
+        .filter(|child| {
+            child.is_element()
+                && child.tag_name().namespace() == Some(AC_NS)
+                && child.tag_name().name() == "task"
+        })
+        .collect();
+    if tasks.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    for task in tasks {
+        let status = namespaced_child(task, AC_NS, "task-status")?
+            .text()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let body = namespaced_child(task, AC_NS, "task-body")?;
+        let text = render_inline_children(body, source)?;
+        let marker = if status == "complete" { "[x]" } else { "[ ]" };
+        lines.push(format!("- {marker} {}", text.trim()));
+    }
+    Some(lines.join("\n"))
+}
+
+fn render_inline_children(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let mut rendered = String::new();
+    for child in node.children() {
+        match child.node_type() {
+            NodeType::Text => {
+                rendered.push_str(&normalize_text_node(child.text().unwrap_or_default()))
+            }
+            NodeType::Element => rendered.push_str(&render_inline_node(child, source)?),
+            _ => {}
+        }
+    }
+    Some(rendered)
+}
+
+fn render_inline_node(node: Node<'_, '_>, source: &str) -> Option<String> {
+    if is_confluence_node(node) {
+        return render_confluence_inline(node, source);
+    }
+    if contains_confluence_markup(node) {
+        return None;
+    }
+
+    match node.tag_name().name() {
+        "strong" | "b" => wrap_markdown("**", render_inline_children(node, source)?),
+        "em" | "i" => wrap_markdown("*", render_inline_children(node, source)?),
+        "code" => Some(format!(
+            "`{}`",
+            node.text().unwrap_or_default().trim().replace('`', r"\`")
+        )),
+        "a" => {
+            let href = node.attribute("href")?;
+            let label = render_inline_children(node, source)?.trim().to_string();
+            Some(format!(
+                "[{}]({href})",
+                if label.is_empty() { href } else { &label }
+            ))
+        }
+        "img" => {
+            let src = node.attribute("src")?;
+            let alt = node.attribute("alt").unwrap_or_default();
+            Some(format!("![{}]({src})", escape_markdown_text(alt)))
+        }
+        "br" => Some("  \n".to_string()),
+        "span" => {
+            if node.attributes().len() > 0 {
+                Some(raw_xml_fragment(node, source).to_string())
+            } else {
+                render_inline_children(node, source)
+            }
+        }
+        "small" | "big" | "u" | "sub" | "sup" => Some(raw_xml_fragment(node, source).to_string()),
+        _ => {
+            if node.attributes().len() > 0 || has_block_children(node) {
+                Some(raw_xml_fragment(node, source).to_string())
+            } else {
+                render_inline_children(node, source)
+            }
+        }
+    }
+}
+
+fn render_confluence_inline(node: Node<'_, '_>, source: &str) -> Option<String> {
+    if node.tag_name().namespace() != Some(AC_NS) {
+        return None;
+    }
+
+    match node.tag_name().name() {
+        "image" => render_confluence_image(node),
+        "link" => render_confluence_link(node, source),
+        _ => None,
+    }
+}
+
+fn render_confluence_image(node: Node<'_, '_>) -> Option<String> {
+    let alt = node
+        .attribute((AC_NS, "alt"))
+        .or_else(|| node.attribute((AC_NS, "title")))
+        .unwrap_or_default();
+
+    if let Some(attachment) = namespaced_child(node, RI_NS, "attachment") {
+        let file_name = attachment.attribute((RI_NS, "filename"))?;
+        return Some(format!(
+            "![{}](attachments/{file_name})",
+            escape_markdown_text(alt)
+        ));
+    }
+
+    let url = namespaced_child(node, RI_NS, "url")?.attribute((RI_NS, "value"))?;
+    Some(format!("![{}]({url})", escape_markdown_text(alt)))
+}
+
+fn render_confluence_link(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let anchor = node.attribute((AC_NS, "anchor"));
+    let label = link_label(node, source);
+
+    if let Some(page) = namespaced_child(node, RI_NS, "page") {
+        let placeholder = PageLinkPlaceholder {
+            content_id: page.attribute((RI_NS, "content-id")).map(ToOwned::to_owned),
+            space_key: page.attribute((RI_NS, "space-key")).map(ToOwned::to_owned),
+            content_title: page
+                .attribute((RI_NS, "content-title"))
+                .map(ToOwned::to_owned),
+            anchor: anchor.map(ToOwned::to_owned),
+        };
+        let target = build_page_placeholder_url(&placeholder);
+        let label = label
+            .or_else(|| placeholder.content_title.clone())
+            .or_else(|| placeholder.content_id.clone())
+            .or_else(|| placeholder.anchor.clone())
+            .unwrap_or_else(|| "Confluence page".to_string());
+        return Some(format!("[{}]({target})", label.trim()));
+    }
+
+    if let Some(attachment) = namespaced_child(node, RI_NS, "attachment") {
+        let file_name = attachment.attribute((RI_NS, "filename"))?;
+        let mut target = format!("attachments/{file_name}");
+        if let Some(anchor) = anchor {
+            target.push('#');
+            target.push_str(anchor);
+        }
+        let label = label.unwrap_or_else(|| file_name.to_string());
+        return Some(format!("[{}]({target})", label.trim()));
+    }
+
+    if let Some(url) =
+        namespaced_child(node, RI_NS, "url").and_then(|url| url.attribute((RI_NS, "value")))
+    {
+        let mut target = url.to_string();
+        if let Some(anchor) = anchor {
+            target.push('#');
+            target.push_str(anchor);
+        }
+        let label = label.unwrap_or_else(|| target.clone());
+        return Some(format!("[{}]({target})", label.trim()));
+    }
+
+    if let Some(anchor) = anchor {
+        let label = label.unwrap_or_else(|| anchor.to_string());
+        return Some(format!("[{}](#{anchor})", label.trim()));
+    }
+
+    None
+}
+
+fn link_label(node: Node<'_, '_>, source: &str) -> Option<String> {
+    if let Some(body) = namespaced_child(node, AC_NS, "plain-text-link-body") {
+        return body.text().map(|text| escape_markdown_text(text.trim()));
+    }
+    if let Some(body) = namespaced_child(node, AC_NS, "link-body") {
+        return render_inline_children(body, source).map(|text| text.trim().to_string());
+    }
+    None
+}
+
+fn namespaced_child<'a, 'input>(
+    node: Node<'a, 'input>,
+    namespace: &str,
+    name: &str,
+) -> Option<Node<'a, 'input>> {
+    node.children().find(|child| {
+        child.is_element()
+            && child.tag_name().namespace() == Some(namespace)
+            && child.tag_name().name() == name
+    })
+}
+
+fn is_confluence_node(node: Node<'_, '_>) -> bool {
+    node.tag_name()
+        .namespace()
+        .is_some_and(|namespace| namespace == AC_NS || namespace == RI_NS)
+}
+
+fn is_confluence_inline(node: Node<'_, '_>) -> bool {
+    is_confluence_node(node) && matches!(node.tag_name().name(), "image" | "link")
+}
+
+fn contains_confluence_markup(node: Node<'_, '_>) -> bool {
+    node.descendants()
+        .any(|child| child.is_element() && is_confluence_node(child))
+}
+
+fn is_inlineish_tag(node: Node<'_, '_>) -> bool {
+    matches!(
+        node.tag_name().name(),
+        "span"
+            | "strong"
+            | "b"
+            | "em"
+            | "i"
+            | "code"
+            | "a"
+            | "img"
+            | "br"
+            | "small"
+            | "big"
+            | "u"
+            | "sub"
+            | "sup"
+    )
+}
+
+fn has_block_children(node: Node<'_, '_>) -> bool {
+    node.children().any(|child| {
+        child.is_element()
+            && !matches!(
+                child.tag_name().name(),
+                "span"
+                    | "strong"
+                    | "b"
+                    | "em"
+                    | "i"
+                    | "code"
+                    | "a"
+                    | "img"
+                    | "br"
+                    | "small"
+                    | "big"
+                    | "u"
+                    | "sub"
+                    | "sup"
+            )
+    })
+}
+
+fn normalize_text_node(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        if text.chars().any(char::is_whitespace) {
+            " ".to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        let leading = if text.chars().next().is_some_and(char::is_whitespace) {
+            " "
+        } else {
+            ""
+        };
+        let trailing = if text.chars().last().is_some_and(char::is_whitespace) {
+            " "
+        } else {
+            ""
+        };
+        format!("{leading}{}{trailing}", escape_markdown_text(&collapsed))
+    }
+}
+
+fn escape_markdown_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' | '*' | '_' | '[' | ']' | '`' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn wrap_markdown(wrapper: &str, content: String) -> Option<String> {
+    if content.trim().is_empty() {
+        None
+    } else {
+        Some(format!("{wrapper}{}{wrapper}", content.trim()))
+    }
+}
+
+fn prefix_markdown_block(block: &str, prefix: &str) -> String {
+    block
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                prefix.trim_end().to_string()
+            } else {
+                format!("{prefix}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn fallback_block_markdown(node: Node<'_, '_>, source: &str) -> String {
+    if contains_confluence_markup(node) || is_confluence_node(node) {
+        confluence_raw_block(raw_xml_fragment(node, source))
+    } else {
+        raw_xml_fragment(node, source).trim().to_string()
+    }
+}
+
+fn confluence_raw_block(raw: &str) -> String {
+    format!("```confluence-storage\n{}\n```", raw.trim())
+}
+
+pub(crate) fn build_page_placeholder_url(link: &PageLinkPlaceholder) -> String {
+    let mut url = Url::parse(&format!("{CONFLUENCE_PAGE_SCHEME}://page"))
+        .expect("valid confluence page placeholder base");
+    {
+        let mut pairs = url.query_pairs_mut();
+        if let Some(content_id) = &link.content_id {
+            pairs.append_pair("content-id", content_id);
+        }
+        if let Some(space_key) = &link.space_key {
+            pairs.append_pair("space-key", space_key);
+        }
+        if let Some(content_title) = &link.content_title {
+            pairs.append_pair("content-title", content_title);
+        }
+    }
+    if let Some(anchor) = &link.anchor {
+        url.set_fragment(Some(anchor));
+    }
+    url.to_string()
+}
+
+pub(crate) fn parse_page_placeholder_url(target: &str) -> Option<PageLinkPlaceholder> {
+    let normalized = target.replace("&amp;", "&");
+    let url = Url::parse(&normalized).ok()?;
+    if url.scheme() != CONFLUENCE_PAGE_SCHEME || url.host_str() != Some("page") {
+        return None;
+    }
+    let mut placeholder = PageLinkPlaceholder::default();
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "content-id" => placeholder.content_id = Some(value.into_owned()),
+            "space-key" => placeholder.space_key = Some(value.into_owned()),
+            "content-title" => placeholder.content_title = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    placeholder.anchor = url.fragment().map(ToOwned::to_owned);
+    if placeholder.content_id.is_none()
+        && placeholder.space_key.is_none()
+        && placeholder.content_title.is_none()
+        && placeholder.anchor.is_none()
+    {
+        None
+    } else {
+        Some(placeholder)
+    }
+}
+
+fn raw_xml_fragment<'a>(node: Node<'_, 'a>, source: &'a str) -> &'a str {
+    &source[node.range()]
+}
+
+fn convert_checkbox_lists_to_task_lists(html: &str) -> String {
+    let ul_re = Regex::new(
+        r#"(?s)<ul>\s*((?:<li>\s*<input[^>]*type="checkbox"[^>]*/?>\s*.*?</li>\s*)+)</ul>"#,
+    )
+    .expect("valid checkbox list regex");
+    let li_re = Regex::new(r#"(?s)<li>\s*<input([^>]*)type="checkbox"([^>]*)/?>\s*(.*?)\s*</li>"#)
+        .expect("valid checkbox item regex");
+
+    ul_re
+        .replace_all(html, |captures: &regex::Captures<'_>| {
+            let items = &captures[1];
+            let mut tasks = Vec::new();
+            for item in li_re.captures_iter(items) {
+                let attrs = format!("{} {}", &item[1], &item[2]);
+                let status = if attrs.contains("checked") {
+                    "complete"
+                } else {
+                    "incomplete"
+                };
+                let body = item[3].trim();
+                tasks.push(format!(
+                    "<ac:task><ac:task-status>{status}</ac:task-status><ac:task-body>{body}</ac:task-body></ac:task>"
+                ));
+            }
+
+            if tasks.is_empty() {
+                captures[0].to_string()
+            } else {
+                format!("<ac:task-list>{}</ac:task-list>", tasks.join(""))
+            }
+        })
+        .to_string()
 }
 
 pub fn split_frontmatter(content: &str) -> Result<(Frontmatter, String)> {
@@ -273,6 +989,67 @@ mod tests {
         assert!(markdown.contains("```confluence-storage"));
         let rendered = markdown_to_storage(&markdown, false).expect("conversion succeeds");
         assert!(rendered.storage.contains("<ac:structured-macro"));
+    }
+
+    #[test]
+    fn mixed_content_preserves_only_unsupported_confluence_fragments() {
+        let storage = r#"<h1>Title</h1><ac:structured-macro ac:name="info"><ac:rich-text-body><p>Body</p></ac:rich-text-body></ac:structured-macro><p>After</p>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains("# Title"));
+        assert!(markdown.contains("```confluence-storage"));
+        assert!(markdown.contains("After"));
+        assert!(
+            !markdown
+                .trim_start()
+                .starts_with("```confluence-storage\n<h1>Title</h1>")
+        );
+    }
+
+    #[test]
+    fn task_lists_round_trip_between_storage_and_markdown() {
+        let storage = r#"<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>Write docs</ac:task-body></ac:task><ac:task><ac:task-status>complete</ac:task-status><ac:task-body>Ship it</ac:task-body></ac:task></ac:task-list>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains("- [ ] Write docs"));
+        assert!(markdown.contains("- [x] Ship it"));
+
+        let rendered = markdown_to_storage(&markdown, false).expect("task list markdown converts");
+        assert!(rendered.storage.contains("<ac:task-list>"));
+        assert!(
+            rendered
+                .storage
+                .contains("<ac:task-status>incomplete</ac:task-status>")
+        );
+        assert!(
+            rendered
+                .storage
+                .contains("<ac:task-status>complete</ac:task-status>")
+        );
+    }
+
+    #[test]
+    fn attachment_image_and_link_macros_become_markdown_paths() {
+        let storage = r#"<p><ac:image ac:alt="Logo"><ri:attachment ri:filename="logo.png" /></ac:image> <ac:link><ri:attachment ri:filename="manual.pdf" /><ac:plain-text-link-body><![CDATA[Manual]]></ac:plain-text-link-body></ac:link></p>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains("![Logo](attachments/logo.png)"));
+        assert!(markdown.contains("[Manual](attachments/manual.pdf)"));
+    }
+
+    #[test]
+    fn page_link_macros_export_to_placeholders() {
+        let storage = r#"<p><ac:link ac:anchor="intro"><ri:page ri:space-key="TEST" ri:content-title="Docs Home" /><ac:plain-text-link-body><![CDATA[Docs]]></ac:plain-text-link-body></ac:link></p>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains("[Docs](confluence-page://page?"));
+        assert!(markdown.contains("space-key=TEST"));
+        assert!(markdown.contains("content-title=Docs+Home#intro"));
+    }
+
+    #[test]
+    fn simple_tables_export_to_markdown_tables() {
+        let storage = r#"<table><tbody><tr><th>Name</th><th>Status</th></tr><tr><td>CLI</td><td>Ready</td></tr></tbody></table>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains("| Name | Status |"));
+        assert!(markdown.contains("| --- | --- |"));
+        assert!(markdown.contains("| CLI | Ready |"));
     }
 
     #[test]

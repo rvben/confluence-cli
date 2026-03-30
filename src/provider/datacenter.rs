@@ -18,7 +18,7 @@ use crate::provider::{
     ConfluenceProvider, HttpClient, Results, V1Attachment, V1Comment, V1Content, V1Label,
     V1Property, V1Space, V1SpaceRef, build_search_cql, ensure_writable, fetch_all_v1,
     normalize_properties, parse_datetime, property_payload, resolve_reference_via_url_or_search,
-    v1_content_to_item, value_to_string,
+    v1_content_to_item, v1_search_result, value_to_string,
 };
 
 pub struct DataCenterProvider {
@@ -165,12 +165,12 @@ impl DataCenterProvider {
 
 #[async_trait]
 impl ConfluenceProvider for DataCenterProvider {
-    fn profile(&self) -> &ResolvedProfile {
-        &self.http.profile
-    }
-
     fn kind(&self) -> ProviderKind {
         ProviderKind::DataCenter
+    }
+
+    fn web_path_prefix(&self) -> String {
+        self.http.profile.web_path_prefix()
     }
 
     async fn ping(&self) -> Result<()> {
@@ -218,20 +218,7 @@ impl ConfluenceProvider for DataCenterProvider {
         Ok(response
             .results
             .into_iter()
-            .map(|item| SearchResult {
-                id: item.id,
-                title: item.title,
-                excerpt: None,
-                kind: match item.content_type.as_str() {
-                    "blogpost" => ContentKind::BlogPost,
-                    _ => ContentKind::Page,
-                },
-                space_key: item.space.map(|space| space.key),
-                web_url: crate::provider::combine_url(
-                    &self.http.profile.base_url,
-                    item._links.webui.as_deref(),
-                ),
-            })
+            .filter_map(|item| v1_search_result(&self.http.profile.base_url, item))
             .collect())
     }
 
@@ -437,14 +424,18 @@ impl ConfluenceProvider for DataCenterProvider {
     }
 
     async fn download_attachment(&self, content_id: &str, attachment_id: &str) -> Result<Bytes> {
-        self.http
-            .bytes(
-                Method::GET,
-                self.http.v1_url(&format!(
-                    "/content/{content_id}/child/attachment/{attachment_id}/download"
-                )),
-            )
-            .await
+        let attachment = self
+            .list_attachments(content_id)
+            .await?
+            .into_iter()
+            .find(|attachment| attachment.id == attachment_id)
+            .ok_or_else(|| {
+                anyhow!("attachment `{attachment_id}` not found on content `{content_id}`")
+            })?;
+        let download_url = attachment
+            .download_url
+            .ok_or_else(|| anyhow!("attachment `{attachment_id}` did not expose a download URL"))?;
+        self.http.bytes(Method::GET, download_url).await
     }
 
     async fn upload_attachment(
@@ -506,13 +497,18 @@ impl ConfluenceProvider for DataCenterProvider {
             let body = response.text().await.unwrap_or_default();
             bail!("attachment upload failed with {status}: {body}");
         }
-        let payload: Results<V1Attachment> = response.json().await?;
-        payload
-            .results
-            .into_iter()
-            .next()
-            .map(|attachment| self.map_attachment(attachment))
-            .ok_or_else(|| anyhow!("attachment upload returned no attachment metadata"))
+        if existing.is_some() {
+            let attachment: V1Attachment = response.json().await?;
+            Ok(self.map_attachment(attachment))
+        } else {
+            let payload: Results<V1Attachment> = response.json().await?;
+            payload
+                .results
+                .into_iter()
+                .next()
+                .map(|attachment| self.map_attachment(attachment))
+                .ok_or_else(|| anyhow!("attachment upload returned no attachment metadata"))
+        }
     }
 
     async fn delete_attachment(&self, content_id: &str, attachment_id: &str) -> Result<()> {
@@ -581,8 +577,7 @@ impl ConfluenceProvider for DataCenterProvider {
             .http
             .json(
                 Method::POST,
-                self.http
-                    .v1_url(&format!("/content/{content_id}/child/comment")),
+                self.http.v1_url("/content"),
                 Some(json!({
                     "type": "comment",
                     "container": { "type": "page", "id": content_id },

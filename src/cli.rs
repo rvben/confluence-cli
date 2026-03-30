@@ -4,7 +4,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
 use serde_json::{Value, json};
 
 use crate::config::{AppConfig, LoginInput, ResolvedProfile, logout, run_login};
@@ -76,6 +77,9 @@ enum Commands {
     Property {
         #[command(subcommand)]
         command: PropertyCommand,
+    },
+    Completions {
+        shell: Shell,
     },
 }
 
@@ -399,6 +403,11 @@ pub async fn run() -> Result<()> {
         Commands::Property { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
             handle_property(&*provider, command, output).await
+        }
+        Commands::Completions { shell } => {
+            let mut command = Cli::command();
+            generate(shell, &mut command, "confluence-cli", &mut io::stdout());
+            Ok(())
         }
     }
 }
@@ -1234,5 +1243,20 @@ fn print_status(output: OutputFormat, value: Value, text: &str) -> Result<()> {
     } else {
         println!("{text}");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_includes_completions_command() {
+        let command = Cli::command();
+        assert!(
+            command
+                .get_subcommands()
+                .any(|subcommand| subcommand.get_name() == "completions")
+        );
     }
 }
