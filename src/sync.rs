@@ -11,8 +11,8 @@ use walkdir::WalkDir;
 use crate::markdown::{
     Frontmatter, LocalDocument, PageLinkPlaceholder, Sidecar, UserMentionPlaceholder,
     document_dir_name, load_document, markdown_to_storage, parse_page_placeholder_url,
-    parse_user_placeholder_url, save_document, scan_local_documents, sha256_hex,
-    storage_to_markdown,
+    parse_status_placeholder_url, parse_user_placeholder_url, save_document, scan_local_documents,
+    sha256_hex, storage_to_markdown,
 };
 use crate::model::{AttachmentState, ContentItem, ContentKind, PlanActionKind, PlanItem, SyncPlan};
 use crate::provider::ConfluenceProvider;
@@ -611,7 +611,9 @@ fn rewrite_local_target_url(
     if let Some(link) = parse_page_placeholder_url(target) {
         return placeholder_to_remote_url(&link, web_path_prefix);
     }
-    if parse_user_placeholder_url(target).is_some() {
+    if parse_user_placeholder_url(target).is_some()
+        || parse_status_placeholder_url(target).is_some()
+    {
         return None;
     }
     if !is_local_target(target) {
@@ -878,9 +880,10 @@ fn rewrite_attachment_links(
 }
 
 fn rewrite_placeholder_links_to_storage(storage: &str) -> String {
-    let re =
-        Regex::new(r#"(?s)<a([^>]*?)href="(confluence-(?:page|user)://[^"]+)"([^>]*)>(.*?)</a>"#)
-            .expect("valid placeholder link regex");
+    let re = Regex::new(
+        r#"(?s)<a([^>]*?)href="(confluence-(?:page|user|status)://[^"]+)"([^>]*)>(.*?)</a>"#,
+    )
+    .expect("valid placeholder link regex");
     re.replace_all(storage, |captures: &regex::Captures<'_>| {
         let target = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
         let body = captures.get(4).map(|m| m.as_str()).unwrap_or_default();
@@ -916,10 +919,36 @@ fn placeholder_to_storage_macro(target: &str, body_html: &str) -> Option<String>
         ));
     }
 
-    let placeholder = parse_user_placeholder_url(target)?;
-    let resource = user_placeholder_to_storage_resource(&placeholder)?;
-    let body = build_storage_link_body(body_html);
-    Some(format!(r#"<ac:link>{resource}{body}</ac:link>"#))
+    if let Some(placeholder) = parse_user_placeholder_url(target) {
+        let resource = user_placeholder_to_storage_resource(&placeholder)?;
+        let body = build_storage_link_body(body_html);
+        return Some(format!(r#"<ac:link>{resource}{body}</ac:link>"#));
+    }
+
+    status_placeholder_to_storage_macro(target, body_html)
+}
+
+fn status_placeholder_to_storage_macro(target: &str, body_html: &str) -> Option<String> {
+    let placeholder = parse_status_placeholder_url(target)?;
+    let title = if !body_html.trim().is_empty() && !body_html.contains('<') {
+        body_html.trim().to_string()
+    } else {
+        placeholder.title
+    };
+    let mut parameters = vec![format!(
+        r#"<ac:parameter ac:name="title">{}</ac:parameter>"#,
+        escape_xml_attr(&title)
+    )];
+    if let Some(colour) = placeholder.colour.as_deref() {
+        parameters.push(format!(
+            r#"<ac:parameter ac:name="colour">{}</ac:parameter>"#,
+            escape_xml_attr(colour)
+        ));
+    }
+    Some(format!(
+        r#"<ac:structured-macro ac:name="status">{}</ac:structured-macro>"#,
+        parameters.join("")
+    ))
 }
 
 fn user_placeholder_to_storage_resource(placeholder: &UserMentionPlaceholder) -> Option<String> {
@@ -1090,8 +1119,9 @@ mod tests {
 
     use super::*;
     use crate::markdown::{
-        Frontmatter, PageLinkPlaceholder, Sidecar, UserMentionPlaceholder,
-        build_page_placeholder_url, build_user_placeholder_url, render_document,
+        Frontmatter, PageLinkPlaceholder, Sidecar, StatusMacroPlaceholder, UserMentionPlaceholder,
+        build_page_placeholder_url, build_status_placeholder_url, build_user_placeholder_url,
+        render_document,
     };
     use crate::model::ProviderKind;
 
@@ -1388,5 +1418,42 @@ mod tests {
             storage
                 .contains("<ac:plain-text-link-body><![CDATA[@Ruben]]></ac:plain-text-link-body>")
         );
+    }
+
+    #[test]
+    fn render_body_storage_rewrites_status_placeholders_back_to_storage_macros() {
+        let current_dir = PathBuf::from("/tmp/root/current-page--123");
+        let placeholder = build_status_placeholder_url(&StatusMacroPlaceholder {
+            title: "Ready".to_string(),
+            colour: Some("Green".to_string()),
+        });
+        let current = LocalDocument {
+            directory: current_dir.clone(),
+            markdown_path: current_dir.join("index.md"),
+            sidecar_path: current_dir.join(".confluence.json"),
+            frontmatter: Frontmatter {
+                title: "Current".to_string(),
+                kind: "page".to_string(),
+                labels: vec![],
+                status: "current".to_string(),
+                parent: None,
+                properties: BTreeMap::new(),
+            },
+            body_markdown: format!("State: [Ready]({placeholder})\n"),
+            sidecar: Sidecar {
+                content_id: Some("123".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                web_path_prefix: Some("/wiki".to_string()),
+                ..Sidecar::default()
+            },
+        };
+
+        let index = build_link_index(&[current.clone()]);
+        let storage =
+            render_body_storage(&current, &index, false, "/wiki").expect("render body storage");
+
+        assert!(storage.contains(r#"<ac:structured-macro ac:name="status">"#));
+        assert!(storage.contains(r#"<ac:parameter ac:name="title">Ready</ac:parameter>"#));
+        assert!(storage.contains(r#"<ac:parameter ac:name="colour">Green</ac:parameter>"#));
     }
 }

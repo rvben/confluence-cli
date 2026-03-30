@@ -87,6 +87,7 @@ const AC_NS: &str = "urn:confluence-ac";
 const RI_NS: &str = "urn:confluence-ri";
 pub(crate) const CONFLUENCE_PAGE_SCHEME: &str = "confluence-page";
 pub(crate) const CONFLUENCE_USER_SCHEME: &str = "confluence-user";
+pub(crate) const CONFLUENCE_STATUS_SCHEME: &str = "confluence-status";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct PageLinkPlaceholder {
@@ -101,6 +102,12 @@ pub(crate) struct UserMentionPlaceholder {
     pub account_id: Option<String>,
     pub user_key: Option<String>,
     pub username: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct StatusMacroPlaceholder {
+    pub title: String,
+    pub colour: Option<String>,
 }
 
 fn storage_to_markdown_xml(storage: &str) -> Option<String> {
@@ -506,6 +513,9 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "expand" {
         return render_expand_macro_block(node, source);
     }
+    if name == "status" {
+        return render_status_macro(node);
+    }
     if !matches!(name, "info" | "note" | "tip" | "warning") {
         return Some(confluence_raw_block(raw_xml_fragment(node, source)));
     }
@@ -639,8 +649,33 @@ fn render_confluence_inline(node: Node<'_, '_>, source: &str) -> Option<String> 
     match node.tag_name().name() {
         "image" => render_confluence_image(node),
         "link" => render_confluence_link(node, source),
+        "structured-macro" => render_status_macro(node),
         _ => None,
     }
+}
+
+fn render_status_macro(node: Node<'_, '_>) -> Option<String> {
+    let name = node.attribute((AC_NS, "name"))?;
+    if name != "status" {
+        return None;
+    }
+    let parameters = collect_macro_parameters(node);
+    if parameters
+        .keys()
+        .any(|key| !matches!(key.as_str(), "title" | "colour"))
+    {
+        return None;
+    }
+    let title = parameters.get("title")?.trim().to_string();
+    let placeholder = StatusMacroPlaceholder {
+        title: title.clone(),
+        colour: parameters
+            .get("colour")
+            .cloned()
+            .filter(|value| !value.is_empty()),
+    };
+    let target = build_status_placeholder_url(&placeholder);
+    Some(format!("[{}]({target})", escape_markdown_text(&title)))
 }
 
 fn render_confluence_image(node: Node<'_, '_>) -> Option<String> {
@@ -994,6 +1029,40 @@ pub(crate) fn parse_user_placeholder_url(target: &str) -> Option<UserMentionPlac
     } else {
         Some(placeholder)
     }
+}
+
+pub(crate) fn build_status_placeholder_url(status: &StatusMacroPlaceholder) -> String {
+    let mut url = Url::parse(&format!("{CONFLUENCE_STATUS_SCHEME}://status"))
+        .expect("valid confluence status placeholder base");
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("title", &status.title);
+        if let Some(colour) = &status.colour {
+            pairs.append_pair("colour", colour);
+        }
+    }
+    url.to_string()
+}
+
+pub(crate) fn parse_status_placeholder_url(target: &str) -> Option<StatusMacroPlaceholder> {
+    let normalized = target.replace("&amp;", "&");
+    let url = Url::parse(&normalized).ok()?;
+    if url.scheme() != CONFLUENCE_STATUS_SCHEME || url.host_str() != Some("status") {
+        return None;
+    }
+    let mut title = None;
+    let mut colour = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "title" => title = Some(value.into_owned()),
+            "colour" => colour = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    Some(StatusMacroPlaceholder {
+        title: title?,
+        colour,
+    })
 }
 
 fn raw_xml_fragment<'a>(node: Node<'_, 'a>, source: &'a str) -> &'a str {
@@ -1375,6 +1444,16 @@ mod tests {
         let storage = r#"<p><ac:link><ri:user ri:account-id="abc123" /><ac:plain-text-link-body><![CDATA[@Ruben]]></ac:plain-text-link-body></ac:link></p>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("[@Ruben](confluence-user://user?account-id=abc123)"));
+    }
+
+    #[test]
+    fn status_macros_export_to_placeholders() {
+        let storage = r#"<p>State: <ac:structured-macro ac:name="status"><ac:parameter ac:name="title">Ready</ac:parameter><ac:parameter ac:name="colour">Green</ac:parameter></ac:structured-macro></p>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(
+            markdown
+                .contains("State: [Ready](confluence-status://status?title=Ready&colour=Green)")
+        );
     }
 
     #[test]
