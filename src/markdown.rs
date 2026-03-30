@@ -136,10 +136,12 @@ fn storage_to_markdown_fallback(storage: &str) -> String {
 }
 
 pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<ConversionOutput> {
+    let (normalized_macros, macro_fragments) =
+        replace_confluence_macro_blocks(markdown, allow_lossy)?;
     let block_re = Regex::new(r"(?s)```confluence-storage\s*\n(.*?)\n```")?;
     let mut raw_fragments = Vec::new();
     let normalized = block_re
-        .replace_all(markdown, |captures: &regex::Captures<'_>| {
+        .replace_all(&normalized_macros, |captures: &regex::Captures<'_>| {
             let idx = raw_fragments.len();
             raw_fragments.push(captures[1].to_string());
             format!("CONFLUENCE_XML_PLACEHOLDER_{idx}")
@@ -155,6 +157,14 @@ pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<Conversi
             &fragment,
         );
         html_output = html_output.replace(&format!("CONFLUENCE_XML_PLACEHOLDER_{idx}"), &fragment);
+    }
+    for (idx, fragment) in macro_fragments.into_iter().enumerate() {
+        html_output = html_output.replace(
+            &format!("<p>CONFLUENCE_MACRO_PLACEHOLDER_{idx}</p>"),
+            &fragment,
+        );
+        html_output =
+            html_output.replace(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"), &fragment);
     }
     html_output = convert_checkbox_lists_to_task_lists(&html_output);
 
@@ -241,6 +251,7 @@ fn render_confluence_block(node: Node<'_, '_>, source: &str) -> Option<String> {
 
     match node.tag_name().name() {
         "task-list" => render_task_list(node, source),
+        "structured-macro" => render_supported_macro_block(node, source),
         "image" | "link" => render_inline_node(node, source).map(|value| value.trim().to_string()),
         _ => Some(confluence_raw_block(raw_xml_fragment(node, source))),
     }
@@ -477,6 +488,23 @@ fn render_task_list(node: Node<'_, '_>, source: &str) -> Option<String> {
         lines.push(format!("- {marker} {}", text.trim()));
     }
     Some(lines.join("\n"))
+}
+
+fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let name = node.attribute((AC_NS, "name"))?;
+    if !matches!(name, "info" | "note" | "tip" | "warning") {
+        return Some(confluence_raw_block(raw_xml_fragment(node, source)));
+    }
+    let body = namespaced_child(node, AC_NS, "rich-text-body")?;
+    let body_markdown = storage_to_markdown(&inner_xml_fragment(body, source));
+    if body_markdown.trim().is_empty() {
+        Some(format!(":::confluence-{name}\n:::"))
+    } else {
+        Some(format!(
+            ":::confluence-{name}\n{}\n:::",
+            body_markdown.trim()
+        ))
+    }
 }
 
 fn render_inline_children(node: Node<'_, '_>, source: &str) -> Option<String> {
@@ -829,6 +857,40 @@ fn raw_xml_fragment<'a>(node: Node<'_, 'a>, source: &'a str) -> &'a str {
     &source[node.range()]
 }
 
+fn inner_xml_fragment(node: Node<'_, '_>, source: &str) -> String {
+    node.children()
+        .map(|child| raw_xml_fragment(child, source))
+        .collect::<String>()
+}
+
+fn replace_confluence_macro_blocks(
+    markdown: &str,
+    allow_lossy: bool,
+) -> Result<(String, Vec<String>)> {
+    let macro_re =
+        Regex::new(r"(?ms)^:::confluence-(info|note|tip|warning)[ \t]*\n(.*?)\n:::[ \t]*(?:\n|$)")?;
+    let mut fragments = Vec::new();
+    let mut normalized = String::with_capacity(markdown.len());
+    let mut last = 0;
+    for captures in macro_re.captures_iter(markdown) {
+        let Some(full_match) = captures.get(0) else {
+            continue;
+        };
+        normalized.push_str(&markdown[last..full_match.start()]);
+        let name = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let body_markdown = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let body_storage = markdown_to_storage(body_markdown, allow_lossy)?.storage;
+        let idx = fragments.len();
+        fragments.push(format!(
+            r#"<ac:structured-macro ac:name="{name}"><ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:structured-macro>"#
+        ));
+        normalized.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
+        last = full_match.end();
+    }
+    normalized.push_str(&markdown[last..]);
+    Ok((normalized, fragments))
+}
+
 fn convert_checkbox_lists_to_task_lists(html: &str) -> String {
     let ul_re = Regex::new(
         r#"(?s)<ul>\s*((?:<li>\s*<input[^>]*type="checkbox"[^>]*/?>\s*.*?</li>\s*)+)</ul>"#,
@@ -984,7 +1046,7 @@ mod tests {
 
     #[test]
     fn storage_macro_round_trips_through_sentinel_block() {
-        let storage = r#"<p>Hello</p><ac:structured-macro ac:name="info"><ac:rich-text-body><p>world</p></ac:rich-text-body></ac:structured-macro>"#;
+        let storage = r#"<p>Hello</p><ac:structured-macro ac:name="toc" />"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("```confluence-storage"));
         let rendered = markdown_to_storage(&markdown, false).expect("conversion succeeds");
@@ -993,7 +1055,7 @@ mod tests {
 
     #[test]
     fn mixed_content_preserves_only_unsupported_confluence_fragments() {
-        let storage = r#"<h1>Title</h1><ac:structured-macro ac:name="info"><ac:rich-text-body><p>Body</p></ac:rich-text-body></ac:structured-macro><p>After</p>"#;
+        let storage = r#"<h1>Title</h1><ac:structured-macro ac:name="toc" /><p>After</p>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("# Title"));
         assert!(markdown.contains("```confluence-storage"));
@@ -1041,6 +1103,29 @@ mod tests {
         assert!(markdown.contains("[Docs](confluence-page://page?"));
         assert!(markdown.contains("space-key=TEST"));
         assert!(markdown.contains("content-title=Docs+Home#intro"));
+    }
+
+    #[test]
+    fn supported_panel_macros_export_to_macro_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="info"><ac:rich-text-body><p>Hello</p><ul><li>World</li></ul></ac:rich-text-body></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-info"));
+        assert!(markdown.contains("Hello"));
+        assert!(markdown.contains("- World"));
+    }
+
+    #[test]
+    fn macro_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-warning\n## Heads up\n\nBody text.\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("macro block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="warning">"#)
+        );
+        assert!(rendered.storage.contains("<ac:rich-text-body>"));
+        assert!(rendered.storage.contains("<h2>Heads up</h2>"));
+        assert!(rendered.storage.contains("<p>Body text.</p>"));
     }
 
     #[test]
