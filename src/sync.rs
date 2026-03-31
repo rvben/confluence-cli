@@ -561,6 +561,7 @@ fn rewrite_macro_page_references(
         output.push('\n');
 
         let macro_mode = match lines[index].trim() {
+            ":::confluence-children" => Some(MacroPageReferenceMode::Children),
             ":::confluence-excerpt-include" => Some(MacroPageReferenceMode::ExcerptInclude),
             ":::confluence-include-page" => Some(MacroPageReferenceMode::IncludePage),
             ":::confluence-page-tree" => Some(MacroPageReferenceMode::PageTree),
@@ -605,6 +606,7 @@ fn rewrite_macro_page_references(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MacroPageReferenceMode {
+    Children,
     ExcerptInclude,
     IncludePage,
     PageTree,
@@ -622,6 +624,7 @@ fn rewrite_page_reference_parameter_line(
         return line.to_string();
     };
     let expected_parameter = match mode {
+        MacroPageReferenceMode::Children => "page",
         MacroPageReferenceMode::PageTree | MacroPageReferenceMode::PageTreeSearch => "root",
         MacroPageReferenceMode::AttachmentPreview => "page",
         MacroPageReferenceMode::ExcerptInclude | MacroPageReferenceMode::IncludePage => "page",
@@ -663,6 +666,12 @@ fn local_target_to_page_placeholder(
     };
     let link = link_index.by_markdown_path.get(&markdown_target)?;
     let placeholder = match mode {
+        MacroPageReferenceMode::Children => PageLinkPlaceholder {
+            content_id: None,
+            space_key: link.space_key.clone(),
+            content_title: Some(link.title.clone()),
+            anchor: None,
+        },
         MacroPageReferenceMode::ExcerptInclude => PageLinkPlaceholder {
             content_id: None,
             space_key: link.space_key.clone(),
@@ -1671,6 +1680,67 @@ mod tests {
                 r#"<ac:parameter ac:name="default-parameter">MFS:Sibling</ac:parameter>"#
             )
         );
+    }
+
+    #[test]
+    fn render_body_storage_rewrites_children_page_parameters_to_storage_macros() {
+        let current_dir = PathBuf::from("/tmp/root/current-page--123");
+        let sibling_dir = PathBuf::from("/tmp/root/sibling-page--456");
+        let current = LocalDocument {
+            directory: current_dir.clone(),
+            markdown_path: current_dir.join("index.md"),
+            sidecar_path: current_dir.join(".confluence.json"),
+            frontmatter: Frontmatter {
+                title: "Current".to_string(),
+                kind: "page".to_string(),
+                labels: vec![],
+                status: "current".to_string(),
+                parent: None,
+                properties: BTreeMap::new(),
+            },
+            body_markdown:
+                ":::confluence-children\npage: ../sibling-page--456/index.md\nall: true\nsort: creation\n:::\n"
+                    .to_string(),
+            sidecar: Sidecar {
+                content_id: Some("123".to_string()),
+                space_key: Some("MFS".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                web_path_prefix: Some("/wiki".to_string()),
+                ..Sidecar::default()
+            },
+        };
+        let sibling = LocalDocument {
+            directory: sibling_dir.clone(),
+            markdown_path: sibling_dir.join("index.md"),
+            sidecar_path: sibling_dir.join(".confluence.json"),
+            frontmatter: Frontmatter {
+                title: "Sibling".to_string(),
+                kind: "page".to_string(),
+                labels: vec![],
+                status: "current".to_string(),
+                parent: None,
+                properties: BTreeMap::new(),
+            },
+            body_markdown: "# Sibling".to_string(),
+            sidecar: Sidecar {
+                content_id: Some("456".to_string()),
+                space_key: Some("MFS".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                web_path_prefix: Some("/wiki".to_string()),
+                ..Sidecar::default()
+            },
+        };
+
+        let index = build_link_index(&[current.clone(), sibling]);
+        let storage =
+            render_body_storage(&current, &index, false, "/wiki").expect("render body storage");
+
+        assert!(storage.contains(r#"<ac:structured-macro ac:name="children">"#));
+        assert!(storage.contains(
+            r#"<ac:parameter ac:name="page"><ac:link><ri:page ri:content-title="Sibling" ri:space-key="MFS" /></ac:link></ac:parameter>"#
+        ));
+        assert!(storage.contains(r#"<ac:parameter ac:name="all">true</ac:parameter>"#));
+        assert!(storage.contains(r#"<ac:parameter ac:name="sort">creation</ac:parameter>"#));
     }
 
     #[test]

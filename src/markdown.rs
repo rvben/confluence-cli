@@ -861,13 +861,10 @@ fn render_page_tree_search_macro_block(node: Node<'_, '_>) -> Option<String> {
 fn render_recently_updated_macro_block(node: Node<'_, '_>) -> Option<String> {
     let mut parameters = collect_macro_parameters(node);
     if let Some(parameter) = find_macro_parameter(node, "spaces") {
-        if let Some(space) = namespaced_child(parameter, RI_NS, "space") {
-            let space_key = space
-                .attribute((RI_NS, "space-key"))
-                .or_else(|| space.attribute("ri:space-key"))
-                .or_else(|| space.attribute("space-key"))?;
-            parameters.insert("spaces".to_string(), space_key.to_string());
-        }
+        parameters.insert(
+            "spaces".to_string(),
+            collect_macro_parameter_value(parameter),
+        );
     }
     Some(render_parameter_only_macro_block_with_parameters(
         "recently-updated",
@@ -878,13 +875,10 @@ fn render_recently_updated_macro_block(node: Node<'_, '_>) -> Option<String> {
 fn render_space_key_macro_block(name: &str, node: Node<'_, '_>) -> Option<String> {
     let mut parameters = collect_macro_parameters(node);
     if let Some(parameter) = find_macro_parameter(node, "spaceKey") {
-        if let Some(space) = namespaced_child(parameter, RI_NS, "space") {
-            let space_key = space
-                .attribute((RI_NS, "space-key"))
-                .or_else(|| space.attribute("ri:space-key"))
-                .or_else(|| space.attribute("space-key"))?;
-            parameters.insert("spaceKey".to_string(), space_key.to_string());
-        }
+        parameters.insert(
+            "spaceKey".to_string(),
+            collect_macro_parameter_value(parameter),
+        );
     }
     Some(render_parameter_only_macro_block_with_parameters(
         name,
@@ -1082,16 +1076,9 @@ fn collect_generic_macro_parameter_value(parameter: Node<'_, '_>) -> Option<Stri
         return Some(format!("!space {}", space_keys.join(",")));
     }
 
-    if let Some(user) = namespaced_child(parameter, RI_NS, "user") {
-        let placeholder = UserMentionPlaceholder {
-            account_id: user.attribute((RI_NS, "account-id")).map(ToOwned::to_owned),
-            user_key: user.attribute((RI_NS, "userkey")).map(ToOwned::to_owned),
-            username: user.attribute((RI_NS, "username")).map(ToOwned::to_owned),
-        };
-        return Some(format!(
-            "!user {}",
-            build_user_placeholder_url(&placeholder)
-        ));
+    let user_placeholders = collect_user_parameter_placeholders(parameter);
+    if !user_placeholders.is_empty() {
+        return Some(format!("!user {}", user_placeholders.join(",")));
     }
 
     if let Some(page) = namespaced_child(parameter, RI_NS, "page") {
@@ -1153,6 +1140,23 @@ fn page_resource_placeholder(node: Node<'_, '_>) -> PageLinkPlaceholder {
             .map(ToOwned::to_owned),
         anchor: None,
     }
+}
+
+fn collect_user_parameter_placeholders(parameter: Node<'_, '_>) -> Vec<String> {
+    parameter
+        .children()
+        .filter(|child| {
+            child.is_element()
+                && child.tag_name().namespace() == Some(RI_NS)
+                && child.tag_name().name() == "user"
+        })
+        .map(|user| UserMentionPlaceholder {
+            account_id: user.attribute((RI_NS, "account-id")).map(ToOwned::to_owned),
+            user_key: user.attribute((RI_NS, "userkey")).map(ToOwned::to_owned),
+            username: user.attribute((RI_NS, "username")).map(ToOwned::to_owned),
+        })
+        .map(|placeholder| build_user_placeholder_url(&placeholder))
+        .collect()
 }
 
 fn render_rich_text_macro_block(
@@ -1609,13 +1613,9 @@ fn collect_macro_parameter_value(parameter: Node<'_, '_>) -> String {
         return space_keys.join(",");
     }
 
-    if let Some(user) = namespaced_child(parameter, RI_NS, "user") {
-        let placeholder = UserMentionPlaceholder {
-            account_id: user.attribute((RI_NS, "account-id")).map(ToOwned::to_owned),
-            user_key: user.attribute((RI_NS, "userkey")).map(ToOwned::to_owned),
-            username: user.attribute((RI_NS, "username")).map(ToOwned::to_owned),
-        };
-        return build_user_placeholder_url(&placeholder);
+    let user_placeholders = collect_user_parameter_placeholders(parameter);
+    if !user_placeholders.is_empty() {
+        return user_placeholders.join(",");
     }
 
     if let Some(page) = namespaced_child(parameter, RI_NS, "page") {
@@ -2052,7 +2052,7 @@ fn replace_parameterized_colon_macro_blocks(
             }
             "blog-posts" => {
                 let parameters = parse_macro_parameter_lines(&body, "confluence blog-posts macro")?;
-                build_parameter_only_macro_storage("blog-posts", &parameters)
+                build_blog_posts_macro_storage(&parameters)
             }
             "contributors" => {
                 let parameters =
@@ -2082,7 +2082,7 @@ fn replace_parameterized_colon_macro_blocks(
             }
             "children" => {
                 let parameters = parse_macro_parameter_lines(&body, "confluence children macro")?;
-                build_parameter_only_macro_storage("children", &parameters)
+                build_children_macro_storage(&parameters)?
             }
             "excerpt-include" => {
                 let parameters =
@@ -2766,10 +2766,14 @@ fn build_recently_updated_macro_storage(parameters: &BTreeMap<String, String>) -
     } else {
         None
     };
+    let author_xml = parameters
+        .remove("author")
+        .and_then(|author| build_optional_user_parameter_xml("author", &author));
     let parameters_xml = build_macro_parameters_xml(&parameters);
     format!(
-        r#"<ac:structured-macro ac:name="recently-updated">{parameters_xml}{}</ac:structured-macro>"#,
-        spaces_xml.unwrap_or_default()
+        r#"<ac:structured-macro ac:name="recently-updated">{parameters_xml}{}{}</ac:structured-macro>"#,
+        spaces_xml.unwrap_or_default(),
+        author_xml.unwrap_or_default()
     )
 }
 
@@ -2782,6 +2786,22 @@ fn build_spaces_macro_storage(name: &str, parameters: &BTreeMap<String, String>)
     format!(
         r#"<ac:structured-macro ac:name="{name}">{parameters_xml}{}</ac:structured-macro>"#,
         spaces_xml.unwrap_or_default()
+    )
+}
+
+fn build_blog_posts_macro_storage(parameters: &BTreeMap<String, String>) -> String {
+    let mut parameters = parameters.clone();
+    let spaces_xml = parameters
+        .remove("spaces")
+        .and_then(|spaces| build_space_parameter_xml("spaces", &spaces));
+    let author_xml = parameters
+        .remove("author")
+        .and_then(|author| build_optional_user_parameter_xml("author", &author));
+    let parameters_xml = build_macro_parameters_xml(&parameters);
+    format!(
+        r#"<ac:structured-macro ac:name="blog-posts">{parameters_xml}{}{}</ac:structured-macro>"#,
+        spaces_xml.unwrap_or_default(),
+        author_xml.unwrap_or_default()
     )
 }
 
@@ -2911,17 +2931,89 @@ fn build_space_parameter_xml(name: &str, spaces: &str) -> Option<String> {
 }
 
 fn build_user_parameter_xml(name: &str, user: &str) -> String {
-    if let Some(placeholder) =
-        parse_user_placeholder_url(user).or_else(|| parse_user_resource_identifier_text(user))
-    {
-        if let Some(resource_xml) = build_user_resource_xml(&placeholder) {
-            return format!(r#"<ac:parameter ac:name="{name}">{resource_xml}</ac:parameter>"#);
-        }
+    if let Some(parameter_xml) = build_optional_user_parameter_xml(name, user) {
+        return parameter_xml;
     }
     format!(
         r#"<ac:parameter ac:name="{name}">{}</ac:parameter>"#,
         escape_xml(user)
     )
+}
+
+fn build_optional_user_parameter_xml(name: &str, user: &str) -> Option<String> {
+    let trimmed = user.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(placeholder) = parse_user_resource_identifier_text(trimmed) {
+        if let Some(resource_xml) = build_user_resource_xml(&placeholder) {
+            return Some(format!(
+                r#"<ac:parameter ac:name="{name}">{resource_xml}</ac:parameter>"#
+            ));
+        }
+    }
+    if !trimmed.contains(',')
+        && let Some(placeholder) = parse_user_placeholder_url(trimmed)
+        && let Some(resource_xml) = build_user_resource_xml(&placeholder)
+    {
+        return Some(format!(
+            r#"<ac:parameter ac:name="{name}">{resource_xml}</ac:parameter>"#
+        ));
+    }
+
+    let values: Vec<_> = trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+
+    let resources = values
+        .iter()
+        .map(|value| {
+            parse_user_placeholder_url(value)
+                .or_else(|| parse_user_resource_identifier_text(value))
+                .and_then(|placeholder| build_user_resource_xml(&placeholder))
+        })
+        .collect::<Option<Vec<_>>>();
+    if let Some(resources) = resources {
+        return Some(format!(
+            r#"<ac:parameter ac:name="{name}">{}</ac:parameter>"#,
+            resources.join("")
+        ));
+    }
+
+    None
+}
+
+fn build_optional_linked_page_parameter_xml(name: &str, page: &str) -> Result<Option<String>> {
+    let trimmed = page.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let placeholder = parse_page_placeholder_url(trimmed)
+        .unwrap_or_else(|| parse_default_parameter_page_target(trimmed));
+    let page_xml = build_page_resource_xml(&placeholder)?;
+    Ok(Some(format!(
+        r#"<ac:parameter ac:name="{name}"><ac:link>{page_xml}</ac:link></ac:parameter>"#
+    )))
+}
+
+fn build_children_macro_storage(parameters: &BTreeMap<String, String>) -> Result<String> {
+    let mut parameters = parameters.clone();
+    let page_xml = parameters
+        .remove("page")
+        .map(|page| build_optional_linked_page_parameter_xml("page", &page))
+        .transpose()?
+        .flatten();
+    let parameters_xml = build_macro_parameters_xml(&parameters);
+    Ok(format!(
+        r#"<ac:structured-macro ac:name="children">{parameters_xml}{}</ac:structured-macro>"#,
+        page_xml.unwrap_or_default()
+    ))
 }
 
 fn build_user_resource_xml(user: &UserMentionPlaceholder) -> Option<String> {
@@ -3351,11 +3443,20 @@ mod tests {
 
     #[test]
     fn blog_posts_macros_export_to_blocks() {
-        let storage = r#"<ac:structured-macro ac:name="blog-posts"><ac:parameter ac:name="max">5</ac:parameter><ac:parameter ac:name="time">7</ac:parameter></ac:structured-macro>"#;
+        let storage = r#"<ac:structured-macro ac:name="blog-posts"><ac:parameter ac:name="author"><ri:user ri:userkey="user-123" /></ac:parameter><ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="max">5</ac:parameter><ac:parameter ac:name="time">7</ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains(":::confluence-blog-posts"));
+        assert!(markdown.contains("author: confluence-user://user?userkey=user-123"));
+        assert!(markdown.contains("spaces: TEST"));
         assert!(markdown.contains("max: 5"));
         assert!(markdown.contains("time: 7"));
+    }
+
+    #[test]
+    fn multi_author_blog_posts_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="blog-posts"><ac:parameter ac:name="author"><ri:user ri:userkey="user-123" /><ri:user ri:account-id="abc123" /></ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains("author: confluence-user://user?userkey=user-123,confluence-user://user?account-id=abc123"));
     }
 
     #[test]
@@ -3643,9 +3744,10 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
 
     #[test]
     fn recently_updated_macros_export_to_blocks() {
-        let storage = r#"<ac:structured-macro ac:name="recently-updated"><ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="max">10</ac:parameter></ac:structured-macro>"#;
+        let storage = r#"<ac:structured-macro ac:name="recently-updated"><ac:parameter ac:name="author"><ri:user ri:userkey="user-123" /></ac:parameter><ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="max">10</ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains(":::confluence-recently-updated"));
+        assert!(markdown.contains("author: confluence-user://user?userkey=user-123"));
         assert!(markdown.contains("spaces: TEST"));
         assert!(markdown.contains("max: 10"));
     }
@@ -3888,9 +3990,11 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
 
     #[test]
     fn children_macros_export_to_blocks() {
-        let storage = r#"<ac:structured-macro ac:name="children"><ac:parameter ac:name="all">true</ac:parameter><ac:parameter ac:name="sort">creation</ac:parameter></ac:structured-macro>"#;
+        let storage = r#"<ac:structured-macro ac:name="children"><ac:parameter ac:name="page"><ri:page ri:space-key="TEST" ri:content-title="Docs Home" /></ac:parameter><ac:parameter ac:name="all">true</ac:parameter><ac:parameter ac:name="sort">creation</ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains(":::confluence-children"));
+        assert!(markdown.contains("page: confluence-page://page?"));
+        assert!(markdown.contains("content-title=Docs+Home"));
         assert!(markdown.contains("all: true"));
         assert!(markdown.contains("sort: creation"));
     }
@@ -4126,13 +4230,19 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
 
     #[test]
     fn blog_posts_blocks_round_trip_back_to_structured_macros() {
-        let markdown = ":::confluence-blog-posts\nmax: 5\ntime: 7\n:::";
+        let markdown = ":::confluence-blog-posts\nauthor: confluence-user://user?userkey=user-123\nspaces: TEST\nmax: 5\ntime: 7\n:::";
         let rendered = markdown_to_storage(markdown, false).expect("blog-posts block converts");
         assert!(
             rendered
                 .storage
                 .contains(r#"<ac:structured-macro ac:name="blog-posts">"#)
         );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="author"><ri:user ri:userkey="user-123" /></ac:parameter>"#
+        ));
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter>"#
+        ));
         assert!(
             rendered
                 .storage
@@ -4143,6 +4253,16 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
                 .storage
                 .contains(r#"<ac:parameter ac:name="time">7</ac:parameter>"#)
         );
+    }
+
+    #[test]
+    fn multi_author_blog_posts_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-blog-posts\nauthor: confluence-user://user?userkey=user-123,confluence-user://user?account-id=abc123\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("multi-author blog-posts block converts");
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="author"><ri:user ri:userkey="user-123" /><ri:user ri:account-id="abc123" /></ac:parameter>"#
+        ));
     }
 
     #[test]
@@ -4865,7 +4985,7 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
 
     #[test]
     fn recently_updated_blocks_round_trip_back_to_structured_macros() {
-        let markdown = ":::confluence-recently-updated\nspaces: TEST\nmax: 10\n:::";
+        let markdown = ":::confluence-recently-updated\nauthor: confluence-user://user?userkey=user-123\nspaces: TEST\nmax: 10\n:::";
         let rendered =
             markdown_to_storage(markdown, false).expect("recently-updated block converts");
         assert!(
@@ -4873,6 +4993,9 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
                 .storage
                 .contains(r#"<ac:structured-macro ac:name="recently-updated">"#)
         );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="author"><ri:user ri:userkey="user-123" /></ac:parameter>"#
+        ));
         assert!(rendered.storage.contains(
             r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter>"#
         ));
@@ -4963,13 +5086,16 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
 
     #[test]
     fn children_blocks_round_trip_back_to_structured_macros() {
-        let markdown = ":::confluence-children\nall: true\nsort: creation\n:::";
+        let markdown = ":::confluence-children\npage: confluence-page://page?space-key=TEST&content-title=Docs+Home\nall: true\nsort: creation\n:::";
         let rendered = markdown_to_storage(markdown, false).expect("children block converts");
         assert!(
             rendered
                 .storage
                 .contains(r#"<ac:structured-macro ac:name="children">"#)
         );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="page"><ac:link><ri:page ri:content-title="Docs Home" ri:space-key="TEST" /></ac:link></ac:parameter>"#
+        ));
         assert!(
             rendered
                 .storage
