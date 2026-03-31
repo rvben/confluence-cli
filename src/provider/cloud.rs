@@ -55,18 +55,18 @@ impl CloudProvider {
             .await
     }
 
-    async fn content_v1(&self, id: &str, include_body: bool) -> Result<V1Content> {
+    async fn content_v1(&self, id: &str, include_body: bool, status: &str) -> Result<V1Content> {
         let expand = if include_body {
             "version,space,ancestors,body.storage,metadata.labels,history"
         } else {
             "version,space,ancestors,metadata.labels,history"
         };
+        let mut path = format!("/content/{id}?expand={expand}");
+        if status != "current" {
+            path.push_str(&format!("&status={}", urlencoding::encode(status)));
+        }
         self.http
-            .json(
-                Method::GET,
-                self.http.v1_url(&format!("/content/{id}?expand={expand}")),
-                None,
-            )
+            .json(Method::GET, self.http.v1_url(&path), None)
             .await
     }
 
@@ -171,6 +171,7 @@ impl CloudProvider {
                 .history
                 .as_ref()
                 .and_then(|history| parse_datetime(history.created_date.as_deref())),
+            version: comment.version.map(|v| v.number),
         }
     }
 }
@@ -202,7 +203,7 @@ impl ConfluenceProvider for CloudProvider {
             .http
             .json(
                 Method::GET,
-                self.http.v1_url(&format!("/space?limit={limit}")),
+                self.http.v1_url(&format!("/space?limit={limit}&expand=homepage")),
                 None,
             )
             .await?;
@@ -217,10 +218,16 @@ impl ConfluenceProvider for CloudProvider {
         self.space_by_key_or_id(key_or_id).await
     }
 
-    async fn search(&self, query: &str, cql: bool, limit: usize) -> Result<Vec<SearchResult>> {
+    async fn search(
+        &self,
+        query: &str,
+        cql: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchResult>> {
         let cql = build_search_cql(query, cql);
         let path = format!(
-            "/content/search?cql={}&limit={limit}&expand=space",
+            "/content/search?cql={}&limit={limit}&start={offset}&expand=space",
             urlencoding::encode(&cql)
         );
         let response: Results<V1Content> = self
@@ -246,7 +253,7 @@ impl ConfluenceProvider for CloudProvider {
             ContentKind::Page => {
                 let page = self.page_v2(id, include_body).await?;
                 let mut item = v2_page_to_item(&self.http.profile, page, labels, properties);
-                let enriched = self.content_v1(id, include_body).await?;
+                let enriched = self.content_v1(id, include_body, "current").await?;
                 item.space_key = enriched.space.as_ref().map(|space| space.key.clone());
                 item.parent_id = enriched
                     .ancestors
@@ -260,7 +267,7 @@ impl ConfluenceProvider for CloudProvider {
                 Ok(item)
             }
             ContentKind::BlogPost => {
-                let item = self.content_v1(id, include_body).await?;
+                let item = self.content_v1(id, include_body, "current").await?;
                 Ok(v1_content_to_item(
                     &self.http.profile.base_url,
                     item,
@@ -359,7 +366,27 @@ impl ConfluenceProvider for CloudProvider {
                 for (key, value) in &request.properties {
                     let _ = self.set_property(&content_id, key, value.clone()).await;
                 }
-                self.get_content(ContentKind::Page, &content_id, true).await
+                let labels = self.labels_for(&content_id).await.unwrap_or_default();
+                let properties = normalize_properties(
+                    self.properties_for(&content_id).await.unwrap_or_default(),
+                );
+                let page = self.page_v2(&content_id, true).await?;
+                let mut item =
+                    v2_page_to_item(&self.http.profile, page, labels, properties);
+                let enriched = self
+                    .content_v1(&content_id, true, &request.status)
+                    .await?;
+                item.space_key = enriched.space.as_ref().map(|space| space.key.clone());
+                item.parent_id = enriched
+                    .ancestors
+                    .last()
+                    .map(|ancestor| ancestor.id.clone());
+                if item.body_storage.is_none() {
+                    item.body_storage = enriched
+                        .body
+                        .and_then(|body| body.storage.map(|storage| storage.value));
+                }
+                Ok(item)
             }
             ContentKind::BlogPost => {
                 let body = json!({
@@ -385,8 +412,19 @@ impl ConfluenceProvider for CloudProvider {
                 for (key, value) in &request.properties {
                     let _ = self.set_property(&content_id, key, value.clone()).await;
                 }
-                self.get_content(ContentKind::BlogPost, &content_id, true)
-                    .await
+                let labels = self.labels_for(&content_id).await.unwrap_or_default();
+                let properties = normalize_properties(
+                    self.properties_for(&content_id).await.unwrap_or_default(),
+                );
+                let item = self
+                    .content_v1(&content_id, true, &request.status)
+                    .await?;
+                Ok(v1_content_to_item(
+                    &self.http.profile.base_url,
+                    item,
+                    labels,
+                    properties,
+                ))
             }
         }
     }
@@ -685,6 +723,38 @@ impl ConfluenceProvider for CloudProvider {
             )
             .await?;
         Ok(self.map_comment(comment))
+    }
+
+    async fn update_comment(&self, comment_id: &str, text: &str) -> Result<CommentInfo> {
+        ensure_writable(&self.http.profile)?;
+        let current: V1Comment = self
+            .http
+            .json(
+                Method::GET,
+                self.http.v1_url(&format!(
+                    "/content/{comment_id}?expand=body.storage,version"
+                )),
+                None,
+            )
+            .await?;
+        let version = current
+            .version
+            .as_ref()
+            .map(|v| v.number)
+            .ok_or_else(|| anyhow!("comment version unavailable"))?;
+        let updated: V1Comment = self
+            .http
+            .json(
+                Method::PUT,
+                self.http.v1_url(&format!("/content/{comment_id}")),
+                Some(json!({
+                    "type": "comment",
+                    "version": { "number": version + 1 },
+                    "body": { "storage": { "value": text, "representation": "storage" } }
+                })),
+            )
+            .await?;
+        Ok(self.map_comment(updated))
     }
 
     async fn delete_comment(&self, comment_id: &str) -> Result<()> {

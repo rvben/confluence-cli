@@ -111,6 +111,7 @@ pub struct CommentInfo {
     pub author: Option<String>,
     pub body_storage: String,
     pub created_at: Option<DateTime<Utc>>,
+    pub version: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +188,9 @@ pub struct PlanItem {
     pub content_id: Option<String>,
     pub path: PathBuf,
     pub details: String,
+    /// Unified diff of the markdown body for update actions when --diff is requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

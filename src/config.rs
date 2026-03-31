@@ -382,7 +382,7 @@ impl EnvOverride {
             .ok()
             .map(|v| match v.to_ascii_lowercase().as_str() {
                 "cloud" => Ok(ProviderKind::Cloud),
-                "dc" | "datacenter" | "data_center" | "server" => Ok(ProviderKind::DataCenter),
+                "dc" | "datacenter" | "data_center" | "data-center" | "server" => Ok(ProviderKind::DataCenter),
                 other => bail!("unsupported CONFLUENCE_PROVIDER `{other}`"),
             })
             .transpose()?;

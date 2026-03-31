@@ -30,7 +30,13 @@ pub trait ConfluenceProvider: Send + Sync {
     async fn resolve_page_ref(&self, reference: &str) -> Result<String>;
     async fn list_spaces(&self, limit: usize) -> Result<Vec<SpaceSummary>>;
     async fn get_space(&self, key_or_id: &str) -> Result<SpaceSummary>;
-    async fn search(&self, query: &str, cql: bool, limit: usize) -> Result<Vec<SearchResult>>;
+    async fn search(
+        &self,
+        query: &str,
+        cql: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchResult>>;
     async fn get_content(
         &self,
         kind: ContentKind,
@@ -63,6 +69,7 @@ pub trait ConfluenceProvider: Send + Sync {
     async fn remove_label(&self, content_id: &str, label: &str) -> Result<()>;
     async fn list_comments(&self, content_id: &str) -> Result<Vec<CommentInfo>>;
     async fn add_comment(&self, content_id: &str, text: &str) -> Result<CommentInfo>;
+    async fn update_comment(&self, comment_id: &str, text: &str) -> Result<CommentInfo>;
     async fn delete_comment(&self, comment_id: &str) -> Result<()>;
     async fn list_properties(&self, content_id: &str) -> Result<Vec<ContentProperty>>;
     async fn get_property(&self, content_id: &str, key: &str) -> Result<Option<ContentProperty>>;
@@ -151,8 +158,9 @@ impl HttpClient {
         let response = self.send_with_retry(request, &url).await?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("request to {url} failed with {status}: {body}");
+            let raw = response.text().await.unwrap_or_default();
+            let message = extract_error_message(&raw);
+            bail!("request to {url} failed with {status}: {message}");
         }
         Ok(response.json::<T>().await?)
     }
@@ -165,8 +173,9 @@ impl HttpClient {
         let response = self.send_with_retry(request, &url).await?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("request to {url} failed with {status}: {body}");
+            let raw = response.text().await.unwrap_or_default();
+            let message = extract_error_message(&raw);
+            bail!("request to {url} failed with {status}: {message}");
         }
         Ok(())
     }
@@ -177,8 +186,9 @@ impl HttpClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("request to {url} failed with {status}: {body}");
+            let raw = response.text().await.unwrap_or_default();
+            let message = extract_error_message(&raw);
+            bail!("request to {url} failed with {status}: {message}");
         }
         Ok(response.bytes().await?)
     }
@@ -704,6 +714,15 @@ pub fn property_payload(key: &str, value: Value, version: Option<u64>) -> Value 
         body["version"] = json!({ "number": version + 1 });
     }
     body
+}
+
+fn extract_error_message(raw: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        if let Some(msg) = value.get("message").and_then(|m| m.as_str()) {
+            return msg.to_string();
+        }
+    }
+    raw.to_string()
 }
 
 pub fn ensure_writable(profile: &ResolvedProfile) -> Result<()> {

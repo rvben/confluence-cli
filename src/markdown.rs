@@ -55,6 +55,18 @@ pub struct Sidecar {
     #[serde(default)]
     pub attachment_map: BTreeMap<String, AttachmentState>,
     pub last_sync_at: Option<DateTime<Utc>>,
+    /// Title as of the last pull/apply, used by plan to detect title changes.
+    #[serde(default)]
+    pub last_pulled_title: Option<String>,
+    /// Labels as of the last pull/apply, used by plan to detect label changes.
+    #[serde(default)]
+    pub last_pulled_labels: Vec<String>,
+    /// Status as of the last pull/apply, used by plan to detect status changes.
+    #[serde(default)]
+    pub last_pulled_status: Option<String>,
+    /// SHA-256 of the JSON-serialised properties map as of the last pull/apply.
+    #[serde(default)]
+    pub last_pulled_properties_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]

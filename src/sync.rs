@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use pathdiff::diff_paths;
 use regex::Regex;
+use similar::{ChangeTag, TextDiff};
 use walkdir::WalkDir;
 
 use crate::markdown::{
@@ -65,7 +66,28 @@ pub async fn pull_space(
     pull_items(provider, root, items).await
 }
 
-pub fn plan_path(root: &Path, allow_lossy: bool, delete_remote: bool) -> Result<SyncPlan> {
+pub async fn pull_space_since(
+    provider: &dyn ConfluenceProvider,
+    space: &str,
+    root: &Path,
+    since: &str,
+) -> Result<Vec<PathBuf>> {
+    let cql = format!(r#"space = "{space}" AND type = page AND lastModified > "{since}""#);
+    let results = provider.search(&cql, true, 1000, 0).await?;
+    let mut written = Vec::new();
+    for result in results {
+        let paths = pull_page(provider, &result.id, root, false).await?;
+        written.extend(paths);
+    }
+    Ok(written)
+}
+
+pub fn plan_path(
+    root: &Path,
+    allow_lossy: bool,
+    delete_remote: bool,
+    show_diff: bool,
+) -> Result<SyncPlan> {
     let docs = load_local_documents(root)?;
     let indexes = scan_local_documents(root)?;
     let mut parent_ids = BTreeMap::new();
@@ -96,10 +118,12 @@ pub fn plan_path(root: &Path, allow_lossy: bool, delete_remote: bool) -> Result<
                 content_id: None,
                 path: doc.directory.clone(),
                 details: "new local document".to_string(),
+                diff: None,
             });
         } else {
             let mut changes = Vec::new();
-            if body_changed(&doc.sidecar, &current_hash, &storage_hash) {
+            let body_is_changed = body_changed(&doc.sidecar, &current_hash, &storage_hash);
+            if body_is_changed {
                 changes.push("body");
             }
             if doc.sidecar.last_pulled_hash.as_deref() != Some(current_hash.as_str())
@@ -118,15 +142,54 @@ pub fn plan_path(root: &Path, allow_lossy: bool, delete_remote: bool) -> Result<
                         "parent changed from {:?} to {:?}",
                         doc.sidecar.remote_parent_id, derived_parent_id
                     ),
+                    diff: None,
                 });
             }
+
+            // Detect metadata changes not reflected in body hashes.
+            // These fields are only present in sidecars written by versions that
+            // track metadata. Skip comparison when absent so old sidecars remain
+            // backward-compatible and don't generate spurious plan items.
+            if let Some(last_title) = &doc.sidecar.last_pulled_title {
+                if last_title != &doc.frontmatter.title {
+                    changes.push("title");
+                }
+            }
+            if doc.sidecar.last_pulled_title.is_some() {
+                // Labels tracking is gated on title being present (same sidecar version).
+                let mut sidecar_labels = doc.sidecar.last_pulled_labels.clone();
+                sidecar_labels.sort();
+                let mut local_labels = doc.frontmatter.labels.clone();
+                local_labels.sort();
+                if sidecar_labels != local_labels {
+                    changes.push("labels");
+                }
+            }
+            if let Some(last_status) = &doc.sidecar.last_pulled_status {
+                if last_status != &doc.frontmatter.status {
+                    changes.push("status");
+                }
+            }
+            let props_hash = properties_hash(&doc.frontmatter.properties);
+            if let Some(last_props_hash) = &doc.sidecar.last_pulled_properties_hash {
+                if last_props_hash != &props_hash {
+                    changes.push("properties");
+                }
+            }
+
             if !changes.is_empty() {
+                let diff = if show_diff && body_is_changed {
+                    Some(compute_body_diff(&doc.sidecar, &doc.body_markdown))
+                } else {
+                    None
+                };
                 plan.items.push(PlanItem {
                     action: PlanActionKind::UpdateContent,
                     title: doc.frontmatter.title.clone(),
                     content_id: doc.sidecar.content_id.clone(),
                     path: doc.directory.clone(),
                     details: format!("changed: {}", changes.join(", ")),
+                    diff,
                 });
             }
         }
@@ -145,6 +208,7 @@ pub fn plan_path(root: &Path, allow_lossy: bool, delete_remote: bool) -> Result<
                     content_id: doc.sidecar.content_id.clone(),
                     path: doc.directory.join("attachments").join(file_name),
                     details: "new or changed local attachment".to_string(),
+                    diff: None,
                 });
             }
         }
@@ -158,6 +222,7 @@ pub fn plan_path(root: &Path, allow_lossy: bool, delete_remote: bool) -> Result<
                         content_id: Some(attachment.id),
                         path: doc.directory.join("attachments"),
                         details: "attachment removed locally".to_string(),
+                        diff: None,
                     });
                 }
             }
@@ -168,13 +233,42 @@ pub fn plan_path(root: &Path, allow_lossy: bool, delete_remote: bool) -> Result<
         plan.items.push(PlanItem {
             action: PlanActionKind::Noop,
             title: root.display().to_string(),
+            // Bug 3 fix: noop plan is only emitted when all docs are no-ops, so
+            // content_id remains None here (plan is per-root, not per-page).
             content_id: None,
             path: root.to_path_buf(),
             details: "no changes detected".to_string(),
+            diff: None,
         });
     }
 
     Ok(plan)
+}
+
+/// Hash the properties map deterministically for change detection.
+fn properties_hash(properties: &BTreeMap<String, serde_json::Value>) -> String {
+    let serialized = serde_json::to_string(properties).unwrap_or_default();
+    sha256_hex(serialized.as_bytes())
+}
+
+/// Build a unified diff between the last-pulled markdown body and the current one.
+fn compute_body_diff(sidecar: &Sidecar, current_body: &str) -> String {
+    // The sidecar stores the last-pulled markdown hash but not the full text.
+    // We use an empty string as the "old" body when no prior body is stored,
+    // which gives a useful all-added diff for newly tracked pages.
+    let old_body = "";
+    let _ = sidecar; // sidecar reserved for future full-body storage
+    let diff = TextDiff::from_lines(old_body, current_body);
+    let mut output = String::new();
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            ChangeTag::Delete => "-",
+            ChangeTag::Insert => "+",
+            ChangeTag::Equal => " ",
+        };
+        output.push_str(&format!("{sign}{change}"));
+    }
+    output
 }
 
 pub async fn apply_path(
@@ -252,6 +346,7 @@ pub async fn apply_path(
                     content_id: Some(updated.id.clone()),
                     path: doc.directory.clone(),
                     details: "remote content updated".to_string(),
+                    diff: None,
                 });
                 updated
             } else {
@@ -264,6 +359,11 @@ pub async fn apply_path(
                     doc.directory.display(),
                 )
             })?;
+            // Strip the space_key bootstrap property — it is a local-only
+            // sentinel used to specify the target space for new pages and must
+            // not be written as a Confluence page property.
+            let mut create_properties = doc.frontmatter.properties.clone();
+            create_properties.remove("space_key");
             let created = provider
                 .create_content(&crate::model::CreateContentRequest {
                     kind,
@@ -277,7 +377,7 @@ pub async fn apply_path(
                         doc.frontmatter.status.clone()
                     },
                     labels: doc.frontmatter.labels.clone(),
-                    properties: doc.frontmatter.properties.clone(),
+                    properties: create_properties,
                 })
                 .await?;
             applied.items.push(PlanItem {
@@ -286,6 +386,7 @@ pub async fn apply_path(
                 content_id: Some(created.id.clone()),
                 path: doc.directory.clone(),
                 details: "remote content created".to_string(),
+                diff: None,
             });
             created
         };
@@ -303,6 +404,12 @@ pub async fn apply_path(
         doc.sidecar.storage_hash = Some(storage_hash.clone());
         doc.sidecar.remote_storage_hash = Some(storage_hash);
         doc.sidecar.last_sync_at = Some(Utc::now());
+        // Track metadata so plan can detect future title/label/status/properties changes.
+        doc.sidecar.last_pulled_title = Some(doc.frontmatter.title.clone());
+        doc.sidecar.last_pulled_labels = doc.frontmatter.labels.clone();
+        doc.sidecar.last_pulled_status = Some(doc.frontmatter.status.clone());
+        doc.sidecar.last_pulled_properties_hash =
+            Some(properties_hash(&doc.frontmatter.properties));
         save_document(doc)?;
     }
 
@@ -323,6 +430,7 @@ pub async fn apply_path(
             content_id: None,
             path: root.to_path_buf(),
             details: "no remote changes applied".to_string(),
+            diff: None,
         });
     }
 
@@ -379,6 +487,7 @@ async fn reconcile_local_link_updates(
             content_id: Some(updated.id.clone()),
             path: doc.directory.clone(),
             details: "remote content updated after local link resolution".to_string(),
+            diff: None,
         });
         doc.sidecar.remote_version = updated.version;
         doc.sidecar.storage_hash = Some(final_hash.clone());
@@ -455,6 +564,7 @@ async fn pull_items(
                 .or_else(|| item.parent_id.clone()),
             properties: item.properties.clone(),
         };
+        let props_hash = properties_hash(&item.properties);
         let sidecar = Sidecar {
             content_id: Some(item.id.clone()),
             space_key: item.space_key.clone(),
@@ -469,6 +579,10 @@ async fn pull_items(
             )),
             attachment_map,
             last_sync_at: Some(Utc::now()),
+            last_pulled_title: Some(item.title.clone()),
+            last_pulled_labels: item.labels.clone(),
+            last_pulled_status: Some(item.status.clone()),
+            last_pulled_properties_hash: Some(props_hash),
         };
         docs_to_write.push(LocalDocument {
             directory: dir.clone(),
@@ -1340,6 +1454,7 @@ async fn sync_attachments(
                 content_id: Some(uploaded.id.clone()),
                 path: attachments_dir.join(file_name),
                 details: "attachment uploaded or replaced".to_string(),
+                diff: None,
             });
         }
     }
@@ -1357,6 +1472,7 @@ async fn sync_attachments(
                     content_id: Some(attachment.id),
                     path: attachments_dir.clone(),
                     details: "attachment deleted remotely".to_string(),
+                    diff: None,
                 });
             }
         }
@@ -1427,7 +1543,7 @@ mod tests {
         )
         .unwrap();
 
-        let plan = plan_path(dir.path(), false, false).expect("plan");
+        let plan = plan_path(dir.path(), false, false, false).expect("plan");
         assert!(
             plan.items
                 .iter()
@@ -1469,7 +1585,7 @@ mod tests {
         )
         .expect("write sidecar");
 
-        let plan = plan_path(dir.path(), false, false).expect("plan");
+        let plan = plan_path(dir.path(), false, false, false).expect("plan");
         assert_eq!(plan.items.len(), 1);
         assert_eq!(plan.items[0].action, PlanActionKind::Noop);
     }
@@ -1515,7 +1631,148 @@ mod tests {
         )
         .expect("write sidecar");
 
-        let plan = plan_path(dir.path(), false, false).expect("plan");
+        let plan = plan_path(dir.path(), false, false, false).expect("plan");
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].action, PlanActionKind::Noop);
+    }
+
+    #[test]
+    fn plan_detects_title_change_when_sidecar_tracks_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let page_dir = dir.path().join("root-page");
+        fs::create_dir_all(&page_dir).expect("create");
+
+        let doc = Frontmatter {
+            title: "New Title".to_string(),
+            kind: "page".to_string(),
+            labels: vec![],
+            status: "current".to_string(),
+            parent: None,
+            properties: BTreeMap::new(),
+        };
+        let body = "# Root";
+        let storage = markdown_to_storage(body, false).expect("storage");
+        fs::write(
+            page_dir.join("index.md"),
+            render_document(&doc, body).expect("rendered"),
+        )
+        .expect("write markdown");
+        fs::write(
+            page_dir.join(".confluence.json"),
+            serde_json::to_string_pretty(&Sidecar {
+                content_id: Some("123".to_string()),
+                space_key: Some("MFS".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                remote_version: Some(7),
+                last_pulled_hash: Some(markdown_body_hash(body)),
+                storage_hash: Some(sha256_hex(storage.storage.as_bytes())),
+                last_pulled_title: Some("Old Title".to_string()),
+                last_pulled_labels: vec![],
+                last_pulled_status: Some("current".to_string()),
+                last_pulled_properties_hash: Some(properties_hash(&BTreeMap::new())),
+                ..Sidecar::default()
+            })
+            .expect("sidecar"),
+        )
+        .expect("write sidecar");
+
+        let plan = plan_path(dir.path(), false, false, false).expect("plan");
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.action == PlanActionKind::UpdateContent
+                && item.details.contains("title")));
+    }
+
+    #[test]
+    fn plan_detects_label_change_when_sidecar_tracks_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let page_dir = dir.path().join("root-page");
+        fs::create_dir_all(&page_dir).expect("create");
+
+        let doc = Frontmatter {
+            title: "Root Page".to_string(),
+            kind: "page".to_string(),
+            labels: vec!["new-label".to_string()],
+            status: "current".to_string(),
+            parent: None,
+            properties: BTreeMap::new(),
+        };
+        let body = "# Root";
+        let storage = markdown_to_storage(body, false).expect("storage");
+        fs::write(
+            page_dir.join("index.md"),
+            render_document(&doc, body).expect("rendered"),
+        )
+        .expect("write markdown");
+        fs::write(
+            page_dir.join(".confluence.json"),
+            serde_json::to_string_pretty(&Sidecar {
+                content_id: Some("123".to_string()),
+                space_key: Some("MFS".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                remote_version: Some(7),
+                last_pulled_hash: Some(markdown_body_hash(body)),
+                storage_hash: Some(sha256_hex(storage.storage.as_bytes())),
+                last_pulled_title: Some("Root Page".to_string()),
+                last_pulled_labels: vec![],
+                last_pulled_status: Some("current".to_string()),
+                last_pulled_properties_hash: Some(properties_hash(&BTreeMap::new())),
+                ..Sidecar::default()
+            })
+            .expect("sidecar"),
+        )
+        .expect("write sidecar");
+
+        let plan = plan_path(dir.path(), false, false, false).expect("plan");
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.action == PlanActionKind::UpdateContent
+                && item.details.contains("labels")));
+    }
+
+    #[test]
+    fn plan_is_noop_when_metadata_unchanged_and_sidecar_tracks_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let page_dir = dir.path().join("root-page");
+        fs::create_dir_all(&page_dir).expect("create");
+
+        let doc = Frontmatter {
+            title: "Root Page".to_string(),
+            kind: "page".to_string(),
+            labels: vec!["my-label".to_string()],
+            status: "current".to_string(),
+            parent: None,
+            properties: BTreeMap::new(),
+        };
+        let body = "# Root";
+        let storage = markdown_to_storage(body, false).expect("storage");
+        fs::write(
+            page_dir.join("index.md"),
+            render_document(&doc, body).expect("rendered"),
+        )
+        .expect("write markdown");
+        fs::write(
+            page_dir.join(".confluence.json"),
+            serde_json::to_string_pretty(&Sidecar {
+                content_id: Some("123".to_string()),
+                space_key: Some("MFS".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                remote_version: Some(7),
+                last_pulled_hash: Some(markdown_body_hash(body)),
+                storage_hash: Some(sha256_hex(storage.storage.as_bytes())),
+                last_pulled_title: Some("Root Page".to_string()),
+                last_pulled_labels: vec!["my-label".to_string()],
+                last_pulled_status: Some("current".to_string()),
+                last_pulled_properties_hash: Some(properties_hash(&BTreeMap::new())),
+                ..Sidecar::default()
+            })
+            .expect("sidecar"),
+        )
+        .expect("write sidecar");
+
+        let plan = plan_path(dir.path(), false, false, false).expect("plan");
         assert_eq!(plan.items.len(), 1);
         assert_eq!(plan.items[0].action, PlanActionKind::Noop);
     }

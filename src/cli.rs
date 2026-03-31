@@ -112,6 +112,12 @@ enum SpaceCommand {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ContentTypeFilter {
+    Page,
+    Blog,
+}
+
 #[derive(Args, Debug)]
 struct SearchArgs {
     query: String,
@@ -119,12 +125,21 @@ struct SearchArgs {
     cql: bool,
     #[arg(long)]
     space: Option<String>,
+    #[arg(long, value_enum)]
+    r#type: Option<ContentTypeFilter>,
     #[arg(long, default_value_t = 20)]
     limit: usize,
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
 }
 
 #[derive(Subcommand, Debug)]
 enum PageCommand {
+    List {
+        space: String,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
     Get {
         reference: String,
         #[arg(long)]
@@ -135,15 +150,26 @@ enum PageCommand {
         #[arg(long, default_value_t = true)]
         recursive: bool,
     },
+    Move {
+        reference: String,
+        parent: String,
+    },
     Create(WriteContentArgs),
     Update(UpdateContentArgs),
     Delete {
         reference: String,
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum BlogCommand {
+    List {
+        space: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     Get {
         id: String,
         #[arg(long)]
@@ -153,6 +179,8 @@ enum BlogCommand {
     Update(UpdateContentArgs),
     Delete {
         id: String,
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -160,7 +188,12 @@ enum BlogCommand {
 enum PullCommand {
     Page { reference: String, output: PathBuf },
     Tree { reference: String, output: PathBuf },
-    Space { space: String, output: PathBuf },
+    Space {
+        space: String,
+        output: PathBuf,
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -170,6 +203,8 @@ struct PlanArgs {
     allow_lossy: bool,
     #[arg(long)]
     delete_remote: bool,
+    #[arg(long)]
+    diff: bool,
 }
 
 #[derive(Args, Debug)]
@@ -217,6 +252,8 @@ enum AttachmentCommand {
     Delete {
         reference: String,
         attachment_id: String,
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -237,8 +274,15 @@ enum CommentCommand {
         #[command(flatten)]
         body: BodyInput,
     },
+    Update {
+        comment_id: String,
+        #[command(flatten)]
+        body: BodyInput,
+    },
     Delete {
         comment_id: String,
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -420,8 +464,10 @@ pub async fn run() -> Result<()> {
         }
         Commands::Doctor(args) => handle_doctor(cli.profile.as_deref(), args, output).await,
         Commands::Plan(args) => {
-            let plan = sync::plan_path(&args.path, args.allow_lossy, args.delete_remote)?;
-            render_plan(&plan, output)
+            let show_diff = args.diff;
+            let plan =
+                sync::plan_path(&args.path, args.allow_lossy, args.delete_remote, show_diff)?;
+            render_plan(&plan, output, show_diff)
         }
         Commands::Apply(args) => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
@@ -433,7 +479,7 @@ pub async fn run() -> Result<()> {
                 args.force,
             )
             .await?;
-            render_plan(&plan, output)
+            render_plan(&plan, output, false)
         }
         Commands::Attachment { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
@@ -695,7 +741,7 @@ async fn handle_doctor(
                 format!("path `{}` does not exist", path.display()),
             );
         } else {
-            match sync::plan_path(path, false, false) {
+            match sync::plan_path(path, false, false, false) {
                 Ok(plan) => push_doctor_check(
                     &mut report,
                     "sync_path",
@@ -814,19 +860,31 @@ async fn handle_search(
     args: SearchArgs,
     output: OutputFormat,
 ) -> Result<()> {
-    let query = if let Some(space) = args.space {
-        if args.cql {
-            format!("space = \"{space}\" and ({})", args.query)
+    // When --space or --type are provided alongside a plain-text query, we build
+    // CQL ourselves so the filters can be combined correctly.
+    let needs_cql_build = args.space.is_some() || args.r#type.is_some();
+    let (query, is_cql) = if needs_cql_build {
+        let text_clause = if args.cql {
+            args.query.clone()
         } else {
-            format!(
-                "space = \"{space}\" and text ~ \"{}\"",
-                args.query.replace('"', "\\\"")
-            )
+            format!("text ~ \"{}\"", args.query.replace('"', "\\\""))
+        };
+        let mut clauses = vec![text_clause];
+        if let Some(space) = &args.space {
+            clauses.push(format!("space = \"{space}\""));
         }
+        if let Some(content_type) = args.r#type {
+            let type_str = match content_type {
+                ContentTypeFilter::Page => "page",
+                ContentTypeFilter::Blog => "blogpost",
+            };
+            clauses.push(format!("type = \"{type_str}\""));
+        }
+        (clauses.join(" and "), true)
     } else {
-        args.query
+        (args.query, args.cql)
     };
-    let results = provider.search(&query, args.cql, args.limit).await?;
+    let results = provider.search(&query, is_cql, args.limit, args.offset).await?;
     render_search_results(&results, output)?;
     Ok(())
 }
@@ -837,6 +895,13 @@ async fn handle_page(
     output: OutputFormat,
 ) -> Result<()> {
     match command {
+        PageCommand::List { space, limit } => {
+            let mut pages = provider
+                .list_space_content(ContentKind::Page, &space, false)
+                .await?;
+            pages.truncate(limit);
+            render_content_items(&pages, output, false)?;
+        }
         PageCommand::Get {
             reference,
             show_body,
@@ -856,6 +921,28 @@ async fn handle_page(
             let mut items = vec![root];
             items.extend(provider.list_children(&id, recursive).await?);
             render_content_items(&items, output, false)?;
+        }
+        PageCommand::Move { reference, parent } => {
+            let id = provider.resolve_page_ref(&reference).await?;
+            let parent_id = provider.resolve_page_ref(&parent).await?;
+            let current = provider.get_content(ContentKind::Page, &id, true).await?;
+            let updated = provider
+                .update_content(&UpdateContentRequest {
+                    id: id.clone(),
+                    kind: ContentKind::Page,
+                    title: current.title,
+                    parent_id: Some(parent_id),
+                    body_storage: current.body_storage.unwrap_or_default(),
+                    version: current
+                        .version
+                        .ok_or_else(|| anyhow!("page version unavailable"))?,
+                    message: Some("Moved via confluence-cli".to_string()),
+                    status: current.status,
+                    labels: current.labels,
+                    properties: current.properties,
+                })
+                .await?;
+            render_content_items(&[updated], output, false)?;
         }
         PageCommand::Create(args) => {
             let parent_id = if let Some(parent) = args.parent.as_deref() {
@@ -927,8 +1014,9 @@ async fn handle_page(
                 .await?;
             render_content_items(&[updated], output, true)?;
         }
-        PageCommand::Delete { reference } => {
+        PageCommand::Delete { reference, yes } => {
             let id = provider.resolve_page_ref(&reference).await?;
+            confirm_destructive(yes, &format!("Delete page {id}?"))?;
             provider.delete_content(ContentKind::Page, &id).await?;
             print_status(output, json!({ "id": id, "deleted": true }), "Deleted page")?;
         }
@@ -942,6 +1030,13 @@ async fn handle_blog(
     output: OutputFormat,
 ) -> Result<()> {
     match command {
+        BlogCommand::List { space, limit } => {
+            let mut posts = provider
+                .list_space_content(ContentKind::BlogPost, &space, false)
+                .await?;
+            posts.truncate(limit);
+            render_content_items(&posts, output, false)?;
+        }
         BlogCommand::Get { id, show_body } => {
             let item = provider
                 .get_content(ContentKind::BlogPost, &id, show_body)
@@ -1009,7 +1104,8 @@ async fn handle_blog(
                 .await?;
             render_content_items(&[updated], output, true)?;
         }
-        BlogCommand::Delete { id } => {
+        BlogCommand::Delete { id, yes } => {
+            confirm_destructive(yes, &format!("Delete blog post {id}?"))?;
             provider.delete_content(ContentKind::BlogPost, &id).await?;
             print_status(
                 output,
@@ -1033,7 +1129,17 @@ async fn handle_pull(
         PullCommand::Tree { reference, output } => {
             sync::pull_page(provider, &reference, &output, true).await?
         }
-        PullCommand::Space { space, output } => sync::pull_space(provider, &space, &output).await?,
+        PullCommand::Space {
+            space,
+            output,
+            since,
+        } => {
+            if let Some(since) = since {
+                sync::pull_space_since(provider, &space, &output, &since).await?
+            } else {
+                sync::pull_space(provider, &space, &output).await?
+            }
+        }
     };
     if matches!(output, OutputFormat::Json) {
         print_json(&written)?;
@@ -1096,8 +1202,10 @@ async fn handle_attachment(
         AttachmentCommand::Delete {
             reference,
             attachment_id,
+            yes,
         } => {
             let id = provider.resolve_page_ref(&reference).await?;
+            confirm_destructive(yes, &format!("Delete attachment {attachment_id}?"))?;
             provider.delete_attachment(&id, &attachment_id).await?;
             print_status(
                 output,
@@ -1163,7 +1271,13 @@ async fn handle_comment(
             let comment = provider.add_comment(&id, &storage).await?;
             render_comments(&[comment], output)?;
         }
-        CommentCommand::Delete { comment_id } => {
+        CommentCommand::Update { comment_id, body } => {
+            let storage = read_body_storage(&body)?;
+            let comment = provider.update_comment(&comment_id, &storage).await?;
+            render_comments(&[comment], output)?;
+        }
+        CommentCommand::Delete { comment_id, yes } => {
+            confirm_destructive(yes, &format!("Delete comment {comment_id}?"))?;
             provider.delete_comment(&comment_id).await?;
             print_status(
                 output,
@@ -1432,7 +1546,7 @@ fn render_properties(items: &[ContentProperty], output: OutputFormat) -> Result<
     }
 }
 
-fn render_plan(plan: &SyncPlan, output: OutputFormat) -> Result<()> {
+fn render_plan(plan: &SyncPlan, output: OutputFormat, show_diff: bool) -> Result<()> {
     if matches!(output, OutputFormat::Json) {
         print_json(plan)
     } else {
@@ -1452,6 +1566,14 @@ fn render_plan(plan: &SyncPlan, output: OutputFormat) -> Result<()> {
             })
             .collect::<Vec<_>>();
         print_table(&["action", "title", "id", "path", "details"], &rows);
+        if show_diff {
+            for item in &plan.items {
+                if let Some(diff) = &item.diff {
+                    println!("\n--- diff: {} ---", item.title);
+                    print!("{diff}");
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1628,6 +1750,20 @@ fn doctor_status_label(status: DoctorCheckStatus) -> &'static str {
         DoctorCheckStatus::Pass => "pass",
         DoctorCheckStatus::Warn => "warn",
         DoctorCheckStatus::Fail => "fail",
+    }
+}
+
+fn confirm_destructive(yes: bool, prompt: &str) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    eprint!("{prompt} [y/N] ");
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    if input.trim().eq_ignore_ascii_case("y") {
+        Ok(())
+    } else {
+        bail!("aborted")
     }
 }
 
