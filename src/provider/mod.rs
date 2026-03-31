@@ -188,7 +188,7 @@ impl HttpClient {
             .await
             .with_context(|| format!("request failed for {url}"))
             .map_err(|err| {
-                if matches!(err.downcast_ref::<reqwest::Error>(), Some(_)) {
+                if err.downcast_ref::<reqwest::Error>().is_some() {
                     anyhow!("request failed for {url}: {err}")
                 } else {
                     err

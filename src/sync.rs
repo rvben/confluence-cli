@@ -303,7 +303,7 @@ pub async fn apply_path(
         doc.sidecar.storage_hash = Some(storage_hash.clone());
         doc.sidecar.remote_storage_hash = Some(storage_hash);
         doc.sidecar.last_sync_at = Some(Utc::now());
-        save_document(&doc)?;
+        save_document(doc)?;
     }
 
     reconcile_local_link_updates(
@@ -850,9 +850,8 @@ fn rewrite_local_target_url(
     if let Some(link) = link_index.by_markdown_path.get(&markdown_target) {
         if let Some(content_id) = &link.content_id {
             let mut url = format!(
-                "{}{}",
-                web_path_prefix.trim_end_matches('/'),
-                format!("/pages/viewpage.action?pageId={content_id}")
+                "{}/pages/viewpage.action?pageId={content_id}",
+                web_path_prefix.trim_end_matches('/')
             );
             if let Some(fragment) = fragment {
                 url.push('#');
@@ -872,12 +871,9 @@ fn rewrite_local_target_url(
     let content_id = owner.content_id.as_deref()?;
 
     let mut url = format!(
-        "{}{}",
+        "{}/download/attachments/{content_id}/{}",
         web_path_prefix.trim_end_matches('/'),
-        format!(
-            "/download/attachments/{content_id}/{}",
-            urlencoding::encode(file_name)
-        )
+        urlencoding::encode(file_name)
     );
     if let Some(fragment) = fragment {
         url.push('#');
@@ -1264,9 +1260,8 @@ fn build_storage_link_body(body_html: &str) -> String {
 fn placeholder_to_remote_url(link: &PageLinkPlaceholder, web_path_prefix: &str) -> Option<String> {
     let content_id = link.content_id.as_deref()?;
     let mut url = format!(
-        "{}{}",
-        web_path_prefix.trim_end_matches('/'),
-        format!("/pages/viewpage.action?pageId={content_id}")
+        "{}/pages/viewpage.action?pageId={content_id}",
+        web_path_prefix.trim_end_matches('/')
     );
     if let Some(anchor) = link.anchor.as_deref() {
         url.push('#');
@@ -1695,7 +1690,7 @@ mod tests {
             },
         };
 
-        let index = build_link_index(&[current.clone()]);
+        let index = build_link_index(std::slice::from_ref(&current));
         let storage =
             render_body_storage(&current, &index, false, "/wiki").expect("render body storage");
 
@@ -1797,7 +1792,7 @@ mod tests {
             },
         };
 
-        let index = build_link_index(&[current.clone()]);
+        let index = build_link_index(std::slice::from_ref(&current));
         let storage =
             render_body_storage(&current, &index, false, "/wiki").expect("render body storage");
 
@@ -1836,7 +1831,7 @@ mod tests {
             },
         };
 
-        let index = build_link_index(&[current.clone()]);
+        let index = build_link_index(std::slice::from_ref(&current));
         let storage =
             render_body_storage(&current, &index, false, "/wiki").expect("render body storage");
 

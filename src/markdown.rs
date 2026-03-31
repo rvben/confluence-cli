@@ -172,27 +172,26 @@ pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<Conversi
         let fragment = &raw_fragments[idx];
         html_output = html_output.replace(
             &format!("<p>CONFLUENCE_XML_PLACEHOLDER_{idx}</p>"),
-            &fragment,
+            fragment,
         );
-        html_output = html_output.replace(&format!("CONFLUENCE_XML_PLACEHOLDER_{idx}"), &fragment);
+        html_output = html_output.replace(&format!("CONFLUENCE_XML_PLACEHOLDER_{idx}"), fragment);
     }
     for idx in (0..layout_fragments.len()).rev() {
         let fragment = &layout_fragments[idx];
         html_output = html_output.replace(
             &format!("<p>CONFLUENCE_LAYOUT_PLACEHOLDER_{idx}</p>"),
-            &fragment,
+            fragment,
         );
         html_output =
-            html_output.replace(&format!("CONFLUENCE_LAYOUT_PLACEHOLDER_{idx}"), &fragment);
+            html_output.replace(&format!("CONFLUENCE_LAYOUT_PLACEHOLDER_{idx}"), fragment);
     }
     for idx in (0..macro_fragments.len()).rev() {
         let fragment = &macro_fragments[idx];
         html_output = html_output.replace(
             &format!("<p>CONFLUENCE_MACRO_PLACEHOLDER_{idx}</p>"),
-            &fragment,
+            fragment,
         );
-        html_output =
-            html_output.replace(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"), &fragment);
+        html_output = html_output.replace(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"), fragment);
     }
     html_output = convert_checkbox_lists_to_task_lists(&html_output);
 
@@ -3176,7 +3175,7 @@ fn build_page_title_resource_xml(placeholder: &PageLinkPlaceholder) -> Result<St
 }
 
 fn build_macro_parameters_xml(parameters: &BTreeMap<String, String>) -> String {
-    let parameters_xml = parameters
+    parameters
         .iter()
         .map(|(name, value)| {
             format!(
@@ -3185,8 +3184,7 @@ fn build_macro_parameters_xml(parameters: &BTreeMap<String, String>) -> String {
                 escape_xml(value)
             )
         })
-        .collect::<String>();
-    parameters_xml
+        .collect::<String>()
 }
 
 fn escape_xml(value: &str) -> String {
