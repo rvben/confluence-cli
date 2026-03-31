@@ -48,7 +48,12 @@ impl DataCenterProvider {
         }
     }
 
-    async fn get_content_v1(&self, id: &str, include_body: bool, status: &str) -> Result<V1Content> {
+    async fn get_content_v1(
+        &self,
+        id: &str,
+        include_body: bool,
+        status: &str,
+    ) -> Result<V1Content> {
         let mut path = format!(
             "/content/{id}?expand={}",
             Self::content_expand(include_body)
@@ -194,7 +199,8 @@ impl ConfluenceProvider for DataCenterProvider {
             .http
             .json(
                 Method::GET,
-                self.http.v1_url(&format!("/space?limit={limit}&expand=homepage")),
+                self.http
+                    .v1_url(&format!("/space?limit={limit}&expand=homepage")),
                 None,
             )
             .await?;

@@ -186,8 +186,14 @@ enum BlogCommand {
 
 #[derive(Subcommand, Debug)]
 enum PullCommand {
-    Page { reference: String, output: PathBuf },
-    Tree { reference: String, output: PathBuf },
+    Page {
+        reference: String,
+        output: PathBuf,
+    },
+    Tree {
+        reference: String,
+        output: PathBuf,
+    },
     Space {
         space: String,
         output: PathBuf,
@@ -884,7 +890,9 @@ async fn handle_search(
     } else {
         (args.query, args.cql)
     };
-    let results = provider.search(&query, is_cql, args.limit, args.offset).await?;
+    let results = provider
+        .search(&query, is_cql, args.limit, args.offset)
+        .await?;
     render_search_results(&results, output)?;
     Ok(())
 }

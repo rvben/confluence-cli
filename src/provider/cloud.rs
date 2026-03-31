@@ -203,7 +203,8 @@ impl ConfluenceProvider for CloudProvider {
             .http
             .json(
                 Method::GET,
-                self.http.v1_url(&format!("/space?limit={limit}&expand=homepage")),
+                self.http
+                    .v1_url(&format!("/space?limit={limit}&expand=homepage")),
                 None,
             )
             .await?;
@@ -371,11 +372,8 @@ impl ConfluenceProvider for CloudProvider {
                     self.properties_for(&content_id).await.unwrap_or_default(),
                 );
                 let page = self.page_v2(&content_id, true).await?;
-                let mut item =
-                    v2_page_to_item(&self.http.profile, page, labels, properties);
-                let enriched = self
-                    .content_v1(&content_id, true, &request.status)
-                    .await?;
+                let mut item = v2_page_to_item(&self.http.profile, page, labels, properties);
+                let enriched = self.content_v1(&content_id, true, &request.status).await?;
                 item.space_key = enriched.space.as_ref().map(|space| space.key.clone());
                 item.parent_id = enriched
                     .ancestors
@@ -416,9 +414,7 @@ impl ConfluenceProvider for CloudProvider {
                 let properties = normalize_properties(
                     self.properties_for(&content_id).await.unwrap_or_default(),
                 );
-                let item = self
-                    .content_v1(&content_id, true, &request.status)
-                    .await?;
+                let item = self.content_v1(&content_id, true, &request.status).await?;
                 Ok(v1_content_to_item(
                     &self.http.profile.base_url,
                     item,

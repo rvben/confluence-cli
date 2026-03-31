@@ -1677,11 +1677,12 @@ mod tests {
         .expect("write sidecar");
 
         let plan = plan_path(dir.path(), false, false, false).expect("plan");
-        assert!(plan
-            .items
-            .iter()
-            .any(|item| item.action == PlanActionKind::UpdateContent
-                && item.details.contains("title")));
+        assert!(
+            plan.items
+                .iter()
+                .any(|item| item.action == PlanActionKind::UpdateContent
+                    && item.details.contains("title"))
+        );
     }
 
     #[test]
@@ -1725,11 +1726,12 @@ mod tests {
         .expect("write sidecar");
 
         let plan = plan_path(dir.path(), false, false, false).expect("plan");
-        assert!(plan
-            .items
-            .iter()
-            .any(|item| item.action == PlanActionKind::UpdateContent
-                && item.details.contains("labels")));
+        assert!(
+            plan.items
+                .iter()
+                .any(|item| item.action == PlanActionKind::UpdateContent
+                    && item.details.contains("labels"))
+        );
     }
 
     #[test]
