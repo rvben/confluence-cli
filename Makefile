@@ -5,13 +5,13 @@ POSTGRES_DATA_VOLUME := confluencecli_postgres-data
 CONFLUENCE_E2E_PROFILE ?= local-dc
 CONFLUENCE_E2E_SPACE ?= TEST
 
-.PHONY: build test test-e2e fmt lint check confluence-start confluence-stop confluence-wait confluence-logs confluence-reset confluence-backup confluence-restore
+.PHONY: build test test-e2e fmt lint check release-check confluence-start confluence-stop confluence-wait confluence-logs confluence-reset confluence-backup confluence-restore
 
 build:
-	cargo build
+	cargo build --locked
 
 test:
-	cargo test
+	cargo test --locked
 
 # Run end-to-end tests against a real Confluence instance.
 # Defaults to the local Data Center profile created during local setup.
@@ -21,17 +21,25 @@ test:
 #   CONFLUENCE_E2E_BASE_URL / CONFLUENCE_E2E_TOKEN / CONFLUENCE_E2E_PROVIDER / CONFLUENCE_E2E_API_PATH
 # Set CONFLUENCE_E2E_PROFILE= to force env-driven mode instead of profile mode.
 test-e2e:
-	cargo build
+	cargo build --locked
 	CONFLUENCE_CLI_BIN=$(CURDIR)/target/debug/confluence-cli CONFLUENCE_E2E_PROFILE=$(CONFLUENCE_E2E_PROFILE) CONFLUENCE_E2E_SPACE=$(CONFLUENCE_E2E_SPACE) cargo nextest run --test e2e --run-ignored all
 
 fmt:
-	cargo fmt
+	cargo fmt --all
 
 lint:
 	cargo fmt -- --check
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --locked --all-targets --all-features -- -D warnings
 
 check: lint test
+
+release-check:
+	cargo fmt --all --check
+	cargo clippy --locked --all-targets --all-features -- -D warnings
+	cargo test --locked
+	cargo run --locked -- --help >/dev/null
+	cargo run --locked -- doctor --help >/dev/null
+	cargo package --locked --allow-dirty
 
 # ── Local Confluence (Data Center) for integration testing ───────────────────
 confluence-start:

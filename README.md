@@ -2,33 +2,163 @@
 
 Markdown-sync-first Confluence CLI in Rust.
 
+`confluence-cli` is built around a safe local workflow:
+
+1. `pull` Confluence content into Markdown plus sidecar metadata.
+2. `plan` exactly what would change remotely.
+3. `apply` only when the diff is correct.
+
+It also exposes direct page, blog, search, attachment, label, comment, and property commands for non-sync use cases.
+
 ## Status
 
-Usable early release with the core CLI surface in place and live e2e coverage verified against both Confluence Cloud and Data Center.
+Early release, but already live-verified against both Confluence Cloud and Confluence Data Center.
 
-Current capabilities include:
-
-- Confluence Cloud and Data Center profile support
-- Space, search, page, blog, attachment, label, comment, and property commands
-- Markdown-backed `pull`, `plan`, and `apply` workflows
-- Local frontmatter plus sidecar metadata for sync safety
-- Confluence-aware Markdown conversion for headings, lists, tables, task lists, attachment links/images, page links, user mentions, anchor macros, status macros, layouts, excerpt macros, excerpt-include macros, include-page macros, page-tree macros, page-tree-search macros, page-index macros, spaces-list macros, space-details macros, space-attachments macros, attachment preview macros (`view-file`, `viewdoc`, `viewxls`, `viewppt`), search macros, navigation map macros, Live Search macros, TOC zone macros, content-properties macros, content-properties-report macros, content-report-table macros, content-by-user macros, task-report macros, attachments macros, blog-posts macros, contributors macros, contributors-summary macros, recently-updated-dashboard macros, content-by-label macros, recently-updated macros, labels-list macros, popular-labels macros, related-labels macros, recently-used-labels macros, gallery macros, favorite-pages macros, change-history macros, profile macros, status-list macros, network macros, children macros, TOC macros, panel macros, expand macros, code macros, noformat macros, and generic `confluence-macro <name>` blocks for unsupported macros with plain parameters, rich-text bodies, and typed page/user/space resource parameters
+| Area | Cloud | Data Center | Notes |
+| --- | --- | --- | --- |
+| Auth, spaces, search, page/blog CRUD | Verified | Verified | Live e2e |
+| Attachments, labels, properties, comments | Verified | Verified | Live e2e |
+| `pull -> plan -> apply` sync flow | Verified | Verified | Includes drift refusal and noop checks |
+| `doctor` environment/profile validation | Verified | Verified | Live checked |
+| Markdown round-trip for common built-in macros | Verified | Verified | Unsupported cases preserve storage safely |
 
 ## Installation
+
+From crates.io:
 
 ```bash
 cargo install confluence-cli
 ```
 
-## Usage
+Prebuilt macOS and Linux archives are published on the [GitHub releases page](https://github.com/rvben/confluence-cli/releases).
+
+## Quick Start
+
+Cloud profile:
 
 ```bash
-confluence-cli --help
-confluence-cli auth login
-confluence-cli page --help
-confluence-cli pull --help
-confluence-cli completions zsh
+confluence-cli auth login \
+  --profile cloud \
+  --provider cloud \
+  --domain your-site.atlassian.net \
+  --auth-type basic \
+  --username you@example.com \
+  --token "$CONFLUENCE_API_TOKEN" \
+  --non-interactive
+
+confluence-cli doctor --profile cloud --space SPACEKEY
 ```
+
+Data Center profile:
+
+```bash
+confluence-cli auth login \
+  --profile dc \
+  --provider data-center \
+  --domain http://localhost:8090 \
+  --auth-type bearer \
+  --token "$CONFLUENCE_PAT" \
+  --non-interactive
+
+confluence-cli doctor --profile dc --space TEST
+```
+
+Environment-driven mode also works without a stored profile:
+
+```bash
+export CONFLUENCE_DOMAIN=https://your-site.atlassian.net
+export CONFLUENCE_PROVIDER=cloud
+export CONFLUENCE_AUTH_TYPE=basic
+export CONFLUENCE_EMAIL=you@example.com
+export CONFLUENCE_TOKEN="$CONFLUENCE_API_TOKEN"
+
+confluence-cli doctor --space SPACEKEY
+```
+
+## Markdown Sync Workflow
+
+Pull a page tree:
+
+```bash
+confluence-cli pull tree SPACE:ParentPage ./docs/parent-page
+```
+
+Inspect the planned changes:
+
+```bash
+confluence-cli plan ./docs/parent-page
+```
+
+Apply the diff:
+
+```bash
+confluence-cli apply ./docs/parent-page
+```
+
+Local content is stored as:
+
+- `<slug>/index.md`
+- `<slug>/.confluence.json`
+- `<slug>/attachments/*`
+
+The frontmatter carries editable metadata like `title`, `type`, `labels`, `status`, `parent`, and `properties`. The sidecar stores remote ids, versions, hashes, and attachment mappings used for safe sync and drift detection.
+
+## `doctor`
+
+Use `doctor` before a first sync, in CI, or when a profile behaves unexpectedly.
+
+```bash
+confluence-cli doctor --profile cloud --space SPACEKEY --path ./docs/parent-page
+```
+
+It checks:
+
+- config loading and profile resolution
+- base URL and auth shape
+- provider reachability
+- optional space access
+- optional local sync path planning
+
+`doctor` exits non-zero on failures and supports `--json` for machine-readable checks.
+
+## Commands
+
+Top-level command groups:
+
+- `auth login|status|logout`
+- `profile add|list|use|remove`
+- `space list|get`
+- `search`
+- `page get|tree|create|update|delete`
+- `blog get|create|update|delete`
+- `pull page|tree|space`
+- `plan`
+- `apply`
+- `attachment list|download|upload|delete`
+- `label list|add|remove`
+- `comment list|add|delete`
+- `property list|get|set|delete`
+- `doctor`
+- `completions`
+
+All major commands accept `--json`.
+
+## Auth And Environment Overrides
+
+Stored profiles live under the local config directory used by `directories::ProjectDirs`.
+
+Supported environment overrides:
+
+- `CONFLUENCE_PROFILE`
+- `CONFLUENCE_DOMAIN`
+- `CONFLUENCE_PROVIDER`
+- `CONFLUENCE_API_PATH`
+- `CONFLUENCE_AUTH_TYPE`
+- `CONFLUENCE_EMAIL` or `CONFLUENCE_USERNAME`
+- `CONFLUENCE_API_TOKEN`, `CONFLUENCE_TOKEN`, `CONFLUENCE_PASSWORD`, or `CONFLUENCE_BEARER_TOKEN`
+- `CONFLUENCE_READ_ONLY`
+
+`CONFLUENCE_PROVIDER` must be `cloud` or `data-center`. `CONFLUENCE_AUTH_TYPE` must be `basic` or `bearer`.
 
 ## Shell Completions
 
@@ -40,6 +170,8 @@ confluence-cli completions fish > ~/.config/fish/completions/confluence-cli.fish
 
 ## Local Data Center
 
+The repo includes a local Confluence Data Center stack for integration testing.
+
 ```bash
 make confluence-start
 make confluence-wait
@@ -48,7 +180,7 @@ make test-e2e
 
 The default e2e path targets the local `local-dc` profile and the `TEST` space.
 
-Available local-instance helpers:
+Available helpers:
 
 - `make confluence-backup`
 - `make confluence-restore`
@@ -60,9 +192,9 @@ Backups are written to:
 - `docker/backup/confluence-data.tar.gz`
 - `docker/backup/postgres-data.tar.gz`
 
-The first boot after `make confluence-restore` can take several minutes before HTTP starts responding.
+The first boot after `make confluence-restore` can take several minutes before HTTP responds.
 
-To point the e2e suite at another instance, override:
+To point the e2e suite at another instance:
 
 ```bash
 CONFLUENCE_E2E_PROFILE=other-profile CONFLUENCE_E2E_SPACE=SPACE make test-e2e
@@ -73,18 +205,48 @@ Or run fully env-driven:
 ```bash
 CONFLUENCE_E2E_PROFILE= \
 CONFLUENCE_E2E_BASE_URL=http://localhost:8090 \
-CONFLUENCE_E2E_TOKEN=... \
+CONFLUENCE_E2E_TOKEN="$CONFLUENCE_PAT" \
 CONFLUENCE_E2E_PROVIDER=data-center \
 CONFLUENCE_E2E_SPACE=TEST \
 make test-e2e
 ```
 
-## Notes
+## Release And CI
 
-- Remote canonical content format is Confluence storage format.
-- Markdown conversion now covers common editable storage content directly, including page links, user mentions, anchor macros, status macros, layouts, excerpt macros, excerpt-include macros, include-page macros, page-tree macros, page-tree-search macros, page-index macros, spaces-list macros, space-details macros, space-attachments macros, attachment preview macros (`view-file`, `viewdoc`, `viewxls`, `viewppt`), search macros, navigation map macros, Live Search macros, TOC zone macros, content-properties macros, content-properties-report macros, content-report-table macros, content-by-user macros, task-report macros, attachments macros, blog-posts macros, contributors macros, contributors-summary macros, recently-updated-dashboard macros, content-by-label macros, recently-updated macros, labels-list macros, popular-labels macros, related-labels macros, recently-used-labels macros, gallery macros, favorite-pages macros, change-history macros, profile macros, status-list macros, network macros, children macros, TOC macros, panel macros, expand macros, code macros, noformat macros, and generic `confluence-macro <name>` blocks for unsupported macros with plain parameters, rich-text bodies, and typed page/user/space resource parameters; unsupported Confluence XML is preserved as raw storage blocks instead of forcing whole-page raw exports.
-- The ignored e2e lifecycle suite now runs against real Cloud and Data Center instances, including untouched `pull -> plan`, untouched `pull -> apply`, and fresh local-link reconciliation cases.
-- The main remaining fidelity gap is richer Confluence-aware conversion for advanced macros beyond the currently supported page-link, mention, anchor, status, layout, excerpt, excerpt-include, include-page, page-tree, page-tree-search, page-index, spaces-list, space-details, space-attachments, attachment preview (`view-file`, `viewdoc`, `viewxls`, `viewppt`), search, navigation map, Live Search, TOC zone, content-properties, content-properties-report, content-report-table, content-by-user, task-report, attachments, blog-posts, contributors, contributors-summary, recently-updated-dashboard, content-by-label, recently-updated, labels-list, popular-labels, related-labels, recently-used-labels, gallery, favorite-pages, change-history, profile, status-list, network, children, TOC, panel, expand, code, noformat, and generic resource-aware rich-text macro cases; unsupported nodes are preserved safely rather than rendered into editable Markdown.
+Local release gate:
+
+```bash
+make release-check
+```
+
+That runs formatting, clippy, tests, CLI smoke checks, and `cargo package`.
+
+GitHub Actions is set up to:
+
+- run CI on pushes and pull requests
+- build tagged macOS and Linux release archives
+- attach release archives and checksum files to GitHub releases
+
+## Markdown Fidelity
+
+Remote canonical content stays in Confluence storage format. Markdown is the editable local representation.
+
+The converter already handles a large set of common Confluence constructs directly, including:
+
+- headings, lists, tables, code blocks, task lists, links, and attachments
+- page links and typed page/user/space resource parameters
+- layouts, panels, expand blocks, status, TOC-family macros, and search/navigation macros
+- excerpt, excerpt-include, include-page, page-tree, page-tree-search, and page-index
+- label/reporting/content-property/report-table/task-report families
+- attachment preview and other common built-in macros
+
+When a construct is unsupported or would be lossy, `confluence-cli` preserves the Confluence storage fragment instead of flattening the whole page.
+
+## Known Limits
+
+- Storage fidelity is strongest for supported built-in macros and generic resource-aware macro fallback. Unknown provider-specific macro behavior can still vary between Cloud and Data Center.
+- CI does not run live tenant e2e by default. Use `make test-e2e` against a real instance for provider validation.
+- `apply` refuses remote version drift unless `--force` is used.
 
 ## License
 

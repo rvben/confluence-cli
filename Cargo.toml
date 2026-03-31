@@ -2,12 +2,23 @@
 name = "confluence-cli"
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.85"
 description = "Markdown-sync-first Confluence CLI in Rust"
 license = "MIT"
 documentation = "https://docs.rs/confluence-cli"
+homepage = "https://github.com/rvben/confluence-cli"
+repository = "https://github.com/rvben/confluence-cli"
 readme = "README.md"
 keywords = ["confluence", "cli", "markdown", "sync", "atlassian"]
 categories = ["command-line-utilities"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "src/**",
+    "tests/**",
+]
 
 [dependencies]
 anyhow = "1.0.100"
