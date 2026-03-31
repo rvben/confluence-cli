@@ -1104,7 +1104,17 @@ fn collect_generic_macro_parameter_value(parameter: Node<'_, '_>) -> Option<Stri
             !child.is_element()
         }
     }) {
-        return Some(parameter.text().unwrap_or_default().trim().to_string());
+        let text = parameter.text().unwrap_or_default().trim().to_string();
+        if let Some(user) = parse_user_resource_identifier_text(&text) {
+            return Some(format!("!user {}", build_user_placeholder_url(&user)));
+        }
+        if let Some(page) = parse_default_link_page_resource_identifier_text(&text) {
+            return Some(format!("!page-link {}", build_page_placeholder_url(&page)));
+        }
+        if let Some(page) = parse_page_resource_identifier_text(&text) {
+            return Some(format!("!page {}", build_page_placeholder_url(&page)));
+        }
+        return Some(text);
     }
 
     None
@@ -1777,6 +1787,79 @@ fn parse_user_resource_identifier_text(target: &str) -> Option<UserMentionPlaceh
     } else {
         Some(placeholder)
     }
+}
+
+fn parse_page_resource_identifier_text(target: &str) -> Option<PageLinkPlaceholder> {
+    let trimmed = target.trim();
+    if !trimmed.contains("PageResourceIdentifier[") {
+        return None;
+    }
+    let bracketed = extract_bracketed_expression(trimmed, "PageResourceIdentifier[")?
+        .strip_prefix("PageResourceIdentifier[")?
+        .strip_suffix(']')?;
+
+    let mut placeholder = PageLinkPlaceholder::default();
+    for part in bracketed.split(',') {
+        let (key, value) = part.split_once('=')?;
+        let value = value.trim();
+        if value == "<null>" || value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "spaceKey" => placeholder.space_key = Some(value.to_string()),
+            "title" => placeholder.content_title = Some(value.to_string()),
+            "contentId" => placeholder.content_id = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    if placeholder.content_id.is_none() && placeholder.content_title.is_none() {
+        None
+    } else {
+        Some(placeholder)
+    }
+}
+
+fn parse_default_link_page_resource_identifier_text(target: &str) -> Option<PageLinkPlaceholder> {
+    let trimmed = target.trim();
+    if !trimmed.contains("DefaultLink[") {
+        return None;
+    }
+    let page = extract_bracketed_expression(trimmed, "PageResourceIdentifier[")?;
+    let mut placeholder = parse_page_resource_identifier_text(page)?;
+    if let Some(anchor) = extract_optional_value(trimmed, "anchor=Optional[")
+        && !anchor.is_empty()
+        && anchor != "empty"
+    {
+        placeholder.anchor = Some(anchor.to_string());
+    }
+    Some(placeholder)
+}
+
+fn extract_bracketed_expression<'a>(target: &'a str, marker: &str) -> Option<&'a str> {
+    let start = target.find(marker)?;
+    let mut depth = 0;
+    let mut end = None;
+    for (offset, ch) in target[start..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + offset + ch.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    end.map(|end| &target[start..end])
+}
+
+fn extract_optional_value<'a>(target: &'a str, marker: &str) -> Option<&'a str> {
+    let start = target.find(marker)? + marker.len();
+    let end = target[start..].find(']')?;
+    Some(&target[start..start + end])
 }
 
 pub(crate) fn build_status_placeholder_url(status: &StatusMacroPlaceholder) -> String {
@@ -2614,12 +2697,11 @@ fn build_generic_macro_parameter_xml(name: &str, value: &str) -> Result<String> 
 
     if let Some(user_value) = value.strip_prefix("!user ") {
         let trimmed = user_value.trim();
-        if parse_user_placeholder_url(trimmed).is_none() {
-            bail!(
+        return build_optional_user_parameter_xml(parameter_name, trimmed).ok_or_else(|| {
+            anyhow::anyhow!(
                 "generic confluence macro parameter `{name}` declared `!user` without a valid confluence-user placeholder"
-            );
-        }
-        return Ok(build_user_parameter_xml(parameter_name, trimmed));
+            )
+        });
     }
 
     if let Some(page_value) = value.strip_prefix("!page-link ") {
@@ -3798,6 +3880,16 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
     }
 
     #[test]
+    fn unsupported_multi_user_resource_macros_export_to_generic_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="custom-resource"><ac:parameter ac:name="contributor"><ri:user ri:userkey="user-123" /><ri:user ri:account-id="abc123" /></ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-macro custom-resource"));
+        assert!(markdown.contains(
+            "contributor: !user confluence-user://user?userkey=user-123,confluence-user://user?account-id=abc123"
+        ));
+    }
+
+    #[test]
     fn unsupported_page_resource_macros_export_to_generic_blocks() {
         let storage = r#"<ac:structured-macro ac:name="custom-page"><ac:parameter ac:name="source"><ri:page ri:content-title="Docs Home" ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="related"><ac:link><ri:page ri:content-id="12345" /></ac:link></ac:parameter><ac:parameter ac:name=""><ri:user ri:account-id="abc123" /></ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
@@ -3807,6 +3899,22 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
         ));
         assert!(markdown.contains("related: !page-link confluence-page://page?content-id=12345"));
         assert!(markdown.contains("$default: !user confluence-user://user?account-id=abc123"));
+    }
+
+    #[test]
+    fn unsupported_textual_page_resource_macros_export_to_generic_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="custom-page"><ac:parameter ac:name="source">PageResourceIdentifier[spaceKey=TEST,title=Docs Home]</ac:parameter><ac:parameter ac:name="related">DefaultLink[destination=Optional[PageResourceIdentifier[spaceKey=TEST,title=Docs Home]],body=Optional.empty,tooltip=Optional.empty,anchor=Optional.empty,target=Optional.empty]</ac:parameter><ac:parameter ac:name="contributor">com.atlassian.confluence.content.render.xhtml.model.resource.identifiers.UserResourceIdentifier@59a93065[accountId=557058:abc,userKey=&lt;null&gt;,userName=557058:abc]</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-macro custom-page"));
+        assert!(markdown.contains(
+            "source: !page confluence-page://page?space-key=TEST&content-title=Docs+Home"
+        ));
+        assert!(markdown.contains(
+            "related: !page-link confluence-page://page?space-key=TEST&content-title=Docs+Home"
+        ));
+        assert!(
+            markdown.contains("contributor: !user confluence-user://user?account-id=557058%3Aabc")
+        );
     }
 
     #[test]
@@ -4960,6 +5068,16 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
                 .storage
                 .contains(r#"<ac:parameter ac:name="query">docs</ac:parameter>"#)
         );
+    }
+
+    #[test]
+    fn generic_multi_user_parameter_macro_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-macro search\ncontributor: !user confluence-user://user?userkey=user-123,confluence-user://user?account-id=abc123\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("generic multi-user macro converts");
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="contributor"><ri:user ri:userkey="user-123" /><ri:user ri:account-id="abc123" /></ac:parameter>"#
+        ));
     }
 
     #[test]
