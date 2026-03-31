@@ -648,7 +648,7 @@ fn e2e_cli_lifecycle() {
     fs::write(
         macro_source_dir.join("index.md"),
         format!(
-            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n"
+            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n"
         ),
     )
     .expect("write macro source markdown");
@@ -771,6 +771,16 @@ fn e2e_cli_lifecycle() {
         "expected include-page macro to reference space {}: {macro_source_body}",
         cfg.space
     );
+    assert!(
+        macro_source_body.contains(r#"ac:name="pagetree""#),
+        "expected page-tree macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="root"><ac:link><ri:page "#)
+            && macro_source_body.contains(&format!(r#"ri:content-title="{}""#, macro_source_title))
+            && macro_source_body.contains(&format!(r#"ri:space-key="{}""#, cfg.space)),
+        "expected page-tree root to reference source title {macro_source_title}: {macro_source_body}"
+    );
 
     let macro_pull_arg = macro_pull_dir.to_string_lossy().into_owned();
     cfg.run(&["pull", "tree", &macro_root_id, &macro_pull_arg]);
@@ -800,6 +810,15 @@ fn e2e_cli_lifecycle() {
             && pulled_macro_source_markdown.contains("/index.md")
             && !pulled_macro_source_markdown.contains("confluence-page://page?"),
         "expected pulled include-page target to rewrite to a local path: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-page-tree"),
+        "expected pulled macro source to preserve page-tree block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("root: index.md")
+            && !pulled_macro_source_markdown.contains("root: confluence-page://page?"),
+        "expected pulled page-tree root to rewrite to a local path: {pulled_macro_source_markdown}"
     );
 
     let macro_plan = cfg.run_json(&["plan", &macro_pull_arg]);

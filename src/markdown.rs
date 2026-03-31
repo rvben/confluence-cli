@@ -597,6 +597,9 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if matches!(name, "include" | "include-page") {
         return render_include_page_macro_block(node);
     }
+    if name == "pagetree" {
+        return render_page_tree_macro_block(node);
+    }
     if name == "toc" {
         return render_parameter_only_macro_block("toc", node);
     }
@@ -668,6 +671,34 @@ fn render_include_page_macro_block(node: Node<'_, '_>) -> Option<String> {
     }
     Some(render_parameter_only_macro_block_with_parameters(
         "include-page",
+        &parameters,
+    ))
+}
+
+fn render_page_tree_macro_block(node: Node<'_, '_>) -> Option<String> {
+    let mut parameters = collect_macro_parameters(node);
+    let root_placeholder = if let Some(parameter) = find_macro_parameter(node, "root") {
+        namespaced_child(parameter, AC_NS, "link")
+            .and_then(|link| namespaced_child(link, RI_NS, "page"))
+            .map(page_resource_placeholder)
+            .or_else(|| {
+                parameters.get("root").and_then(|root| {
+                    let trimmed = root.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('@') {
+                        None
+                    } else {
+                        Some(parse_default_parameter_page_target(trimmed))
+                    }
+                })
+            })
+    } else {
+        None
+    };
+    if let Some(placeholder) = root_placeholder {
+        parameters.insert("root".to_string(), build_page_placeholder_url(&placeholder));
+    }
+    Some(render_parameter_only_macro_block_with_parameters(
+        "page-tree",
         &parameters,
     ))
 }
@@ -1376,6 +1407,7 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-children" => Some("children"),
             ":::confluence-excerpt-include" => Some("excerpt-include"),
             ":::confluence-include-page" => Some("include-page"),
+            ":::confluence-page-tree" => Some("page-tree"),
             _ => None,
         };
 
@@ -1420,6 +1452,10 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters =
                     parse_macro_parameter_lines(&body, "confluence include-page macro")?;
                 build_include_page_macro_storage(&parameters)?
+            }
+            "page-tree" => {
+                let parameters = parse_macro_parameter_lines(&body, "confluence page-tree macro")?;
+                build_page_tree_macro_storage(&parameters)?
             }
             _ => unreachable!(),
         };
@@ -1696,7 +1732,7 @@ fn build_excerpt_include_macro_storage(parameters: &BTreeMap<String, String>) ->
             "confluence excerpt-include `page` must be a confluence-page placeholder; local paths are resolved during sync apply"
         )
     })?;
-    let excerpt_target = build_excerpt_include_target(&placeholder)?;
+    let excerpt_target = build_title_page_target(&placeholder)?;
     parameters.insert("default-parameter".to_string(), excerpt_target);
     Ok(build_parameter_only_macro_storage(
         "excerpt-include",
@@ -1718,6 +1754,28 @@ fn build_include_page_macro_storage(parameters: &BTreeMap<String, String>) -> Re
     let parameters_xml = build_macro_parameters_xml(&parameters);
     Ok(format!(
         r#"<ac:structured-macro ac:name="include">{parameters_xml}<ac:parameter ac:name=""><ac:link>{page_xml}</ac:link></ac:parameter></ac:structured-macro>"#
+    ))
+}
+
+fn build_page_tree_macro_storage(parameters: &BTreeMap<String, String>) -> Result<String> {
+    let mut parameters = parameters.clone();
+    let root_xml = if let Some(root) = parameters.remove("root") {
+        if let Some(placeholder) = parse_page_placeholder_url(&root) {
+            let page_xml = build_page_title_resource_xml(&placeholder)?;
+            Some(format!(
+                r#"<ac:parameter ac:name="root"><ac:link>{page_xml}</ac:link></ac:parameter>"#
+            ))
+        } else {
+            parameters.insert("root".to_string(), root);
+            None
+        }
+    } else {
+        None
+    };
+    let parameters_xml = build_macro_parameters_xml(&parameters);
+    Ok(format!(
+        r#"<ac:structured-macro ac:name="pagetree">{parameters_xml}{}</ac:structured-macro>"#,
+        root_xml.unwrap_or_default()
     ))
 }
 
@@ -1744,10 +1802,11 @@ fn looks_like_space_key(space_key: &str) -> bool {
             .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
 }
 
-fn build_excerpt_include_target(placeholder: &PageLinkPlaceholder) -> Result<String> {
-    let title = placeholder.content_title.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("confluence excerpt-include page references require a title")
-    })?;
+fn build_title_page_target(placeholder: &PageLinkPlaceholder) -> Result<String> {
+    let title = placeholder
+        .content_title
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("confluence page references require a title"))?;
     if let Some(space_key) = placeholder.space_key.as_deref() {
         Ok(format!("{space_key}:{title}"))
     } else {
@@ -2088,6 +2147,16 @@ mod tests {
     }
 
     #[test]
+    fn page_tree_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="pagetree"><ac:parameter ac:name="root"><ac:link><ri:page ri:space-key="TEST" ri:content-title="Docs Home" /></ac:link></ac:parameter><ac:parameter ac:name="searchBox">true</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-page-tree"));
+        assert!(markdown.contains("root: confluence-page://page?"));
+        assert!(markdown.contains("content-title=Docs+Home"));
+        assert!(markdown.contains("searchBox: true"));
+    }
+
+    #[test]
     fn whitespace_between_supported_blocks_does_not_force_fallback_export() {
         let storage = concat!(
             "<h1>Macro Source</h1>\n",
@@ -2097,6 +2166,9 @@ mod tests {
             "<ac:structured-macro ac:name=\"include\">",
             "<ri:page ri:content-title=\"Shared Page\" />",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"pagetree\">",
+            "<ac:parameter ac:name=\"root\"><ac:link><ri:page ri:space-key=\"TEST\" ri:content-title=\"Docs Home\" /></ac:link></ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"children\">",
             "<ac:parameter ac:name=\"all\">true</ac:parameter>",
             "</ac:structured-macro>"
@@ -2105,6 +2177,7 @@ mod tests {
         assert!(markdown.contains("# Macro Source"));
         assert!(markdown.contains(":::confluence-excerpt-include"));
         assert!(markdown.contains(":::confluence-include-page"));
+        assert!(markdown.contains(":::confluence-page-tree"));
         assert!(markdown.contains(":::confluence-children"));
         assert!(!markdown.contains("CONFLUENCE_XML_PLACEHOLDER"));
     }
@@ -2268,6 +2341,32 @@ mod tests {
         );
         assert!(rendered.storage.contains(r#"ri:content-title="Docs Home""#));
         assert!(rendered.storage.contains(r#"ri:space-key="TEST""#));
+    }
+
+    #[test]
+    fn page_tree_blocks_round_trip_back_to_structured_macros() {
+        let page = build_page_placeholder_url(&PageLinkPlaceholder {
+            space_key: Some("TEST".to_string()),
+            content_title: Some("Docs Home".to_string()),
+            ..PageLinkPlaceholder::default()
+        });
+        let markdown = format!(":::confluence-page-tree\nroot: {page}\nsearchBox: true\n:::");
+        let rendered = markdown_to_storage(&markdown, false).expect("page-tree block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="pagetree">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="root"><ac:link><ri:page ri:content-title="Docs Home" ri:space-key="TEST" /></ac:link></ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="searchBox">true</ac:parameter>"#)
+        );
     }
 
     #[test]
