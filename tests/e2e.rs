@@ -206,7 +206,12 @@ fn http_config(cfg: &E2eConfig) -> TestHttpConfig {
         let profile = config
             .get("profiles")
             .and_then(|profiles| profiles.get(profile_name))
-            .unwrap_or_else(|| panic!("profile `{profile_name}` not found in {}", config_path.display()));
+            .unwrap_or_else(|| {
+                panic!(
+                    "profile `{profile_name}` not found in {}",
+                    config_path.display()
+                )
+            });
         let auth = match profile
             .get("auth")
             .and_then(|auth| auth.get("type"))
@@ -262,7 +267,9 @@ fn current_user_placeholder(cfg: &E2eConfig) -> String {
     let current_user = runtime.block_on(async move {
         let client = Client::new();
         let request = match http.auth {
-            TestAuth::Basic { username, token } => client.get(&url).basic_auth(username, Some(token)),
+            TestAuth::Basic { username, token } => {
+                client.get(&url).basic_auth(username, Some(token))
+            }
             TestAuth::Bearer { token } => client.get(&url).bearer_auth(token),
         };
         let response = request.send().await.expect("current user request");
@@ -305,6 +312,19 @@ fn expected_user_resource_fragment(user_placeholder: &str) -> String {
                 return format!(r#"ri:username="{}""#, value);
             }
             _ => {}
+        }
+    }
+    panic!("expected at least one user identifier in {user_placeholder}");
+}
+
+fn expected_user_placeholder_fragment(user_placeholder: &str) -> String {
+    let placeholder = Url::parse(user_placeholder).expect("valid user placeholder url");
+    for pair in placeholder.query().unwrap_or_default().split('&') {
+        if pair.starts_with("account-id=")
+            || pair.starts_with("userkey=")
+            || pair.starts_with("username=")
+        {
+            return pair.to_string();
         }
     }
     panic!("expected at least one user identifier in {user_placeholder}");
@@ -771,20 +791,33 @@ fn e2e_cli_lifecycle() {
     let macro_target_attachments_dir = macro_target_dir.join("attachments");
     let macro_user = current_user_placeholder(&cfg);
     let macro_user_fragment = expected_user_resource_fragment(&macro_user);
+    let macro_user_placeholder_fragment = expected_user_placeholder_fragment(&macro_user);
     fs::create_dir_all(&macro_root_dir).expect("create macro root dir");
     fs::create_dir_all(&macro_source_dir).expect("create macro source dir");
     fs::create_dir_all(&macro_target_dir).expect("create macro target dir");
     fs::create_dir_all(&macro_child_dir).expect("create macro child dir");
     fs::create_dir_all(&macro_source_attachments_dir).expect("create macro source attachments dir");
     fs::create_dir_all(&macro_target_attachments_dir).expect("create macro target attachments dir");
-    fs::write(macro_source_attachments_dir.join("preview.pdf"), "preview pdf payload\n")
-        .expect("write macro source preview attachment");
-    fs::write(macro_source_attachments_dir.join("sheet.xlsx"), "spreadsheet payload\n")
-        .expect("write macro source xls attachment");
-    fs::write(macro_source_attachments_dir.join("slides.pptx"), "slides payload\n")
-        .expect("write macro source ppt attachment");
-    fs::write(macro_target_attachments_dir.join("manual.docx"), "manual payload\n")
-        .expect("write macro target doc attachment");
+    fs::write(
+        macro_source_attachments_dir.join("preview.pdf"),
+        "preview pdf payload\n",
+    )
+    .expect("write macro source preview attachment");
+    fs::write(
+        macro_source_attachments_dir.join("sheet.xlsx"),
+        "spreadsheet payload\n",
+    )
+    .expect("write macro source xls attachment");
+    fs::write(
+        macro_source_attachments_dir.join("slides.pptx"),
+        "slides payload\n",
+    )
+    .expect("write macro source ppt attachment");
+    fs::write(
+        macro_target_attachments_dir.join("manual.docx"),
+        "manual payload\n",
+    )
+    .expect("write macro target doc attachment");
     fs::write(
         macro_root_dir.join("index.md"),
         format!(
@@ -795,7 +828,7 @@ fn e2e_cli_lifecycle() {
     fs::write(
         macro_source_dir.join("index.md"),
         format!(
-            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-report-table\nlabels: e2e-macro-target\nspaces: {space}\nmaxResults: 5\n:::\n\n:::confluence-task-report\nspaceAndPage: {space}\nlabels: e2e-macro-target\nstatus: incomplete\npageSize: 20\ncolumns: description,assignee,location\nsortBy: page title\nreverseSort: false\n:::\n\n:::confluence-macro userlister\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-view-file\nattachment: preview.pdf\n:::\n\n:::confluence-view-doc\npage: ../target/index.md\nattachment: manual.docx\n:::\n\n:::confluence-view-xls\nattachment: sheet.xlsx\n:::\n\n:::confluence-view-ppt\nattachment: slides.pptx\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-contributors\nspaces: {space},@personal\nlabels: e2e-macro-target\nmode: list\n:::\n\n:::confluence-contributors-summary\nspaces: {space}\ncolumns: edits,comments,labels\nlimit: 10\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nspaces: {space}\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-recently-used-labels\nscope: space\nstyle: cloud\n:::\n\n:::confluence-gallery\nsortBy: name\ncolumns: 2\n:::\n\n:::confluence-favorite-pages\n:::\n\n:::confluence-change-history\n:::\n\n:::confluence-spaces-list\nscope: all\nwidth: 80%\n:::\n\n:::confluence-space-details\nwidth: 50%\n:::\n\n:::confluence-space-attachments\nspace: {space}\nshowFilter: false\n:::\n\n~~~confluence-noformat\nnopanel: true\n---\n<xml>literal</xml>\nline 2\n~~~\n\n:::confluence-profile\nuser: {macro_user}\n:::\n\n:::confluence-status-list\nusername: {macro_user}\n:::\n\n:::confluence-network\nmode: followers\nusername: {macro_user}\nmax: 10\ntheme: full\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
+            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-report-table\nlabels: e2e-macro-target\nspaces: {space}\nmaxResults: 5\n:::\n\n:::confluence-task-report\nspaceAndPage: {space}\nlabels: e2e-macro-target\nstatus: incomplete\npageSize: 20\ncolumns: description,assignee,location\nsortBy: page title\nreverseSort: false\n:::\n\n:::confluence-macro userlister\n:::\n\n:::confluence-macro search\nspacekey: !space {space}\ncontributor: !user {macro_user}\nquery: Macro Source\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-view-file\nattachment: preview.pdf\n:::\n\n:::confluence-view-doc\npage: ../target/index.md\nattachment: manual.docx\n:::\n\n:::confluence-view-xls\nattachment: sheet.xlsx\n:::\n\n:::confluence-view-ppt\nattachment: slides.pptx\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-contributors\nspaces: {space},@personal\nlabels: e2e-macro-target\nmode: list\n:::\n\n:::confluence-contributors-summary\nspaces: {space}\ncolumns: edits,comments,labels\nlimit: 10\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nspaces: {space}\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-recently-used-labels\nscope: space\nstyle: cloud\n:::\n\n:::confluence-gallery\nsortBy: name\ncolumns: 2\n:::\n\n:::confluence-favorite-pages\n:::\n\n:::confluence-change-history\n:::\n\n:::confluence-spaces-list\nscope: all\nwidth: 80%\n:::\n\n:::confluence-space-details\nwidth: 50%\n:::\n\n:::confluence-space-attachments\nspace: {space}\nshowFilter: false\n:::\n\n~~~confluence-noformat\nnopanel: true\n---\n<xml>literal</xml>\nline 2\n~~~\n\n:::confluence-profile\nuser: {macro_user}\n:::\n\n:::confluence-status-list\nusername: {macro_user}\n:::\n\n:::confluence-network\nmode: followers\nusername: {macro_user}\nmax: 10\ntheme: full\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
             space = cfg.space,
             macro_user = macro_user
         ),
@@ -985,18 +1018,41 @@ fn e2e_cli_lifecycle() {
             cfg.space
         )) && macro_source_body
             .contains(r#"<ac:parameter ac:name="labels">e2e-macro-target</ac:parameter>"#)
-            && macro_source_body.contains(r#"<ac:parameter ac:name="status">incomplete</ac:parameter>"#)
+            && macro_source_body
+                .contains(r#"<ac:parameter ac:name="status">incomplete</ac:parameter>"#)
             && macro_source_body.contains(r#"<ac:parameter ac:name="pageSize">20</ac:parameter>"#)
             && macro_source_body.contains(
                 r#"<ac:parameter ac:name="columns">description,assignee,location</ac:parameter>"#
             )
-            && macro_source_body.contains(r#"<ac:parameter ac:name="sortBy">page title</ac:parameter>"#)
-            && macro_source_body.contains(r#"<ac:parameter ac:name="reverseSort">false</ac:parameter>"#),
+            && macro_source_body
+                .contains(r#"<ac:parameter ac:name="sortBy">page title</ac:parameter>"#)
+            && macro_source_body
+                .contains(r#"<ac:parameter ac:name="reverseSort">false</ac:parameter>"#),
         "expected task-report parameters to survive storage rendering: {macro_source_body}"
     );
     assert!(
         macro_source_body.contains(r#"ac:name="userlister""#),
         "expected generic userlister macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="search""#),
+        "expected generic search macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="spacekey"><ri:space ri:space-key="{}" /></ac:parameter>"#,
+            cfg.space
+        )),
+        "expected generic search spacekey resource to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="contributor"><ri:user "#)
+            && macro_source_body.contains(&macro_user_fragment),
+        "expected generic search contributor resource to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="query">Macro Source</ac:parameter>"#),
+        "expected generic search query parameter to survive storage rendering: {macro_source_body}"
     );
     assert!(
         macro_source_body.contains(r#"ac:name="detailssummary""#),
@@ -1265,7 +1321,8 @@ fn e2e_cli_lifecycle() {
         macro_source_body.contains(&format!(
             r#"<ac:parameter ac:name="space"><ri:space ri:space-key="{}" /></ac:parameter>"#,
             cfg.space
-        )) && macro_source_body.contains(r#"<ac:parameter ac:name="showFilter">false</ac:parameter>"#),
+        )) && macro_source_body
+            .contains(r#"<ac:parameter ac:name="showFilter">false</ac:parameter>"#),
         "expected space-attachments parameters to survive storage rendering: {macro_source_body}"
     );
     assert!(
@@ -1412,6 +1469,23 @@ fn e2e_cli_lifecycle() {
     assert!(
         pulled_macro_source_markdown.contains(":::confluence-macro userlister"),
         "expected pulled macro source to preserve generic userlister block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-macro search"),
+        "expected pulled macro source to preserve generic search block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(&format!("spacekey: !space {}", cfg.space)),
+        "expected pulled generic search spacekey resource to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("contributor: !user confluence-user://user?")
+            && pulled_macro_source_markdown.contains(&macro_user_placeholder_fragment),
+        "expected pulled generic search contributor resource to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("query: Macro Source"),
+        "expected pulled generic search query parameter to survive export: {pulled_macro_source_markdown}"
     );
     assert!(
         pulled_macro_source_markdown.contains(":::confluence-content-properties-report"),

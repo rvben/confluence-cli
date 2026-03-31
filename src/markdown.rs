@@ -967,9 +967,6 @@ fn render_parameter_only_macro_block_with_parameters(
 
 fn render_generic_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
     let name = node.attribute((AC_NS, "name"))?;
-    if !macro_parameters_are_plain_text(node) {
-        return None;
-    }
     let rich_text_body = namespaced_child(node, AC_NS, "rich-text-body");
     if node.children().any(|child| {
         child.is_element()
@@ -981,8 +978,9 @@ fn render_generic_macro_block(node: Node<'_, '_>, source: &str) -> Option<String
         return None;
     }
 
-    let parameters = collect_macro_parameters(node);
-    let body_markdown = rich_text_body.map(|body| storage_to_markdown(&inner_xml_fragment(body, source)));
+    let parameters = collect_generic_macro_parameters(node)?;
+    let body_markdown =
+        rich_text_body.map(|body| storage_to_markdown(&inner_xml_fragment(body, source)));
     Some(render_generic_macro_block_with_parameters(
         name,
         &parameters,
@@ -990,22 +988,80 @@ fn render_generic_macro_block(node: Node<'_, '_>, source: &str) -> Option<String
     ))
 }
 
-fn macro_parameters_are_plain_text(node: Node<'_, '_>) -> bool {
-    node.children()
+fn collect_generic_macro_parameters(node: Node<'_, '_>) -> Option<BTreeMap<String, String>> {
+    let mut parameters = BTreeMap::new();
+    for parameter in node.children().filter(|child| {
+        child.is_element()
+            && child.tag_name().namespace() == Some(AC_NS)
+            && child.tag_name().name() == "parameter"
+    }) {
+        let name = parameter.attribute((AC_NS, "name"))?;
+        let rendered_name = if name.is_empty() { "$default" } else { name };
+        let value = collect_generic_macro_parameter_value(parameter)?;
+        parameters.insert(rendered_name.to_string(), value);
+    }
+    Some(parameters)
+}
+
+fn collect_generic_macro_parameter_value(parameter: Node<'_, '_>) -> Option<String> {
+    let space_keys: Vec<_> = parameter
+        .children()
         .filter(|child| {
             child.is_element()
-                && child.tag_name().namespace() == Some(AC_NS)
-                && child.tag_name().name() == "parameter"
+                && child.tag_name().namespace() == Some(RI_NS)
+                && child.tag_name().name() == "space"
         })
-        .all(|parameter| {
-            parameter.children().all(|child| {
-                if matches!(child.node_type(), NodeType::Text | NodeType::Comment) {
-                    true
-                } else {
-                    !child.is_element()
-                }
-            })
+        .filter_map(|space| {
+            space
+                .attribute((RI_NS, "space-key"))
+                .or_else(|| space.attribute("ri:space-key"))
+                .or_else(|| space.attribute("space-key"))
+                .map(ToOwned::to_owned)
         })
+        .collect();
+    if !space_keys.is_empty() {
+        return Some(format!("!space {}", space_keys.join(",")));
+    }
+
+    if let Some(user) = namespaced_child(parameter, RI_NS, "user") {
+        let placeholder = UserMentionPlaceholder {
+            account_id: user.attribute((RI_NS, "account-id")).map(ToOwned::to_owned),
+            user_key: user.attribute((RI_NS, "userkey")).map(ToOwned::to_owned),
+            username: user.attribute((RI_NS, "username")).map(ToOwned::to_owned),
+        };
+        return Some(format!(
+            "!user {}",
+            build_user_placeholder_url(&placeholder)
+        ));
+    }
+
+    if let Some(page) = namespaced_child(parameter, RI_NS, "page") {
+        return Some(format!(
+            "!page {}",
+            build_page_placeholder_url(&page_resource_placeholder(page))
+        ));
+    }
+
+    if let Some(page) = namespaced_child(parameter, AC_NS, "link")
+        .and_then(|link| namespaced_child(link, RI_NS, "page"))
+    {
+        return Some(format!(
+            "!page-link {}",
+            build_page_placeholder_url(&page_resource_placeholder(page))
+        ));
+    }
+
+    if parameter.children().all(|child| {
+        if matches!(child.node_type(), NodeType::Text | NodeType::Comment) {
+            true
+        } else {
+            !child.is_element()
+        }
+    }) {
+        return Some(parameter.text().unwrap_or_default().trim().to_string());
+    }
+
+    None
 }
 
 fn render_generic_macro_block_with_parameters(
@@ -1870,23 +1926,19 @@ fn replace_parameterized_colon_macro_blocks(
                 build_parameter_only_macro_storage("attachments", &parameters)
             }
             "view-file" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence view-file macro")?;
+                let parameters = parse_macro_parameter_lines(&body, "confluence view-file macro")?;
                 build_attachment_preview_macro_storage("view-file", &parameters)?
             }
             "view-doc" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence view-doc macro")?;
+                let parameters = parse_macro_parameter_lines(&body, "confluence view-doc macro")?;
                 build_attachment_preview_macro_storage("viewdoc", &parameters)?
             }
             "view-xls" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence view-xls macro")?;
+                let parameters = parse_macro_parameter_lines(&body, "confluence view-xls macro")?;
                 build_attachment_preview_macro_storage("viewxls", &parameters)?
             }
             "view-ppt" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence view-ppt macro")?;
+                let parameters = parse_macro_parameter_lines(&body, "confluence view-ppt macro")?;
                 build_attachment_preview_macro_storage("viewppt", &parameters)?
             }
             "blog-posts" => {
@@ -1899,10 +1951,8 @@ fn replace_parameterized_colon_macro_blocks(
                 build_spaces_macro_storage("contributors", &parameters)
             }
             "contributors-summary" => {
-                let parameters = parse_macro_parameter_lines(
-                    &body,
-                    "confluence contributors-summary macro",
-                )?;
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence contributors-summary macro")?;
                 build_spaces_macro_storage("contributors-summary", &parameters)
             }
             "recently-updated-dashboard" => {
@@ -1950,10 +2000,8 @@ fn replace_parameterized_colon_macro_blocks(
                 build_parameter_only_macro_storage("contentbylabel", &parameters)
             }
             "content-report-table" => {
-                let parameters = parse_macro_parameter_lines(
-                    &body,
-                    "confluence content-report-table macro",
-                )?;
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence content-report-table macro")?;
                 build_spaces_macro_storage("content-report-table", &parameters)
             }
             "task-report" => {
@@ -1994,10 +2042,8 @@ fn replace_parameterized_colon_macro_blocks(
                 build_parameter_only_macro_storage("related-labels", &parameters)
             }
             "recently-used-labels" => {
-                let parameters = parse_macro_parameter_lines(
-                    &body,
-                    "confluence recently-used-labels macro",
-                )?;
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence recently-used-labels macro")?;
                 build_parameter_only_macro_storage("recently-used-labels", &parameters)
             }
             "gallery" => {
@@ -2005,10 +2051,8 @@ fn replace_parameterized_colon_macro_blocks(
                 build_parameter_only_macro_storage("gallery", &parameters)
             }
             "favorite-pages" => {
-                let parameters = parse_macro_parameter_lines(
-                    &body,
-                    "confluence favorite-pages macro",
-                )?;
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence favorite-pages macro")?;
                 if parameters.is_empty() {
                     build_simple_macro_storage("favpages")
                 } else {
@@ -2016,10 +2060,8 @@ fn replace_parameterized_colon_macro_blocks(
                 }
             }
             "change-history" => {
-                let parameters = parse_macro_parameter_lines(
-                    &body,
-                    "confluence change-history macro",
-                )?;
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence change-history macro")?;
                 if parameters.is_empty() {
                     build_simple_macro_storage("change-history")
                 } else {
@@ -2037,11 +2079,13 @@ fn replace_parameterized_colon_macro_blocks(
                 build_parameter_only_macro_storage("space-details", &parameters)
             }
             "space-attachments" => {
-                let parameters = parse_macro_parameter_lines(
-                    &body,
-                    "confluence space-attachments macro",
-                )?;
-                build_single_space_parameter_macro_storage("space-attachments", "space", &parameters)
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence space-attachments macro")?;
+                build_single_space_parameter_macro_storage(
+                    "space-attachments",
+                    "space",
+                    &parameters,
+                )
             }
             "profile" => {
                 let parameters = parse_macro_parameter_lines(&body, "confluence profile macro")?;
@@ -2063,12 +2107,7 @@ fn replace_parameterized_colon_macro_blocks(
                     &body,
                     allow_lossy,
                 )?;
-                match body_storage {
-                    Some(body_storage) => {
-                        build_rich_text_macro_storage(generic_name, &parameters, &body_storage)
-                    }
-                    None => build_parameter_only_macro_storage(generic_name, &parameters),
-                }
+                build_generic_macro_storage(generic_name, &parameters, body_storage.as_deref())?
             }
         };
 
@@ -2364,7 +2403,9 @@ fn build_attachment_preview_macro_storage(
     let attachment = parameters
         .remove("attachment")
         .or_else(|| parameters.remove("name"))
-        .ok_or_else(|| anyhow::anyhow!("confluence {name} macro requires an `attachment` parameter"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("confluence {name} macro requires an `attachment` parameter")
+        })?;
     let file_name = attachment_preview_file_name(&attachment)?;
 
     let page_xml = parameters.remove("page").map(|page| {
@@ -2408,6 +2449,94 @@ fn build_legacy_rich_text_macro_storage(
 fn build_parameter_only_macro_storage(name: &str, parameters: &BTreeMap<String, String>) -> String {
     let parameters_xml = build_macro_parameters_xml(parameters);
     format!(r#"<ac:structured-macro ac:name="{name}">{parameters_xml}</ac:structured-macro>"#)
+}
+
+fn build_generic_macro_storage(
+    name: &str,
+    parameters: &BTreeMap<String, String>,
+    body_storage: Option<&str>,
+) -> Result<String> {
+    let parameters_xml = build_generic_macro_parameters_xml(parameters)?;
+    Ok(match body_storage {
+        Some(body_storage) => format!(
+            r#"<ac:structured-macro ac:name="{name}">{parameters_xml}<ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:structured-macro>"#
+        ),
+        None => format!(
+            r#"<ac:structured-macro ac:name="{name}">{parameters_xml}</ac:structured-macro>"#
+        ),
+    })
+}
+
+fn build_generic_macro_parameters_xml(parameters: &BTreeMap<String, String>) -> Result<String> {
+    parameters
+        .iter()
+        .try_fold(String::new(), |mut xml, (name, value)| {
+            xml.push_str(&build_generic_macro_parameter_xml(name, value)?);
+            Ok(xml)
+        })
+}
+
+fn build_generic_macro_parameter_xml(name: &str, value: &str) -> Result<String> {
+    let parameter_name = if name == "$default" { "" } else { name };
+    let escaped_name = escape_xml(parameter_name);
+
+    if let Some(space_values) = value.strip_prefix("!space ") {
+        return build_space_parameter_xml(parameter_name, space_values.trim()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "generic confluence macro parameter `{name}` declared `!space` without a space key"
+            )
+        });
+    }
+
+    if let Some(user_value) = value.strip_prefix("!user ") {
+        let trimmed = user_value.trim();
+        if parse_user_placeholder_url(trimmed).is_none() {
+            bail!(
+                "generic confluence macro parameter `{name}` declared `!user` without a valid confluence-user placeholder"
+            );
+        }
+        return Ok(build_user_parameter_xml(parameter_name, trimmed));
+    }
+
+    if let Some(page_value) = value.strip_prefix("!page-link ") {
+        let placeholder = parse_page_placeholder_url(page_value.trim()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "generic confluence macro parameter `{name}` declared `!page-link` without a valid confluence-page placeholder"
+            )
+        })?;
+        let page_xml = build_page_resource_xml(&placeholder)?;
+        return Ok(format!(
+            r#"<ac:parameter ac:name="{escaped_name}"><ac:link>{page_xml}</ac:link></ac:parameter>"#
+        ));
+    }
+
+    if let Some(page_value) = value.strip_prefix("!page ") {
+        let placeholder = parse_page_placeholder_url(page_value.trim()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "generic confluence macro parameter `{name}` declared `!page` without a valid confluence-page placeholder"
+            )
+        })?;
+        let page_xml = build_page_resource_xml(&placeholder)?;
+        return Ok(format!(
+            r#"<ac:parameter ac:name="{escaped_name}">{page_xml}</ac:parameter>"#
+        ));
+    }
+
+    if parse_user_placeholder_url(value).is_some() {
+        return Ok(build_user_parameter_xml(parameter_name, value));
+    }
+
+    if let Some(placeholder) = parse_page_placeholder_url(value) {
+        let page_xml = build_page_resource_xml(&placeholder)?;
+        return Ok(format!(
+            r#"<ac:parameter ac:name="{escaped_name}">{page_xml}</ac:parameter>"#
+        ));
+    }
+
+    Ok(format!(
+        r#"<ac:parameter ac:name="{escaped_name}">{}</ac:parameter>"#,
+        escape_xml(value)
+    ))
 }
 
 fn build_legacy_parameter_only_macro_storage(
@@ -3371,6 +3500,28 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
     }
 
     #[test]
+    fn unsupported_resource_parameter_macros_export_to_generic_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="search"><ac:parameter ac:name="spacekey"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="contributor"><ri:user ri:userkey="user-123" /></ac:parameter><ac:parameter ac:name="query">docs</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-macro search"));
+        assert!(markdown.contains("spacekey: !space TEST"));
+        assert!(markdown.contains("contributor: !user confluence-user://user?userkey=user-123"));
+        assert!(markdown.contains("query: docs"));
+    }
+
+    #[test]
+    fn unsupported_page_resource_macros_export_to_generic_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="custom-page"><ac:parameter ac:name="source"><ri:page ri:content-title="Docs Home" ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="related"><ac:link><ri:page ri:content-id="12345" /></ac:link></ac:parameter><ac:parameter ac:name=""><ri:user ri:account-id="abc123" /></ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-macro custom-page"));
+        assert!(markdown.contains(
+            "source: !page confluence-page://page?space-key=TEST&content-title=Docs+Home"
+        ));
+        assert!(markdown.contains("related: !page-link confluence-page://page?content-id=12345"));
+        assert!(markdown.contains("$default: !user confluence-user://user?account-id=abc123"));
+    }
+
+    #[test]
     fn unsupported_rich_text_macros_export_to_generic_blocks() {
         let storage = r#"<ac:structured-macro ac:name="custom-rich"><ac:parameter ac:name="mode">summary</ac:parameter><ac:rich-text-body><h2>Heads up</h2><p>Body text.</p></ac:rich-text-body></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
@@ -3775,8 +3926,7 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
 
     #[test]
     fn contributors_blocks_round_trip_back_to_structured_macros() {
-        let markdown =
-            ":::confluence-contributors\nspaces: TEST,@personal\nlabels: docs,howto\nmode: list\n:::";
+        let markdown = ":::confluence-contributors\nspaces: TEST,@personal\nlabels: docs,howto\nmode: list\n:::";
         let rendered = markdown_to_storage(markdown, false).expect("contributors block converts");
         assert!(
             rendered
@@ -3812,9 +3962,9 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
             r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter>"#
         ));
         assert!(
-            rendered
-                .storage
-                .contains(r#"<ac:parameter ac:name="columns">edits,comments,labels</ac:parameter>"#)
+            rendered.storage.contains(
+                r#"<ac:parameter ac:name="columns">edits,comments,labels</ac:parameter>"#
+            )
         );
         assert!(
             rendered
@@ -3891,8 +4041,7 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
     #[test]
     fn favorite_pages_blocks_round_trip_back_to_structured_macros() {
         let markdown = ":::confluence-favorite-pages\n:::";
-        let rendered =
-            markdown_to_storage(markdown, false).expect("favorite-pages block converts");
+        let rendered = markdown_to_storage(markdown, false).expect("favorite-pages block converts");
         assert!(
             rendered
                 .storage
@@ -3906,8 +4055,7 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
     #[test]
     fn change_history_blocks_round_trip_back_to_structured_macros() {
         let markdown = ":::confluence-change-history\n:::";
-        let rendered =
-            markdown_to_storage(markdown, false).expect("change-history block converts");
+        let rendered = markdown_to_storage(markdown, false).expect("change-history block converts");
         assert!(
             rendered
                 .storage
@@ -4023,11 +4171,9 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
                 .storage
                 .contains(r#"<ac:structured-macro ac:name="space-attachments">"#)
         );
-        assert!(
-            rendered
-                .storage
-                .contains(r#"<ac:parameter ac:name="space"><ri:space ri:space-key="TEST" /></ac:parameter>"#)
-        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="space"><ri:space ri:space-key="TEST" /></ac:parameter>"#
+        ));
         assert!(
             rendered
                 .storage
@@ -4037,7 +4183,8 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
 
     #[test]
     fn noformat_blocks_round_trip_back_to_structured_macros() {
-        let markdown = "~~~confluence-noformat\nnopanel: true\n---\n<xml>literal</xml>\nline 2\n~~~";
+        let markdown =
+            "~~~confluence-noformat\nnopanel: true\n---\n<xml>literal</xml>\nline 2\n~~~";
         let rendered = markdown_to_storage(markdown, false).expect("noformat block converts");
         assert!(
             rendered
@@ -4055,7 +4202,6 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
                 .contains("<ac:plain-text-body><![CDATA[<xml>literal</xml>\nline 2]]>")
         );
     }
-
 
     #[test]
     fn toc_zone_blocks_round_trip_back_to_structured_macros() {
@@ -4262,8 +4408,7 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
 
     #[test]
     fn content_report_table_blocks_round_trip_back_to_structured_macros() {
-        let markdown =
-            ":::confluence-content-report-table\nlabels: e2e-macro-target\nspaces: TEST\nmaxResults: 5\n:::";
+        let markdown = ":::confluence-content-report-table\nlabels: e2e-macro-target\nspaces: TEST\nmaxResults: 5\n:::";
         let rendered =
             markdown_to_storage(markdown, false).expect("content-report-table block converts");
         assert!(
@@ -4315,13 +4460,9 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
                 .storage
                 .contains(r#"<ac:parameter ac:name="pageSize">20</ac:parameter>"#)
         );
-        assert!(
-            rendered
-                .storage
-                .contains(
-                    r#"<ac:parameter ac:name="columns">description,assignee,location</ac:parameter>"#
-                )
-        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="columns">description,assignee,location</ac:parameter>"#
+        ));
         assert!(
             rendered
                 .storage
@@ -4348,6 +4489,55 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="group">confluence-users</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn generic_resource_parameter_macro_blocks_round_trip_back_to_structured_macros() {
+        let page = build_page_placeholder_url(&PageLinkPlaceholder {
+            space_key: Some("TEST".to_string()),
+            content_title: Some("Docs Home".to_string()),
+            ..PageLinkPlaceholder::default()
+        });
+        let linked_page = build_page_placeholder_url(&PageLinkPlaceholder {
+            content_id: Some("12345".to_string()),
+            ..PageLinkPlaceholder::default()
+        });
+        let user = build_user_placeholder_url(&UserMentionPlaceholder {
+            user_key: Some("user-123".to_string()),
+            ..UserMentionPlaceholder::default()
+        });
+        let markdown = format!(
+            ":::confluence-macro search\nspacekey: !space TEST,@personal\ncontributor: !user {user}\nsource: !page {page}\nrelated: !page-link {linked_page}\n$default: plain default\nquery: docs\n:::"
+        );
+        let rendered =
+            markdown_to_storage(&markdown, false).expect("generic resource macro converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="search">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="spacekey"><ri:space ri:space-key="TEST" /><ri:space ri:space-key="@personal" /></ac:parameter>"#
+        ));
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="contributor"><ri:user ri:userkey="user-123" /></ac:parameter>"#
+        ));
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="source"><ri:page ri:content-title="Docs Home" ri:space-key="TEST" /></ac:parameter>"#
+        ));
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="related"><ac:link><ri:page ri:content-id="12345" /></ac:link></ac:parameter>"#
+        ));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="">plain default</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="query">docs</ac:parameter>"#)
         );
     }
 
