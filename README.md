@@ -241,6 +241,7 @@ make release-major
 GitHub Actions is set up to:
 
 - run CI on pushes and pull requests
+- publish tagged releases to crates.io
 - build tagged macOS and Linux release archives
 - attach release archives and checksum files to GitHub releases
 - update `rvben/tap` automatically on tagged releases when `HOMEBREW_TAP_TOKEN` is configured
