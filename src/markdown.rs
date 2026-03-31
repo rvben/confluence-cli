@@ -651,6 +651,9 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "contentbylabel" {
         return render_parameter_only_macro_block("content-by-label", node);
     }
+    if name == "content-by-user" || name == "contentbyuser" {
+        return render_default_parameter_macro_block("content-by-user", "user", node);
+    }
     if name == "content-report-table" {
         return render_spaces_macro_block("content-report-table", node);
     }
@@ -1575,7 +1578,11 @@ fn collect_macro_parameter_value(parameter: Node<'_, '_>) -> String {
         }
     }
 
-    parameter.text().unwrap_or_default().trim().to_string()
+    let text = parameter.text().unwrap_or_default().trim().to_string();
+    if let Some(user) = parse_user_resource_identifier_text(&text) {
+        return build_user_placeholder_url(&user);
+    }
+    text
 }
 
 fn find_macro_parameter<'a>(node: Node<'a, 'a>, name: &str) -> Option<Node<'a, 'a>> {
@@ -1668,6 +1675,44 @@ pub(crate) fn parse_user_placeholder_url(target: &str) -> Option<UserMentionPlac
             _ => {}
         }
     }
+    if placeholder.account_id.is_none()
+        && placeholder.user_key.is_none()
+        && placeholder.username.is_none()
+    {
+        None
+    } else {
+        Some(placeholder)
+    }
+}
+
+fn parse_user_resource_identifier_text(target: &str) -> Option<UserMentionPlaceholder> {
+    let trimmed = target.trim();
+    let bracketed = trimmed
+        .strip_suffix(']')?
+        .rsplit_once('[')
+        .map(|(_, suffix)| suffix)?;
+    if !bracketed.contains("accountId=")
+        && !bracketed.contains("userKey=")
+        && !bracketed.contains("userName=")
+    {
+        return None;
+    }
+
+    let mut placeholder = UserMentionPlaceholder::default();
+    for part in bracketed.split(',') {
+        let (key, value) = part.split_once('=')?;
+        let value = value.trim();
+        if value == "<null>" || value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "accountId" => placeholder.account_id = Some(value.to_string()),
+            "userKey" => placeholder.user_key = Some(value.to_string()),
+            "userName" => placeholder.username = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
     if placeholder.account_id.is_none()
         && placeholder.user_key.is_none()
         && placeholder.username.is_none()
@@ -1859,6 +1904,7 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-page-tree" => Some("page-tree"),
             ":::confluence-page-tree-search" => Some("page-tree-search"),
             ":::confluence-content-by-label" => Some("content-by-label"),
+            ":::confluence-content-by-user" => Some("content-by-user"),
             ":::confluence-content-report-table" => Some("content-report-table"),
             ":::confluence-task-report" => Some("task-report"),
             ":::confluence-recently-updated" => Some("recently-updated"),
@@ -1998,6 +2044,11 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters =
                     parse_macro_parameter_lines(&body, "confluence content-by-label macro")?;
                 build_parameter_only_macro_storage("contentbylabel", &parameters)
+            }
+            "content-by-user" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence content-by-user macro")?;
+                build_default_user_parameter_macro_storage("content-by-user", "user", &parameters)
             }
             "content-report-table" => {
                 let parameters =
@@ -2699,6 +2750,22 @@ fn build_user_parameter_macro_storage(
     )
 }
 
+fn build_default_user_parameter_macro_storage(
+    name: &str,
+    default_parameter_name: &str,
+    parameters: &BTreeMap<String, String>,
+) -> String {
+    let mut parameters = parameters.clone();
+    let user_xml = parameters
+        .remove(default_parameter_name)
+        .map(|user| build_user_parameter_xml("", &user))
+        .unwrap_or_default();
+    let parameters_xml = build_macro_parameters_xml(&parameters);
+    format!(
+        r#"<ac:structured-macro ac:name="{name}">{parameters_xml}{user_xml}</ac:structured-macro>"#
+    )
+}
+
 fn build_network_macro_storage(parameters: &BTreeMap<String, String>) -> String {
     let mut parameters = parameters.clone();
     if let Some(mode) = parameters.remove("mode") {
@@ -2771,7 +2838,9 @@ fn build_space_parameter_xml(name: &str, spaces: &str) -> Option<String> {
 }
 
 fn build_user_parameter_xml(name: &str, user: &str) -> String {
-    if let Some(placeholder) = parse_user_placeholder_url(user) {
+    if let Some(placeholder) =
+        parse_user_placeholder_url(user).or_else(|| parse_user_resource_identifier_text(user))
+    {
         if let Some(resource_xml) = build_user_resource_xml(&placeholder) {
             return format!(r#"<ac:parameter ac:name="{name}">{resource_xml}</ac:parameter>"#);
         }
@@ -3209,6 +3278,22 @@ mod tests {
     }
 
     #[test]
+    fn content_by_user_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="content-by-user"><ac:parameter ac:name=""><ri:user ri:userkey="user-123" /></ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-content-by-user"));
+        assert!(markdown.contains("user: confluence-user://user?userkey=user-123"));
+    }
+
+    #[test]
+    fn user_resource_identifier_text_exports_to_user_placeholder() {
+        let storage = r#"<ac:structured-macro ac:name="content-by-user"><ac:parameter ac:name="">com.atlassian.confluence.content.render.xhtml.model.resource.identifiers.UserResourceIdentifier@59a93065[accountId=557058:abc,userKey=&lt;null&gt;,userName=557058:abc]</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-content-by-user"));
+        assert!(markdown.contains("user: confluence-user://user?account-id=557058%3Aabc"));
+    }
+
+    #[test]
     fn contributors_macros_export_to_blocks() {
         let storage = r#"<ac:structured-macro ac:name="contributors"><ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /><ri:space ri:space-key="@personal" /></ac:parameter><ac:parameter ac:name="labels">docs,howto</ac:parameter><ac:parameter ac:name="mode">list</ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
@@ -3551,6 +3636,9 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
             "<ac:structured-macro ac:name=\"contentbylabel\">",
             "<ac:parameter ac:name=\"cql\">label = &quot;e2e-macro-target&quot;</ac:parameter>",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"content-by-user\">",
+            "<ac:parameter ac:name=\"\"><ri:user ri:userkey=\"user-123\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"content-report-table\">",
             "<ac:parameter ac:name=\"labels\">e2e-macro-target</ac:parameter>",
             "<ac:parameter ac:name=\"spaces\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
@@ -3648,6 +3736,7 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
         assert!(markdown.contains(":::confluence-page-tree"));
         assert!(markdown.contains(":::confluence-page-tree-search"));
         assert!(markdown.contains(":::confluence-content-by-label"));
+        assert!(markdown.contains(":::confluence-content-by-user"));
         assert!(markdown.contains(":::confluence-content-report-table"));
         assert!(markdown.contains(":::confluence-task-report"));
         assert!(markdown.contains(":::confluence-recently-updated"));
@@ -4404,6 +4493,32 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
                 .storage
                 .contains(r#"<ac:parameter ac:name="maxResults">5</ac:parameter>"#)
         );
+    }
+
+    #[test]
+    fn content_by_user_blocks_round_trip_back_to_structured_macros() {
+        let markdown =
+            ":::confluence-content-by-user\nuser: confluence-user://user?userkey=user-123\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("content-by-user block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="content-by-user">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name=""><ri:user ri:userkey="user-123" /></ac:parameter>"#
+        ));
+    }
+
+    #[test]
+    fn user_resource_identifier_text_round_trips_back_to_structured_user_resource() {
+        let markdown = ":::confluence-content-by-user\nuser: com.atlassian.confluence.content.render.xhtml.model.resource.identifiers.UserResourceIdentifier@59a93065[accountId=557058:abc,userKey=<null>,userName=557058:abc]\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("user identifier string converts");
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name=""><ri:user ri:account-id="557058:abc" /></ac:parameter>"#
+        ));
     }
 
     #[test]
