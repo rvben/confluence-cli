@@ -1,6 +1,6 @@
 [package]
 name = "confluence-cli"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Markdown-sync-first Confluence CLI in Rust"
@@ -15,6 +15,7 @@ include = [
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "src/**",
     "tests/**",
