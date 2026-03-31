@@ -767,12 +767,24 @@ fn e2e_cli_lifecycle() {
     let macro_source_dir = macro_root_dir.join("source");
     let macro_target_dir = macro_root_dir.join("target");
     let macro_child_dir = macro_source_dir.join("child");
+    let macro_source_attachments_dir = macro_source_dir.join("attachments");
+    let macro_target_attachments_dir = macro_target_dir.join("attachments");
     let macro_user = current_user_placeholder(&cfg);
     let macro_user_fragment = expected_user_resource_fragment(&macro_user);
     fs::create_dir_all(&macro_root_dir).expect("create macro root dir");
     fs::create_dir_all(&macro_source_dir).expect("create macro source dir");
     fs::create_dir_all(&macro_target_dir).expect("create macro target dir");
     fs::create_dir_all(&macro_child_dir).expect("create macro child dir");
+    fs::create_dir_all(&macro_source_attachments_dir).expect("create macro source attachments dir");
+    fs::create_dir_all(&macro_target_attachments_dir).expect("create macro target attachments dir");
+    fs::write(macro_source_attachments_dir.join("preview.pdf"), "preview pdf payload\n")
+        .expect("write macro source preview attachment");
+    fs::write(macro_source_attachments_dir.join("sheet.xlsx"), "spreadsheet payload\n")
+        .expect("write macro source xls attachment");
+    fs::write(macro_source_attachments_dir.join("slides.pptx"), "slides payload\n")
+        .expect("write macro source ppt attachment");
+    fs::write(macro_target_attachments_dir.join("manual.docx"), "manual payload\n")
+        .expect("write macro target doc attachment");
     fs::write(
         macro_root_dir.join("index.md"),
         format!(
@@ -783,7 +795,7 @@ fn e2e_cli_lifecycle() {
     fs::write(
         macro_source_dir.join("index.md"),
         format!(
-            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-contributors\nspaces: {space},@personal\nlabels: e2e-macro-target\nmode: list\n:::\n\n:::confluence-contributors-summary\nspaces: {space}\ncolumns: edits,comments,labels\nlimit: 10\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nspaces: {space}\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-recently-used-labels\nscope: space\nstyle: cloud\n:::\n\n:::confluence-gallery\nsortBy: name\ncolumns: 2\n:::\n\n:::confluence-favorite-pages\n:::\n\n:::confluence-change-history\n:::\n\n:::confluence-spaces-list\nscope: all\nwidth: 80%\n:::\n\n:::confluence-space-details\nwidth: 50%\n:::\n\n:::confluence-space-attachments\nspace: {space}\nshowFilter: false\n:::\n\n~~~confluence-noformat\nnopanel: true\n---\n<xml>literal</xml>\nline 2\n~~~\n\n:::confluence-profile\nuser: {macro_user}\n:::\n\n:::confluence-status-list\nusername: {macro_user}\n:::\n\n:::confluence-network\nmode: followers\nusername: {macro_user}\nmax: 10\ntheme: full\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
+            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-view-file\nattachment: preview.pdf\n:::\n\n:::confluence-view-doc\npage: ../target/index.md\nattachment: manual.docx\n:::\n\n:::confluence-view-xls\nattachment: sheet.xlsx\n:::\n\n:::confluence-view-ppt\nattachment: slides.pptx\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-contributors\nspaces: {space},@personal\nlabels: e2e-macro-target\nmode: list\n:::\n\n:::confluence-contributors-summary\nspaces: {space}\ncolumns: edits,comments,labels\nlimit: 10\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nspaces: {space}\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-recently-used-labels\nscope: space\nstyle: cloud\n:::\n\n:::confluence-gallery\nsortBy: name\ncolumns: 2\n:::\n\n:::confluence-favorite-pages\n:::\n\n:::confluence-change-history\n:::\n\n:::confluence-spaces-list\nscope: all\nwidth: 80%\n:::\n\n:::confluence-space-details\nwidth: 50%\n:::\n\n:::confluence-space-attachments\nspace: {space}\nshowFilter: false\n:::\n\n~~~confluence-noformat\nnopanel: true\n---\n<xml>literal</xml>\nline 2\n~~~\n\n:::confluence-profile\nuser: {macro_user}\n:::\n\n:::confluence-status-list\nusername: {macro_user}\n:::\n\n:::confluence-network\nmode: followers\nusername: {macro_user}\nmax: 10\ntheme: full\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
             space = cfg.space,
             macro_user = macro_user
         ),
@@ -967,6 +979,49 @@ fn e2e_cli_lifecycle() {
         macro_source_body.contains(r#"<ac:parameter ac:name="patterns">*.pdf</ac:parameter>"#)
             && macro_source_body.contains(r#"<ac:parameter ac:name="sortBy">name</ac:parameter>"#),
         "expected attachments parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="view-file""#),
+        "expected view-file macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(
+            r#"<ac:parameter ac:name="name"><ri:attachment ri:filename="preview.pdf" /></ac:parameter>"#
+        ),
+        "expected view-file attachment parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="viewdoc""#),
+        "expected view-doc macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="page"><ac:link><ri:page "#)
+            && macro_source_body.contains(&format!(r#"ri:content-title="{}""#, macro_target_title))
+            && macro_source_body.contains(&format!(r#"ri:space-key="{}""#, cfg.space))
+            && macro_source_body.contains(
+                r#"<ac:parameter ac:name="name"><ri:attachment ri:filename="manual.docx" /></ac:parameter>"#
+            ),
+        "expected view-doc parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="viewxls""#),
+        "expected view-xls macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(
+            r#"<ac:parameter ac:name="name"><ri:attachment ri:filename="sheet.xlsx" /></ac:parameter>"#
+        ),
+        "expected view-xls attachment parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="viewppt""#),
+        "expected view-ppt macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(
+            r#"<ac:parameter ac:name="name"><ri:attachment ri:filename="slides.pptx" /></ac:parameter>"#
+        ),
+        "expected view-ppt attachment parameter to survive storage rendering: {macro_source_body}"
     );
     assert!(
         macro_source_body.contains(r#"ac:name="blog-posts""#),
@@ -1310,6 +1365,41 @@ fn e2e_cli_lifecycle() {
         pulled_macro_source_markdown.contains("patterns: *.pdf")
             && pulled_macro_source_markdown.contains("sortBy: name"),
         "expected pulled attachments parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-view-file"),
+        "expected pulled macro source to preserve view-file block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("attachment: preview.pdf"),
+        "expected pulled view-file attachment parameter to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-view-doc"),
+        "expected pulled macro source to preserve view-doc block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("page: ../")
+            && pulled_macro_source_markdown.contains("/index.md")
+            && pulled_macro_source_markdown.contains("attachment: manual.docx")
+            && !pulled_macro_source_markdown.contains("page: confluence-page://page?"),
+        "expected pulled view-doc parameters to survive export and rewrite the page reference locally: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-view-xls"),
+        "expected pulled macro source to preserve view-xls block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("attachment: sheet.xlsx"),
+        "expected pulled view-xls attachment parameter to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-view-ppt"),
+        "expected pulled macro source to preserve view-ppt block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("attachment: slides.pptx"),
+        "expected pulled view-ppt attachment parameter to survive export: {pulled_macro_source_markdown}"
     );
     assert!(
         pulled_macro_source_markdown.contains(":::confluence-blog-posts"),

@@ -609,6 +609,18 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "attachments" {
         return render_parameter_only_macro_block("attachments", node);
     }
+    if name == "view-file" {
+        return render_attachment_preview_macro_block("view-file", node);
+    }
+    if name == "viewdoc" {
+        return render_attachment_preview_macro_block("view-doc", node);
+    }
+    if name == "viewxls" {
+        return render_attachment_preview_macro_block("view-xls", node);
+    }
+    if name == "viewppt" {
+        return render_attachment_preview_macro_block("view-ppt", node);
+    }
     if matches!(name, "blog-posts" | "blogposts") {
         return render_parameter_only_macro_block("blog-posts", node);
     }
@@ -861,6 +873,25 @@ fn render_space_key_macro_block(name: &str, node: Node<'_, '_>) -> Option<String
 
 fn render_spaces_macro_block(name: &str, node: Node<'_, '_>) -> Option<String> {
     let parameters = collect_macro_parameters(node);
+    Some(render_parameter_only_macro_block_with_parameters(
+        name,
+        &parameters,
+    ))
+}
+
+fn render_attachment_preview_macro_block(name: &str, node: Node<'_, '_>) -> Option<String> {
+    let mut parameters = collect_macro_parameters(node);
+    if let Some(page) = parameters.get("page").cloned() {
+        let trimmed = page.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('@') {
+            let placeholder = parse_page_placeholder_url(trimmed)
+                .unwrap_or_else(|| parse_default_parameter_page_target(trimmed));
+            parameters.insert("page".to_string(), build_page_placeholder_url(&placeholder));
+        }
+    }
+    if let Some(name_parameter) = parameters.remove("name") {
+        parameters.insert("attachment".to_string(), name_parameter);
+    }
     Some(render_parameter_only_macro_block_with_parameters(
         name,
         &parameters,
@@ -1679,6 +1710,10 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-content-properties" => Some("content-properties"),
             ":::confluence-content-properties-report" => Some("content-properties-report"),
             ":::confluence-attachments" => Some("attachments"),
+            ":::confluence-view-file" => Some("view-file"),
+            ":::confluence-view-doc" => Some("view-doc"),
+            ":::confluence-view-xls" => Some("view-xls"),
+            ":::confluence-view-ppt" => Some("view-ppt"),
             ":::confluence-blog-posts" => Some("blog-posts"),
             ":::confluence-contributors" => Some("contributors"),
             ":::confluence-contributors-summary" => Some("contributors-summary"),
@@ -1753,6 +1788,26 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters =
                     parse_macro_parameter_lines(&body, "confluence attachments macro")?;
                 build_parameter_only_macro_storage("attachments", &parameters)
+            }
+            "view-file" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence view-file macro")?;
+                build_attachment_preview_macro_storage("view-file", &parameters)?
+            }
+            "view-doc" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence view-doc macro")?;
+                build_attachment_preview_macro_storage("viewdoc", &parameters)?
+            }
+            "view-xls" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence view-xls macro")?;
+                build_attachment_preview_macro_storage("viewxls", &parameters)?
+            }
+            "view-ppt" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence view-ppt macro")?;
+                build_attachment_preview_macro_storage("viewppt", &parameters)?
             }
             "blog-posts" => {
                 let parameters = parse_macro_parameter_lines(&body, "confluence blog-posts macro")?;
@@ -2176,6 +2231,33 @@ fn build_noformat_macro_storage(parameters: &BTreeMap<String, String>, text: &st
     )
 }
 
+fn build_attachment_preview_macro_storage(
+    name: &str,
+    parameters: &BTreeMap<String, String>,
+) -> Result<String> {
+    let mut parameters = parameters.clone();
+    let attachment = parameters
+        .remove("attachment")
+        .or_else(|| parameters.remove("name"))
+        .ok_or_else(|| anyhow::anyhow!("confluence {name} macro requires an `attachment` parameter"))?;
+    let file_name = attachment_preview_file_name(&attachment)?;
+
+    let page_xml = parameters.remove("page").map(|page| {
+        let placeholder = parse_page_placeholder_url(&page)
+            .unwrap_or_else(|| parse_default_parameter_page_target(&page));
+        let page_resource_xml = build_page_title_resource_xml(&placeholder)?;
+        Ok::<_, anyhow::Error>(format!(
+            r#"<ac:parameter ac:name="page"><ac:link>{page_resource_xml}</ac:link></ac:parameter>"#
+        ))
+    }).transpose()?;
+    let parameters_xml = build_macro_parameters_xml(&parameters);
+    Ok(format!(
+        r#"<ac:structured-macro ac:name="{name}">{parameters_xml}{}<ac:parameter ac:name="name"><ri:attachment ri:filename="{}" /></ac:parameter></ac:structured-macro>"#,
+        page_xml.unwrap_or_default(),
+        escape_xml(&file_name),
+    ))
+}
+
 fn build_rich_text_macro_storage(
     name: &str,
     parameters: &BTreeMap<String, String>,
@@ -2213,6 +2295,21 @@ fn build_legacy_parameter_only_macro_storage(
 
 fn build_simple_macro_storage(name: &str) -> String {
     format!(r#"<ac:macro ac:name="{name}" />"#)
+}
+
+fn attachment_preview_file_name(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("attachment parameter cannot be empty");
+    }
+    let path_part = trimmed.split('#').next().unwrap_or(trimmed);
+    let candidate = Path::new(path_part);
+    if let Some(file_name) = candidate.file_name().and_then(|name| name.to_str()) {
+        if !file_name.is_empty() {
+            return Ok(file_name.to_string());
+        }
+    }
+    Ok(trimmed.to_string())
 }
 
 fn build_excerpt_include_macro_storage(parameters: &BTreeMap<String, String>) -> Result<String> {
@@ -2690,7 +2787,7 @@ mod tests {
 
     #[test]
     fn storage_macro_round_trips_through_sentinel_block() {
-        let storage = r#"<p>Hello</p><ac:structured-macro ac:name="view-file" />"#;
+        let storage = r#"<p>Hello</p><ac:structured-macro ac:name="chart" />"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("```confluence-storage"));
         let rendered = markdown_to_storage(&markdown, false).expect("conversion succeeds");
@@ -2699,7 +2796,7 @@ mod tests {
 
     #[test]
     fn mixed_content_preserves_only_unsupported_confluence_fragments() {
-        let storage = r#"<h1>Title</h1><ac:structured-macro ac:name="view-file" /><p>After</p>"#;
+        let storage = r#"<h1>Title</h1><ac:structured-macro ac:name="chart" /><p>After</p>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("# Title"));
         assert!(markdown.contains("```confluence-storage"));
@@ -2812,6 +2909,40 @@ mod tests {
         assert!(markdown.contains(":::confluence-attachments"));
         assert!(markdown.contains("patterns: *.pdf"));
         assert!(markdown.contains("sortBy: name"));
+    }
+
+    #[test]
+    fn view_file_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="view-file"><ac:parameter ac:name="name"><ri:attachment ri:filename="preview.pdf" /></ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-view-file"));
+        assert!(markdown.contains("attachment: preview.pdf"));
+    }
+
+    #[test]
+    fn view_doc_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="viewdoc"><ac:parameter ac:name="page"><ac:link><ri:page ri:space-key="TEST" ri:content-title="Docs Home" /></ac:link></ac:parameter><ac:parameter ac:name="name"><ri:attachment ri:filename="manual.docx" /></ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-view-doc"));
+        assert!(markdown.contains("attachment: manual.docx"));
+        assert!(markdown.contains("page: confluence-page://page?"));
+        assert!(!markdown.contains("content-title=confluence-page%3A%2F%2Fpage%3F"));
+    }
+
+    #[test]
+    fn view_xls_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="viewxls"><ac:parameter ac:name="name"><ri:attachment ri:filename="sheet.xlsx" /></ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-view-xls"));
+        assert!(markdown.contains("attachment: sheet.xlsx"));
+    }
+
+    #[test]
+    fn view_ppt_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="viewppt"><ac:parameter ac:name="name"><ri:attachment ri:filename="slides.pptx" /></ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-view-ppt"));
+        assert!(markdown.contains("attachment: slides.pptx"));
     }
 
     #[test]
@@ -3111,6 +3242,19 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
             "<ac:structured-macro ac:name=\"attachments\">",
             "<ac:parameter ac:name=\"patterns\">*.pdf</ac:parameter>",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"view-file\">",
+            "<ac:parameter ac:name=\"name\"><ri:attachment ri:filename=\"preview.pdf\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"viewdoc\">",
+            "<ac:parameter ac:name=\"page\">TEST:Docs Home</ac:parameter>",
+            "<ac:parameter ac:name=\"name\"><ri:attachment ri:filename=\"manual.docx\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"viewxls\">",
+            "<ac:parameter ac:name=\"name\"><ri:attachment ri:filename=\"sheet.xlsx\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"viewppt\">",
+            "<ac:parameter ac:name=\"name\"><ri:attachment ri:filename=\"slides.pptx\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"blog-posts\">",
             "<ac:parameter ac:name=\"max\">5</ac:parameter>",
             "</ac:structured-macro>\n",
@@ -3178,6 +3322,10 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
         assert!(markdown.contains(":::confluence-livesearch"));
         assert!(markdown.contains(":::confluence-page-index"));
         assert!(markdown.contains(":::confluence-attachments"));
+        assert!(markdown.contains(":::confluence-view-file"));
+        assert!(markdown.contains(":::confluence-view-doc"));
+        assert!(markdown.contains(":::confluence-view-xls"));
+        assert!(markdown.contains(":::confluence-view-ppt"));
         assert!(markdown.contains(":::confluence-blog-posts"));
         assert!(markdown.contains(":::confluence-contributors"));
         assert!(markdown.contains(":::confluence-contributors-summary"));
@@ -3351,6 +3499,75 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
                 .storage
                 .contains(r#"<ac:parameter ac:name="sortBy">name</ac:parameter>"#)
         );
+    }
+
+    #[test]
+    fn view_file_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-view-file\nattachment: preview.pdf\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("view-file block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="view-file">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="name"><ri:attachment ri:filename="preview.pdf" /></ac:parameter>"#
+        ));
+    }
+
+    #[test]
+    fn view_doc_blocks_round_trip_back_to_structured_macros() {
+        let page = build_page_placeholder_url(&PageLinkPlaceholder {
+            space_key: Some("TEST".to_string()),
+            content_title: Some("Docs Home".to_string()),
+            ..PageLinkPlaceholder::default()
+        });
+        let markdown =
+            format!(":::confluence-view-doc\npage: {page}\nattachment: manual.docx\n:::");
+        let rendered = markdown_to_storage(&markdown, false).expect("view-doc block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="viewdoc">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(
+                    r#"<ac:parameter ac:name="page"><ac:link><ri:page ri:content-title="Docs Home" ri:space-key="TEST" /></ac:link></ac:parameter>"#
+                )
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="name"><ri:attachment ri:filename="manual.docx" /></ac:parameter>"#
+        ));
+    }
+
+    #[test]
+    fn view_xls_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-view-xls\nattachment: sheet.xlsx\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("view-xls block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="viewxls">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="name"><ri:attachment ri:filename="sheet.xlsx" /></ac:parameter>"#
+        ));
+    }
+
+    #[test]
+    fn view_ppt_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-view-ppt\nattachment: slides.pptx\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("view-ppt block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="viewppt">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="name"><ri:attachment ri:filename="slides.pptx" /></ac:parameter>"#
+        ));
     }
 
     #[test]
