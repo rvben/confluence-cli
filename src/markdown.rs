@@ -609,6 +609,15 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "recently-updated" || name == "recentlyupdated" {
         return render_recently_updated_macro_block(node);
     }
+    if matches!(name, "listlabels" | "labels-list") {
+        return render_space_key_macro_block("labels-list", node);
+    }
+    if name == "popular-labels" {
+        return render_space_key_macro_block("popular-labels", node);
+    }
+    if name == "related-labels" {
+        return render_parameter_only_macro_block("related-labels", node);
+    }
     if name == "toc" {
         return render_parameter_only_macro_block("toc", node);
     }
@@ -714,6 +723,15 @@ fn render_page_tree_macro_block(node: Node<'_, '_>) -> Option<String> {
 
 fn render_page_tree_search_macro_block(node: Node<'_, '_>) -> Option<String> {
     let mut parameters = collect_macro_parameters(node);
+    if let Some(parameter) = find_macro_parameter(node, "spaceKey") {
+        if let Some(space) = namespaced_child(parameter, RI_NS, "space") {
+            let space_key = space
+                .attribute((RI_NS, "space-key"))
+                .or_else(|| space.attribute("ri:space-key"))
+                .or_else(|| space.attribute("space-key"))?;
+            parameters.insert("spaceKey".to_string(), space_key.to_string());
+        }
+    }
     if let Some(root) = parameters.get("root").cloned() {
         let trimmed = root.trim();
         if !trimmed.is_empty() && !trimmed.starts_with('@') {
@@ -740,6 +758,23 @@ fn render_recently_updated_macro_block(node: Node<'_, '_>) -> Option<String> {
     }
     Some(render_parameter_only_macro_block_with_parameters(
         "recently-updated",
+        &parameters,
+    ))
+}
+
+fn render_space_key_macro_block(name: &str, node: Node<'_, '_>) -> Option<String> {
+    let mut parameters = collect_macro_parameters(node);
+    if let Some(parameter) = find_macro_parameter(node, "spaceKey") {
+        if let Some(space) = namespaced_child(parameter, RI_NS, "space") {
+            let space_key = space
+                .attribute((RI_NS, "space-key"))
+                .or_else(|| space.attribute("ri:space-key"))
+                .or_else(|| space.attribute("space-key"))?;
+            parameters.insert("spaceKey".to_string(), space_key.to_string());
+        }
+    }
+    Some(render_parameter_only_macro_block_with_parameters(
+        name,
         &parameters,
     ))
 }
@@ -1452,6 +1487,9 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-page-tree-search" => Some("page-tree-search"),
             ":::confluence-content-by-label" => Some("content-by-label"),
             ":::confluence-recently-updated" => Some("recently-updated"),
+            ":::confluence-labels-list" => Some("labels-list"),
+            ":::confluence-popular-labels" => Some("popular-labels"),
+            ":::confluence-related-labels" => Some("related-labels"),
             _ => None,
         };
 
@@ -1515,6 +1553,21 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters =
                     parse_macro_parameter_lines(&body, "confluence recently-updated macro")?;
                 build_recently_updated_macro_storage(&parameters)
+            }
+            "labels-list" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence labels-list macro")?;
+                build_space_key_macro_storage("listlabels", &parameters)
+            }
+            "popular-labels" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence popular-labels macro")?;
+                build_space_key_macro_storage("popular-labels", &parameters)
+            }
+            "related-labels" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence related-labels macro")?;
+                build_parameter_only_macro_storage("related-labels", &parameters)
             }
             _ => unreachable!(),
         };
@@ -1874,6 +1927,28 @@ fn build_recently_updated_macro_storage(parameters: &BTreeMap<String, String>) -
     format!(
         r#"<ac:structured-macro ac:name="recently-updated">{parameters_xml}{}</ac:structured-macro>"#,
         spaces_xml.unwrap_or_default()
+    )
+}
+
+fn build_space_key_macro_storage(name: &str, parameters: &BTreeMap<String, String>) -> String {
+    let mut parameters = parameters.clone();
+    let space_key_xml = if let Some(space_key) = parameters.remove("spaceKey") {
+        let trimmed = space_key.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(format!(
+                r#"<ac:parameter ac:name="spaceKey"><ri:space ri:space-key="{}" /></ac:parameter>"#,
+                escape_xml(trimmed)
+            ))
+        }
+    } else {
+        None
+    };
+    let parameters_xml = build_macro_parameters_xml(&parameters);
+    format!(
+        r#"<ac:structured-macro ac:name="{name}">{parameters_xml}{}</ac:structured-macro>"#,
+        space_key_xml.unwrap_or_default()
     )
 }
 
@@ -2256,7 +2331,7 @@ mod tests {
 
     #[test]
     fn page_tree_search_macros_export_to_blocks() {
-        let storage = r#"<ac:structured-macro ac:name="pagetreesearch"><ac:parameter ac:name="root">TEST:Docs Home</ac:parameter><ac:parameter ac:name="spaceKey">TEST</ac:parameter></ac:structured-macro>"#;
+        let storage = r#"<ac:structured-macro ac:name="pagetreesearch"><ac:parameter ac:name="root">TEST:Docs Home</ac:parameter><ac:parameter ac:name="spaceKey"><ri:space ri:space-key="TEST" /></ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains(":::confluence-page-tree-search"));
         assert!(markdown.contains("root: confluence-page://page?"));
@@ -2283,6 +2358,33 @@ mod tests {
     }
 
     #[test]
+    fn labels_list_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="listlabels"><ac:parameter ac:name="spaceKey"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="excludedLabels">drafts,test</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-labels-list"));
+        assert!(markdown.contains("spaceKey: TEST"));
+        assert!(markdown.contains("excludedLabels: drafts,test"));
+    }
+
+    #[test]
+    fn popular_labels_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="popular-labels"><ac:parameter ac:name="spaceKey"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="count">25</ac:parameter><ac:parameter ac:name="style">heatmap</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-popular-labels"));
+        assert!(markdown.contains("spaceKey: TEST"));
+        assert!(markdown.contains("count: 25"));
+        assert!(markdown.contains("style: heatmap"));
+    }
+
+    #[test]
+    fn related_labels_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="related-labels"><ac:parameter ac:name="labels">docs,howto</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-related-labels"));
+        assert!(markdown.contains("labels: docs,howto"));
+    }
+
+    #[test]
     fn whitespace_between_supported_blocks_does_not_force_fallback_export() {
         let storage = concat!(
             "<h1>Macro Source</h1>\n",
@@ -2304,6 +2406,16 @@ mod tests {
             "<ac:structured-macro ac:name=\"recently-updated\">",
             "<ac:parameter ac:name=\"spaces\">TEST</ac:parameter>",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"listlabels\">",
+            "<ac:parameter ac:name=\"spaceKey\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"popular-labels\">",
+            "<ac:parameter ac:name=\"spaceKey\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
+            "<ac:parameter ac:name=\"count\">10</ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"related-labels\">",
+            "<ac:parameter ac:name=\"labels\">docs</ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"children\">",
             "<ac:parameter ac:name=\"all\">true</ac:parameter>",
             "</ac:structured-macro>"
@@ -2316,6 +2428,9 @@ mod tests {
         assert!(markdown.contains(":::confluence-page-tree-search"));
         assert!(markdown.contains(":::confluence-content-by-label"));
         assert!(markdown.contains(":::confluence-recently-updated"));
+        assert!(markdown.contains(":::confluence-labels-list"));
+        assert!(markdown.contains(":::confluence-popular-labels"));
+        assert!(markdown.contains(":::confluence-related-labels"));
         assert!(markdown.contains(":::confluence-children"));
         assert!(!markdown.contains("CONFLUENCE_XML_PLACEHOLDER"));
     }
@@ -2572,6 +2687,67 @@ mod tests {
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="max">10</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn labels_list_blocks_round_trip_back_to_structured_macros() {
+        let markdown =
+            ":::confluence-labels-list\nspaceKey: TEST\nexcludedLabels: drafts,test\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("labels-list block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="listlabels">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="spaceKey"><ri:space ri:space-key="TEST" /></ac:parameter>"#
+        ));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="excludedLabels">drafts,test</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn popular_labels_blocks_round_trip_back_to_structured_macros() {
+        let markdown =
+            ":::confluence-popular-labels\nspaceKey: TEST\ncount: 25\nstyle: heatmap\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("popular-labels block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="popular-labels">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="spaceKey"><ri:space ri:space-key="TEST" /></ac:parameter>"#
+        ));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="count">25</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="style">heatmap</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn related_labels_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-related-labels\nlabels: docs,howto\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("related-labels block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="related-labels">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="labels">docs,howto</ac:parameter>"#)
         );
     }
 

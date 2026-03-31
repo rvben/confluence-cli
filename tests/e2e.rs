@@ -648,7 +648,7 @@ fn e2e_cli_lifecycle() {
     fs::write(
         macro_source_dir.join("index.md"),
         format!(
-            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
+            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
             space = cfg.space
         ),
     )
@@ -794,6 +794,16 @@ fn e2e_cli_lifecycle() {
         "expected page-tree-search root to reference target title {macro_target_title}: {macro_source_body}"
     );
     assert!(
+        macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="spaceKey">{}</ac:parameter>"#,
+            cfg.space
+        )) || macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="spaceKey"><ri:space ri:space-key="{}" /></ac:parameter>"#,
+            cfg.space
+        )),
+        "expected page-tree-search spaceKey parameter to survive storage rendering as either a plain string or a space resource: {macro_source_body}"
+    );
+    assert!(
         macro_source_body.contains(r#"ac:name="contentbylabel""#),
         "expected content-by-label macro in source body: {macro_source_body}"
     );
@@ -813,6 +823,50 @@ fn e2e_cli_lifecycle() {
             cfg.space
         )),
         "expected recently-updated spaces parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="listlabels""#),
+        "expected labels-list macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="spaceKey"><ri:space ri:space-key="{}" /></ac:parameter>"#,
+            cfg.space
+        )),
+        "expected labels-list spaceKey parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body
+            .contains(r#"<ac:parameter ac:name="excludedLabels">drafts,test</ac:parameter>"#),
+        "expected labels-list excludedLabels parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="popular-labels""#),
+        "expected popular-labels macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="spaceKey"><ri:space ri:space-key="{}" /></ac:parameter>"#,
+            cfg.space
+        )),
+        "expected popular-labels spaceKey parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="count">25</ac:parameter>"#),
+        "expected popular-labels count parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="style">heatmap</ac:parameter>"#),
+        "expected popular-labels style parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="related-labels""#),
+        "expected related-labels macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body
+            .contains(r#"<ac:parameter ac:name="labels">e2e-macro-target</ac:parameter>"#),
+        "expected related-labels labels parameter to survive storage rendering: {macro_source_body}"
     );
 
     let macro_pull_arg = macro_pull_dir.to_string_lossy().into_owned();
@@ -864,6 +918,10 @@ fn e2e_cli_lifecycle() {
         "expected pulled page-tree-search root to rewrite to a local path: {pulled_macro_source_markdown}"
     );
     assert!(
+        pulled_macro_source_markdown.contains(&format!("spaceKey: {}", cfg.space)),
+        "expected pulled page-tree-search spaceKey to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
         pulled_macro_source_markdown.contains(":::confluence-content-by-label"),
         "expected pulled macro source to preserve content-by-label block: {pulled_macro_source_markdown}"
     );
@@ -878,6 +936,35 @@ fn e2e_cli_lifecycle() {
     assert!(
         pulled_macro_source_markdown.contains(&format!("spaces: {}", cfg.space)),
         "expected pulled recently-updated spaces to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-labels-list"),
+        "expected pulled macro source to preserve labels-list block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(&format!("spaceKey: {}", cfg.space)),
+        "expected pulled labels-list spaceKey to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("excludedLabels: drafts,test"),
+        "expected pulled labels-list excludedLabels to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-popular-labels"),
+        "expected pulled macro source to preserve popular-labels block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("count: 25")
+            && pulled_macro_source_markdown.contains("style: heatmap"),
+        "expected pulled popular-labels parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-related-labels"),
+        "expected pulled macro source to preserve related-labels block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("labels: e2e-macro-target"),
+        "expected pulled related-labels labels parameter to survive export: {pulled_macro_source_markdown}"
     );
 
     let macro_plan = cfg.run_json(&["plan", &macro_pull_arg]);
