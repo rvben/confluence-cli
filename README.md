@@ -30,6 +30,13 @@ From crates.io:
 cargo install confluence-cli
 ```
 
+From Homebrew:
+
+```bash
+brew tap rvben/tap
+brew install rvben/tap/confluence-cli
+```
+
 Prebuilt macOS and Linux archives are published on the [GitHub releases page](https://github.com/rvben/confluence-cli/releases).
 
 ## Quick Start
@@ -236,6 +243,7 @@ GitHub Actions is set up to:
 - run CI on pushes and pull requests
 - build tagged macOS and Linux release archives
 - attach release archives and checksum files to GitHub releases
+- update `rvben/tap` automatically on tagged releases when `HOMEBREW_TAP_TOKEN` is configured
 
 ## Markdown Fidelity
 

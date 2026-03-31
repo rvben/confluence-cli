@@ -97,3 +97,98 @@ jobs:
           files: |
             dist/**/*.tar.gz
             dist/**/*.tar.gz.sha256
+
+  update-homebrew:
+    needs: publish
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Check for tap token
+        id: check-token
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "HOMEBREW_TAP_TOKEN not set, skipping Homebrew formula update"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download release artifacts
+        if: steps.check-token.outputs.skip == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Compute release checksums
+        if: steps.check-token.outputs.skip == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          checksum() {
+            awk '{print $1}' "$1"
+          }
+
+          version="${GITHUB_REF_NAME#v}"
+          echo "SHA_MACOS_ARM64=$(checksum "dist/aarch64-apple-darwin/confluence-cli-v${version}-aarch64-apple-darwin.tar.gz.sha256")" >> "$GITHUB_ENV"
+          echo "SHA_MACOS_X86=$(checksum "dist/x86_64-apple-darwin/confluence-cli-v${version}-x86_64-apple-darwin.tar.gz.sha256")" >> "$GITHUB_ENV"
+          echo "SHA_LINUX_X86=$(checksum "dist/x86_64-unknown-linux-gnu/confluence-cli-v${version}-x86_64-unknown-linux-gnu.tar.gz.sha256")" >> "$GITHUB_ENV"
+
+      - name: Update Homebrew formula
+        if: steps.check-token.outputs.skip == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/rvben/homebrew-tap.git" homebrew-tap
+          cd homebrew-tap
+
+          cat > Formula/confluence-cli.rb << 'FORMULA'
+          class ConfluenceCli < Formula
+            desc "Markdown-sync-first Confluence CLI in Rust"
+            homepage "https://github.com/rvben/confluence-cli"
+            version "VERSION_PLACEHOLDER"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/rvben/confluence-cli/releases/download/v#{version}/confluence-cli-v#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "SHA_MACOS_ARM64_PLACEHOLDER"
+              else
+                url "https://github.com/rvben/confluence-cli/releases/download/v#{version}/confluence-cli-v#{version}-x86_64-apple-darwin.tar.gz"
+                sha256 "SHA_MACOS_X86_PLACEHOLDER"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.intel?
+                url "https://github.com/rvben/confluence-cli/releases/download/v#{version}/confluence-cli-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_LINUX_X86_PLACEHOLDER"
+              else
+                odie "Linux ARM is not supported by this formula."
+              end
+            end
+
+            def install
+              bin.install "confluence-cli"
+            end
+
+            test do
+              assert_match "confluence-cli #{version}", shell_output("#{bin}/confluence-cli --version")
+            end
+          end
+          FORMULA
+
+          sed -i 's/^          //' Formula/confluence-cli.rb
+          sed -i "s/VERSION_PLACEHOLDER/${version}/" Formula/confluence-cli.rb
+          sed -i "s/SHA_MACOS_ARM64_PLACEHOLDER/${SHA_MACOS_ARM64}/" Formula/confluence-cli.rb
+          sed -i "s/SHA_MACOS_X86_PLACEHOLDER/${SHA_MACOS_X86}/" Formula/confluence-cli.rb
+          sed -i "s/SHA_LINUX_X86_PLACEHOLDER/${SHA_LINUX_X86}/" Formula/confluence-cli.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/confluence-cli.rb
+          git diff --cached --quiet || git commit -m "Update confluence-cli to ${version}"
+          git push
