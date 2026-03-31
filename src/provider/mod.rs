@@ -1,14 +1,15 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
-use reqwest::{Method, RequestBuilder};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::time::{Duration, sleep};
 use url::Url;
 
 use crate::config::{AuthConfig, ResolvedProfile};
@@ -147,10 +148,7 @@ impl HttpClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("request failed for {url}"))?;
+        let response = self.send_with_retry(request, &url).await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -164,10 +162,7 @@ impl HttpClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("request failed for {url}"))?;
+        let response = self.send_with_retry(request, &url).await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -178,10 +173,8 @@ impl HttpClient {
 
     pub async fn bytes(&self, method: Method, url: String) -> Result<Bytes> {
         let response = self
-            .auth(self.client.request(method, &url))
-            .send()
-            .await
-            .with_context(|| format!("request failed for {url}"))?;
+            .send_with_retry(self.auth(self.client.request(method, &url)), &url)
+            .await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -190,9 +183,104 @@ impl HttpClient {
         Ok(response.bytes().await?)
     }
 
+    pub async fn send(&self, url: &str, request: RequestBuilder) -> Result<Response> {
+        self.send_with_retry(request, url)
+            .await
+            .with_context(|| format!("request failed for {url}"))
+            .map_err(|err| {
+                if matches!(err.downcast_ref::<reqwest::Error>(), Some(_)) {
+                    anyhow!("request failed for {url}: {err}")
+                } else {
+                    err
+                }
+            })
+    }
+
     pub fn raw_client(&self) -> &reqwest::Client {
         &self.client
     }
+
+    async fn send_with_retry(&self, request: RequestBuilder, url: &str) -> Result<Response> {
+        let retry_template = request.try_clone();
+        let method = request
+            .try_clone()
+            .and_then(|builder| builder.build().ok())
+            .map(|request| request.method().clone())
+            .unwrap_or(Method::GET);
+        let max_attempts = if retry_template.is_some() && request_supports_retry(&method) {
+            4usize
+        } else {
+            1usize
+        };
+        let mut next_request = Some(request);
+
+        for attempt in 0..max_attempts {
+            let builder = if attempt == 0 {
+                next_request
+                    .take()
+                    .ok_or_else(|| anyhow!("missing request builder for {url}"))?
+            } else {
+                retry_template
+                    .as_ref()
+                    .and_then(|builder| builder.try_clone())
+                    .ok_or_else(|| anyhow!("request for {url} cannot be retried safely"))?
+            };
+
+            match builder.send().await {
+                Ok(response) => {
+                    if attempt + 1 < max_attempts && should_retry_status(response.status()) {
+                        sleep(retry_delay(attempt, response.headers().get(RETRY_AFTER))).await;
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                Err(err) => {
+                    if attempt + 1 < max_attempts && should_retry_error(&err) {
+                        sleep(retry_delay(attempt, None)).await;
+                        continue;
+                    }
+                    return Err(err).with_context(|| format!("request failed for {url}"));
+                }
+            }
+        }
+
+        unreachable!("retry loop should always return")
+    }
+}
+
+fn request_supports_retry(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::PUT | Method::DELETE
+    )
+}
+
+fn should_retry_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::REQUEST_TIMEOUT
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn should_retry_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request()
+}
+
+fn retry_delay(attempt: usize, retry_after: Option<&HeaderValue>) -> Duration {
+    if let Some(header) = retry_after
+        && let Ok(value) = header.to_str()
+        && let Ok(seconds) = value.trim().parse::<u64>()
+    {
+        return Duration::from_secs(seconds.min(30));
+    }
+
+    let base = 250u64;
+    let factor = 2u64.saturating_pow(attempt as u32);
+    Duration::from_millis((base * factor).min(5_000))
 }
 
 #[allow(dead_code)]

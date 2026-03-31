@@ -331,6 +331,10 @@ fn expected_user_placeholder_fragment(user_placeholder: &str) -> String {
 }
 
 fn find_binary_path() -> PathBuf {
+    if let Some(path) = env::var_os("CONFLUENCE_CLI_BIN") {
+        return PathBuf::from(path);
+    }
+
     if let Some(path) = env::var_os("CARGO_BIN_EXE_confluence-cli") {
         return PathBuf::from(path);
     }

@@ -582,14 +582,16 @@ impl ConfluenceProvider for CloudProvider {
 
         let response = self
             .http
-            .auth(
-                self.http
-                    .raw_client()
-                    .post(endpoint)
-                    .header("X-Atlassian-Token", "nocheck")
-                    .multipart(form),
+            .send(
+                &endpoint,
+                self.http.auth(
+                    self.http
+                        .raw_client()
+                        .post(endpoint.clone())
+                        .header("X-Atlassian-Token", "nocheck")
+                        .multipart(form),
+                ),
             )
-            .send()
             .await?;
         let status = response.status();
         if !status.is_success() {
@@ -703,13 +705,17 @@ impl ConfluenceProvider for CloudProvider {
     async fn get_property(&self, content_id: &str, key: &str) -> Result<Option<ContentProperty>> {
         let response = self
             .http
-            .auth(
-                self.http.raw_client().get(
-                    self.http
-                        .v1_url(&format!("/content/{content_id}/property/{key}")),
+            .send(
+                &self
+                    .http
+                    .v1_url(&format!("/content/{content_id}/property/{key}")),
+                self.http.auth(
+                    self.http.raw_client().get(
+                        self.http
+                            .v1_url(&format!("/content/{content_id}/property/{key}")),
+                    ),
                 ),
             )
-            .send()
             .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);

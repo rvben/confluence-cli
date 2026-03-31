@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
+use serde::Serialize;
 use serde_json::{Value, json};
+use url::Url;
 
 use crate::config::{AppConfig, LoginInput, ResolvedProfile, logout, run_login};
 use crate::markdown::markdown_to_storage;
@@ -60,6 +62,7 @@ enum Commands {
         #[command(subcommand)]
         command: PullCommand,
     },
+    Doctor(DoctorArgs),
     Plan(PlanArgs),
     Apply(ApplyArgs),
     Attachment {
@@ -178,6 +181,16 @@ struct ApplyArgs {
     delete_remote: bool,
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Args, Debug)]
+struct DoctorArgs {
+    #[arg(long)]
+    space: Option<String>,
+    #[arg(long)]
+    path: Option<PathBuf>,
+    #[arg(long)]
+    skip_network: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -345,6 +358,39 @@ enum BodyFormat {
     Storage,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DoctorReport {
+    config_path: String,
+    config_exists: bool,
+    active_profile: Option<String>,
+    stored_profiles: usize,
+    resolved_profile: Option<ResolvedProfile>,
+    checks: Vec<DoctorCheck>,
+    summary: DoctorSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorCheck {
+    name: String,
+    status: DoctorCheckStatus,
+    details: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DoctorCheckStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct DoctorSummary {
+    passed: usize,
+    warned: usize,
+    failed: usize,
+}
+
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let output = OutputFormat::from_json_flag(cli.json);
@@ -372,6 +418,7 @@ pub async fn run() -> Result<()> {
             let provider = provider_from_profile(cli.profile.as_deref())?;
             handle_pull(&*provider, command, output).await
         }
+        Commands::Doctor(args) => handle_doctor(cli.profile.as_deref(), args, output).await,
         Commands::Plan(args) => {
             let plan = sync::plan_path(&args.path, args.allow_lossy, args.delete_remote)?;
             render_plan(&plan, output)
@@ -491,6 +538,187 @@ async fn handle_auth(
                 println!("Logged out profile `{name}`");
             }
         }
+    }
+    Ok(())
+}
+
+async fn handle_doctor(
+    profile_override: Option<&str>,
+    args: DoctorArgs,
+    output: OutputFormat,
+) -> Result<()> {
+    let config_path = AppConfig::config_path()?;
+    let mut report = DoctorReport {
+        config_path: config_path.display().to_string(),
+        config_exists: config_path.exists(),
+        active_profile: None,
+        stored_profiles: 0,
+        resolved_profile: None,
+        checks: Vec::new(),
+        summary: DoctorSummary::default(),
+    };
+
+    if report.config_exists {
+        push_doctor_check(
+            &mut report,
+            "config_file",
+            DoctorCheckStatus::Pass,
+            format!("config file found at {}", config_path.display()),
+        );
+    } else {
+        push_doctor_check(
+            &mut report,
+            "config_file",
+            DoctorCheckStatus::Warn,
+            format!(
+                "config file not found at {}; doctor can still use CONFLUENCE_* environment variables",
+                config_path.display()
+            ),
+        );
+    }
+
+    let config = match AppConfig::load() {
+        Ok(config) => config,
+        Err(err) => {
+            push_doctor_check(
+                &mut report,
+                "config_load",
+                DoctorCheckStatus::Fail,
+                err.to_string(),
+            );
+            finalize_doctor_summary(&mut report);
+            render_doctor(&report, output)?;
+            bail!("doctor found {} failing check(s)", report.summary.failed);
+        }
+    };
+    report.active_profile = config.active_profile.clone();
+    report.stored_profiles = config.profiles.len();
+    let stored_profiles = report.stored_profiles;
+    push_doctor_check(
+        &mut report,
+        "profile_store",
+        DoctorCheckStatus::Pass,
+        format!("{stored_profiles} stored profile(s)"),
+    );
+
+    let profile = match config.resolved_profile(profile_override) {
+        Ok(profile) => {
+            report.resolved_profile = Some(profile.redact());
+            push_doctor_check(
+                &mut report,
+                "profile_resolution",
+                DoctorCheckStatus::Pass,
+                format!("resolved profile `{}`", profile.name),
+            );
+            profile
+        }
+        Err(err) => {
+            push_doctor_check(
+                &mut report,
+                "profile_resolution",
+                DoctorCheckStatus::Fail,
+                err.to_string(),
+            );
+            finalize_doctor_summary(&mut report);
+            render_doctor(&report, output)?;
+            bail!("doctor found {} failing check(s)", report.summary.failed);
+        }
+    };
+
+    match Url::parse(&profile.base_url) {
+        Ok(url) => push_doctor_check(
+            &mut report,
+            "base_url",
+            DoctorCheckStatus::Pass,
+            format!("using host {}", url.host_str().unwrap_or_default()),
+        ),
+        Err(err) => push_doctor_check(
+            &mut report,
+            "base_url",
+            DoctorCheckStatus::Fail,
+            format!("invalid base URL `{}`: {err}", profile.base_url),
+        ),
+    }
+
+    let (auth_status, auth_details) = doctor_auth_check(&profile);
+    push_doctor_check(&mut report, "auth", auth_status, auth_details);
+
+    if args.skip_network {
+        push_doctor_check(
+            &mut report,
+            "connectivity",
+            DoctorCheckStatus::Warn,
+            "network checks skipped".to_string(),
+        );
+    } else {
+        let provider = build_provider(profile.clone());
+        match provider.ping().await {
+            Ok(()) => push_doctor_check(
+                &mut report,
+                "connectivity",
+                DoctorCheckStatus::Pass,
+                format!("{} API reachable at {}", profile.provider, profile.base_url),
+            ),
+            Err(err) => push_doctor_check(
+                &mut report,
+                "connectivity",
+                DoctorCheckStatus::Fail,
+                err.to_string(),
+            ),
+        }
+
+        if let Some(space) = args.space.as_deref() {
+            let provider = build_provider(profile.clone());
+            match provider.get_space(space).await {
+                Ok(found) => push_doctor_check(
+                    &mut report,
+                    "space_access",
+                    DoctorCheckStatus::Pass,
+                    format!("resolved space `{}` ({})", found.key, found.name),
+                ),
+                Err(err) => push_doctor_check(
+                    &mut report,
+                    "space_access",
+                    DoctorCheckStatus::Fail,
+                    format!("failed to access space `{space}`: {err}"),
+                ),
+            }
+        }
+    }
+
+    if let Some(path) = args.path.as_deref() {
+        if !path.exists() {
+            push_doctor_check(
+                &mut report,
+                "sync_path",
+                DoctorCheckStatus::Fail,
+                format!("path `{}` does not exist", path.display()),
+            );
+        } else {
+            match sync::plan_path(path, false, false) {
+                Ok(plan) => push_doctor_check(
+                    &mut report,
+                    "sync_path",
+                    DoctorCheckStatus::Pass,
+                    format!(
+                        "local sync tree parsed successfully ({} planned item(s))",
+                        plan.items.len()
+                    ),
+                ),
+                Err(err) => push_doctor_check(
+                    &mut report,
+                    "sync_path",
+                    DoctorCheckStatus::Fail,
+                    format!("failed to inspect `{}`: {err}", path.display()),
+                ),
+            }
+        }
+    }
+
+    finalize_doctor_summary(&mut report);
+    render_doctor(&report, output)?;
+    if report.summary.failed > 0 {
+        bail!("doctor found {} failing check(s)", report.summary.failed);
     }
     Ok(())
 }
@@ -1208,23 +1436,14 @@ fn render_plan(plan: &SyncPlan, output: OutputFormat) -> Result<()> {
     if matches!(output, OutputFormat::Json) {
         print_json(plan)
     } else {
+        let summary = summarize_plan(plan);
+        println!("Plan summary: {summary}");
         let rows = plan
             .items
             .iter()
             .map(|item| {
                 vec![
-                    match item.action {
-                        PlanActionKind::CreateContent => "create",
-                        PlanActionKind::UpdateContent => "update",
-                        PlanActionKind::MoveContent => "move",
-                        PlanActionKind::UploadAttachment => "upload_attachment",
-                        PlanActionKind::DeleteAttachment => "delete_attachment",
-                        PlanActionKind::UpdateLabels => "update_labels",
-                        PlanActionKind::UpdateProperties => "update_properties",
-                        PlanActionKind::DeleteRemote => "delete_remote",
-                        PlanActionKind::Noop => "noop",
-                    }
-                    .to_string(),
+                    plan_action_label(item.action.clone()).to_string(),
                     item.title.clone(),
                     item.content_id.clone().unwrap_or_default(),
                     item.path.display().to_string(),
@@ -1234,6 +1453,181 @@ fn render_plan(plan: &SyncPlan, output: OutputFormat) -> Result<()> {
             .collect::<Vec<_>>();
         print_table(&["action", "title", "id", "path", "details"], &rows);
         Ok(())
+    }
+}
+
+fn render_doctor(report: &DoctorReport, output: OutputFormat) -> Result<()> {
+    if matches!(output, OutputFormat::Json) {
+        return print_json(report);
+    }
+
+    print_table(
+        &[
+            "config_path",
+            "config_exists",
+            "active_profile",
+            "stored_profiles",
+        ],
+        &[vec![
+            report.config_path.clone(),
+            report.config_exists.to_string(),
+            report
+                .active_profile
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+            report.stored_profiles.to_string(),
+        ]],
+    );
+
+    if let Some(profile) = &report.resolved_profile {
+        print_table(
+            &[
+                "profile",
+                "provider",
+                "base_url",
+                "api_path",
+                "auth",
+                "read_only",
+            ],
+            &[vec![
+                profile.name.clone(),
+                profile.provider.to_string(),
+                profile.base_url.clone(),
+                profile.api_path.clone(),
+                doctor_auth_kind(profile).to_string(),
+                profile.read_only.to_string(),
+            ]],
+        );
+    }
+
+    let rows = report
+        .checks
+        .iter()
+        .map(|check| {
+            vec![
+                check.name.clone(),
+                doctor_status_label(check.status).to_string(),
+                check.details.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&["check", "status", "details"], &rows);
+    println!(
+        "Doctor summary: {} passed, {} warned, {} failed",
+        report.summary.passed, report.summary.warned, report.summary.failed
+    );
+    Ok(())
+}
+
+fn push_doctor_check(
+    report: &mut DoctorReport,
+    name: impl Into<String>,
+    status: DoctorCheckStatus,
+    details: impl Into<String>,
+) {
+    report.checks.push(DoctorCheck {
+        name: name.into(),
+        status,
+        details: details.into(),
+    });
+}
+
+fn finalize_doctor_summary(report: &mut DoctorReport) {
+    let mut summary = DoctorSummary::default();
+    for check in &report.checks {
+        match check.status {
+            DoctorCheckStatus::Pass => summary.passed += 1,
+            DoctorCheckStatus::Warn => summary.warned += 1,
+            DoctorCheckStatus::Fail => summary.failed += 1,
+        }
+    }
+    report.summary = summary;
+}
+
+fn doctor_auth_kind(profile: &ResolvedProfile) -> &'static str {
+    match &profile.auth {
+        crate::config::AuthConfig::Basic { .. } => "basic",
+        crate::config::AuthConfig::Bearer { .. } => "bearer",
+    }
+}
+
+fn doctor_auth_details(profile: &ResolvedProfile) -> String {
+    match &profile.auth {
+        crate::config::AuthConfig::Basic { username, token } => format!(
+            "basic auth configured for `{username}` with a {} token",
+            redact_token_shape(token)
+        ),
+        crate::config::AuthConfig::Bearer { token } => {
+            format!(
+                "bearer auth configured with a {}",
+                redact_token_shape(token)
+            )
+        }
+    }
+}
+
+fn doctor_auth_check(profile: &ResolvedProfile) -> (DoctorCheckStatus, String) {
+    let details = doctor_auth_details(profile);
+    let status = match &profile.auth {
+        crate::config::AuthConfig::Basic { username, token } => {
+            if username.trim().is_empty() || token.trim().is_empty() {
+                DoctorCheckStatus::Fail
+            } else {
+                DoctorCheckStatus::Pass
+            }
+        }
+        crate::config::AuthConfig::Bearer { token } => {
+            if token.trim().is_empty() {
+                DoctorCheckStatus::Fail
+            } else {
+                DoctorCheckStatus::Pass
+            }
+        }
+    };
+    (status, details)
+}
+
+fn redact_token_shape(token: &str) -> String {
+    if token.is_empty() {
+        "missing token".to_string()
+    } else {
+        format!("{}-character secret", token.chars().count())
+    }
+}
+
+fn summarize_plan(plan: &SyncPlan) -> String {
+    let mut counts = BTreeMap::new();
+    for item in &plan.items {
+        *counts
+            .entry(plan_action_label(item.action.clone()))
+            .or_insert(0usize) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(label, count)| format!("{label}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn plan_action_label(action: PlanActionKind) -> &'static str {
+    match action {
+        PlanActionKind::CreateContent => "create",
+        PlanActionKind::UpdateContent => "update",
+        PlanActionKind::MoveContent => "move",
+        PlanActionKind::UploadAttachment => "upload_attachment",
+        PlanActionKind::DeleteAttachment => "delete_attachment",
+        PlanActionKind::UpdateLabels => "update_labels",
+        PlanActionKind::UpdateProperties => "update_properties",
+        PlanActionKind::DeleteRemote => "delete_remote",
+        PlanActionKind::Noop => "noop",
+    }
+}
+
+fn doctor_status_label(status: DoctorCheckStatus) -> &'static str {
+    match status {
+        DoctorCheckStatus::Pass => "pass",
+        DoctorCheckStatus::Warn => "warn",
+        DoctorCheckStatus::Fail => "fail",
     }
 }
 
@@ -1257,6 +1651,16 @@ mod tests {
             command
                 .get_subcommands()
                 .any(|subcommand| subcommand.get_name() == "completions")
+        );
+    }
+
+    #[test]
+    fn cli_includes_doctor_command() {
+        let command = Cli::command();
+        assert!(
+            command
+                .get_subcommands()
+                .any(|subcommand| subcommand.get_name() == "doctor")
         );
     }
 }

@@ -211,8 +211,10 @@ pub async fn apply_path(
             let remote = provider.get_content(kind, &content_id, false).await?;
             if !force && doc.sidecar.remote_version != remote.version {
                 bail!(
-                    "remote version drift for {}: local {:?}, remote {:?}",
+                    "remote version drift for `{}` at {} (content {}): local sidecar version {:?}, remote {:?}. Run `confluence-cli pull ...` to refresh local metadata, or rerun `confluence-cli apply ... --force` if local content should win",
                     title,
+                    doc.directory.display(),
+                    content_id,
                     doc.sidecar.remote_version,
                     remote.version
                 );
@@ -258,8 +260,8 @@ pub async fn apply_path(
         } else {
             let space_key = space_key.clone().ok_or_else(|| {
                 anyhow!(
-                    "document {} is missing space_key metadata",
-                    doc.directory.display()
+                    "document {} is missing space_key metadata. Set `space_key` in frontmatter properties or pull from an existing Confluence page/blog before applying",
+                    doc.directory.display(),
                 )
             })?;
             let created = provider

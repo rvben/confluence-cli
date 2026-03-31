@@ -21,7 +21,8 @@ test:
 #   CONFLUENCE_E2E_BASE_URL / CONFLUENCE_E2E_TOKEN / CONFLUENCE_E2E_PROVIDER / CONFLUENCE_E2E_API_PATH
 # Set CONFLUENCE_E2E_PROFILE= to force env-driven mode instead of profile mode.
 test-e2e:
-	CONFLUENCE_E2E_PROFILE=$(CONFLUENCE_E2E_PROFILE) CONFLUENCE_E2E_SPACE=$(CONFLUENCE_E2E_SPACE) cargo nextest run --test e2e --run-ignored all
+	cargo build
+	CONFLUENCE_CLI_BIN=$(CURDIR)/target/debug/confluence-cli CONFLUENCE_E2E_PROFILE=$(CONFLUENCE_E2E_PROFILE) CONFLUENCE_E2E_SPACE=$(CONFLUENCE_E2E_SPACE) cargo nextest run --test e2e --run-ignored all
 
 fmt:
 	cargo fmt
