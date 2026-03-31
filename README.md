@@ -221,6 +221,16 @@ make release-check
 
 That runs formatting, clippy, tests, CLI smoke checks, and `cargo package`.
 
+Local versioned releases use `vership`, matching the other CLI projects:
+
+```bash
+make release-patch
+make release-minor
+make release-major
+```
+
+`vership` uses `vership.toml` in this repo so `vership preflight` runs the stricter `make release-check` gate rather than the default Rust-only lint/test commands.
+
 GitHub Actions is set up to:
 
 - run CI on pushes and pull requests

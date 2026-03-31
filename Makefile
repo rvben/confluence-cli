@@ -5,7 +5,7 @@ POSTGRES_DATA_VOLUME := confluencecli_postgres-data
 CONFLUENCE_E2E_PROFILE ?= local-dc
 CONFLUENCE_E2E_SPACE ?= TEST
 
-.PHONY: build test test-e2e fmt lint check release-check confluence-start confluence-stop confluence-wait confluence-logs confluence-reset confluence-backup confluence-restore
+.PHONY: build test test-e2e fmt lint check release-check release-patch release-minor release-major confluence-start confluence-stop confluence-wait confluence-logs confluence-reset confluence-backup confluence-restore
 
 build:
 	cargo build --locked
@@ -40,6 +40,15 @@ release-check:
 	cargo run --locked -- --help >/dev/null
 	cargo run --locked -- doctor --help >/dev/null
 	cargo package --locked --allow-dirty
+
+release-patch:
+	vership bump patch
+
+release-minor:
+	vership bump minor
+
+release-major:
+	vership bump major
 
 # ── Local Confluence (Data Center) for integration testing ───────────────────
 confluence-start:
