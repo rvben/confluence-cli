@@ -238,6 +238,27 @@ fn find_index_md(root: &PathBuf) -> PathBuf {
         .unwrap_or_else(|| panic!("failed to find index.md under {}", root.display()))
 }
 
+fn find_index_md_by_title(root: &PathBuf, title: &str) -> PathBuf {
+    WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            if !entry.file_type().is_file() || entry.file_name() != "index.md" {
+                return None;
+            }
+            let contents = fs::read_to_string(entry.path()).ok()?;
+            contents
+                .contains(&format!("title: {title}\n"))
+                .then(|| entry.into_path())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "failed to find index.md for title `{title}` under {}",
+                root.display()
+            )
+        })
+}
+
 fn wait_until<F>(timeout: Duration, interval: Duration, mut check: F) -> bool
 where
     F: FnMut() -> bool,
@@ -275,6 +296,8 @@ fn e2e_cli_lifecycle() {
     let pull_dir = temp.path().join("pull");
     let untouched_pull_dir = temp.path().join("untouched-pull");
     let fresh_links_dir = temp.path().join("fresh-links");
+    let macro_tree_dir = temp.path().join("macro-tree");
+    let macro_pull_dir = temp.path().join("macro-pull");
 
     fs::write(
         &page_body_1,
@@ -521,6 +544,10 @@ fn e2e_cli_lifecycle() {
 
     let fresh_source_title = unique_name("E2E Fresh Source");
     let fresh_target_title = unique_name("E2E Fresh Target");
+    let macro_root_title = unique_name("E2E Macro Root");
+    let macro_source_title = unique_name("E2E Macro Source");
+    let macro_target_title = unique_name("E2E Macro Target");
+    let macro_child_title = unique_name("E2E Macro Child");
     let fresh_source_dir = fresh_links_dir.join("source");
     let fresh_target_dir = fresh_links_dir.join("target");
     fs::create_dir_all(&fresh_source_dir).expect("create fresh source dir");
@@ -601,6 +628,169 @@ fn e2e_cli_lifecycle() {
                         .all(|item| item.get("action").and_then(Value::as_str) == Some("noop"))
             }),
         "expected fresh-links plan to be noop: {fresh_plan}"
+    );
+
+    let macro_root_dir = macro_tree_dir.join("macro-root");
+    let macro_source_dir = macro_root_dir.join("source");
+    let macro_target_dir = macro_root_dir.join("target");
+    let macro_child_dir = macro_source_dir.join("child");
+    fs::create_dir_all(&macro_root_dir).expect("create macro root dir");
+    fs::create_dir_all(&macro_source_dir).expect("create macro source dir");
+    fs::create_dir_all(&macro_target_dir).expect("create macro target dir");
+    fs::create_dir_all(&macro_child_dir).expect("create macro child dir");
+    fs::write(
+        macro_root_dir.join("index.md"),
+        format!(
+            "---\ntitle: {macro_root_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Root\n"
+        ),
+    )
+    .expect("write macro root markdown");
+    fs::write(
+        macro_source_dir.join("index.md"),
+        format!(
+            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n"
+        ),
+    )
+    .expect("write macro source markdown");
+    fs::write(
+        macro_target_dir.join("index.md"),
+        format!(
+            "---\ntitle: {macro_target_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Shared Excerpt\n\nPulled and reapplied through the e2e macro test.\n"
+        ),
+    )
+    .expect("write macro target markdown");
+    fs::write(
+        macro_child_dir.join("index.md"),
+        format!(
+            "---\ntitle: {macro_child_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Nested Child\n\nUsed to back the children macro.\n"
+        ),
+    )
+    .expect("write macro child markdown");
+    fs::write(
+        macro_root_dir.join(".confluence.json"),
+        format!("{{\n  \"space_key\": \"{}\"\n}}\n", cfg.space),
+    )
+    .expect("write macro root sidecar");
+    fs::write(
+        macro_source_dir.join(".confluence.json"),
+        format!("{{\n  \"space_key\": \"{}\"\n}}\n", cfg.space),
+    )
+    .expect("write macro source sidecar");
+    fs::write(
+        macro_target_dir.join(".confluence.json"),
+        format!("{{\n  \"space_key\": \"{}\"\n}}\n", cfg.space),
+    )
+    .expect("write macro target sidecar");
+    fs::write(
+        macro_child_dir.join(".confluence.json"),
+        format!("{{\n  \"space_key\": \"{}\"\n}}\n", cfg.space),
+    )
+    .expect("write macro child sidecar");
+
+    let macro_tree_arg = macro_tree_dir.to_string_lossy().into_owned();
+    let macro_apply = cfg.run_json(&["apply", &macro_tree_arg]);
+    let macro_items = macro_apply
+        .get("items")
+        .and_then(Value::as_array)
+        .expect("macro apply items");
+    let macro_root_id = macro_items
+        .iter()
+        .find(|item| {
+            item.get("action").and_then(Value::as_str) == Some("create_content")
+                && item.get("title").and_then(Value::as_str) == Some(macro_root_title.as_str())
+        })
+        .and_then(|item| item.get("content_id"))
+        .and_then(Value::as_str)
+        .expect("macro root content id")
+        .to_string();
+    let macro_source_id = macro_items
+        .iter()
+        .find(|item| {
+            item.get("action").and_then(Value::as_str) == Some("create_content")
+                && item.get("title").and_then(Value::as_str) == Some(macro_source_title.as_str())
+        })
+        .and_then(|item| item.get("content_id"))
+        .and_then(Value::as_str)
+        .expect("macro source content id")
+        .to_string();
+    let macro_target_id = macro_items
+        .iter()
+        .find(|item| {
+            item.get("action").and_then(Value::as_str) == Some("create_content")
+                && item.get("title").and_then(Value::as_str) == Some(macro_target_title.as_str())
+        })
+        .and_then(|item| item.get("content_id"))
+        .and_then(Value::as_str)
+        .expect("macro target content id")
+        .to_string();
+    let macro_child_id = macro_items
+        .iter()
+        .find(|item| {
+            item.get("action").and_then(Value::as_str) == Some("create_content")
+                && item.get("title").and_then(Value::as_str) == Some(macro_child_title.as_str())
+        })
+        .and_then(|item| item.get("content_id"))
+        .and_then(Value::as_str)
+        .expect("macro child content id")
+        .to_string();
+    cleanup.extra_page_ids.push(macro_root_id.clone());
+    cleanup.extra_page_ids.push(macro_target_id.clone());
+    cleanup.extra_page_ids.push(macro_source_id.clone());
+    cleanup.extra_page_ids.push(macro_child_id.clone());
+
+    let macro_source_get = cfg.run_json(&["page", "get", &macro_source_id, "--show-body"]);
+    let macro_source_body = string_field(
+        first_item(&macro_source_get, "macro source get"),
+        "body_storage",
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="excerpt-include""#),
+        "expected excerpt-include macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="default-parameter">{}:{}</ac:parameter>"#,
+            cfg.space, macro_target_title
+        )),
+        "expected excerpt-include page reference to target title {macro_target_title}: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="children""#),
+        "expected children macro in source body: {macro_source_body}"
+    );
+
+    let macro_pull_arg = macro_pull_dir.to_string_lossy().into_owned();
+    cfg.run(&["pull", "tree", &macro_root_id, &macro_pull_arg]);
+    let pulled_macro_source = find_index_md_by_title(&macro_pull_dir, &macro_source_title);
+    let pulled_macro_source_markdown =
+        fs::read_to_string(&pulled_macro_source).expect("read pulled macro source markdown");
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-excerpt-include"),
+        "expected pulled macro source to preserve excerpt-include block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("page: ../")
+            && pulled_macro_source_markdown.contains("/index.md")
+            && !pulled_macro_source_markdown.contains("confluence-page://page?"),
+        "expected pulled macro source to rewrite excerpt target to a local path: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-children"),
+        "expected pulled macro source to preserve children block: {pulled_macro_source_markdown}"
+    );
+
+    let macro_plan = cfg.run_json(&["plan", &macro_pull_arg]);
+    assert!(
+        macro_plan
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|item| item.get("action").and_then(Value::as_str) == Some("noop"))
+            }),
+        "expected macro pull plan to be noop: {macro_plan}"
     );
 
     let blog_body_1_arg = blog_body_1.to_string_lossy().into_owned();

@@ -115,9 +115,10 @@ fn storage_to_markdown_xml(storage: &str) -> Option<String> {
     let document = Document::parse(&wrapped).ok()?;
     let mut blocks = Vec::new();
     for child in document.root_element().children() {
-        let block = render_top_level_block(child, &wrapped)?;
-        if !block.trim().is_empty() {
-            blocks.push(block.trim().to_string());
+        if let Some(block) = render_top_level_block(child, &wrapped) {
+            if !block.trim().is_empty() {
+                blocks.push(block.trim().to_string());
+            }
         }
     }
     Some(blocks.join("\n\n"))
@@ -590,8 +591,14 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "excerpt" {
         return render_excerpt_macro_block(node, source);
     }
+    if name == "excerpt-include" {
+        return render_excerpt_include_macro_block(node);
+    }
     if name == "toc" {
         return render_parameter_only_macro_block("toc", node);
+    }
+    if name == "children" {
+        return render_parameter_only_macro_block("children", node);
     }
     if name == "expand" {
         return render_expand_macro_block(node, source);
@@ -625,6 +632,28 @@ fn render_excerpt_macro_block(node: Node<'_, '_>, source: &str) -> Option<String
     ))
 }
 
+fn render_excerpt_include_macro_block(node: Node<'_, '_>) -> Option<String> {
+    let mut parameters = collect_macro_parameters(node);
+    if let Some(target) = parameters.remove("default-parameter") {
+        let placeholder = parse_excerpt_include_target(&target);
+        parameters.insert("page".to_string(), build_page_placeholder_url(&placeholder));
+    } else if let Some(page) = namespaced_child(node, RI_NS, "page") {
+        let placeholder = PageLinkPlaceholder {
+            content_id: page.attribute((RI_NS, "content-id")).map(ToOwned::to_owned),
+            space_key: page.attribute((RI_NS, "space-key")).map(ToOwned::to_owned),
+            content_title: page
+                .attribute((RI_NS, "content-title"))
+                .map(ToOwned::to_owned),
+            anchor: None,
+        };
+        parameters.insert("page".to_string(), build_page_placeholder_url(&placeholder));
+    }
+    Some(render_parameter_only_macro_block_with_parameters(
+        "excerpt-include",
+        &parameters,
+    ))
+}
+
 fn render_expand_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
     let parameters = collect_macro_parameters(node);
     if parameters.keys().any(|name| name != "title") {
@@ -650,12 +679,22 @@ fn render_expand_macro_block(node: Node<'_, '_>, source: &str) -> Option<String>
 
 fn render_parameter_only_macro_block(name: &str, node: Node<'_, '_>) -> Option<String> {
     let parameters = collect_macro_parameters(node);
+    Some(render_parameter_only_macro_block_with_parameters(
+        name,
+        &parameters,
+    ))
+}
+
+fn render_parameter_only_macro_block_with_parameters(
+    name: &str,
+    parameters: &BTreeMap<String, String>,
+) -> String {
     let mut markdown = format!(":::confluence-{name}\n");
     for (parameter, value) in parameters {
         markdown.push_str(&format!("{parameter}: {value}\n"));
     }
     markdown.push_str(":::");
-    Some(markdown)
+    markdown
 }
 
 fn render_rich_text_macro_block(
@@ -1296,6 +1335,8 @@ fn replace_parameterized_colon_macro_blocks(
         let macro_name = match trimmed {
             ":::confluence-excerpt" => Some("excerpt"),
             ":::confluence-toc" => Some("toc"),
+            ":::confluence-children" => Some("children"),
+            ":::confluence-excerpt-include" => Some("excerpt-include"),
             _ => None,
         };
 
@@ -1326,6 +1367,15 @@ fn replace_parameterized_colon_macro_blocks(
             "toc" => {
                 let parameters = parse_macro_parameter_lines(&body, "confluence toc macro")?;
                 build_parameter_only_macro_storage("toc", &parameters)
+            }
+            "children" => {
+                let parameters = parse_macro_parameter_lines(&body, "confluence children macro")?;
+                build_parameter_only_macro_storage("children", &parameters)
+            }
+            "excerpt-include" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence excerpt-include macro")?;
+                build_excerpt_include_macro_storage(&parameters)?
             }
             _ => unreachable!(),
         };
@@ -1592,6 +1642,56 @@ fn build_parameter_only_macro_storage(name: &str, parameters: &BTreeMap<String, 
     format!(r#"<ac:structured-macro ac:name="{name}">{parameters_xml}</ac:structured-macro>"#)
 }
 
+fn build_excerpt_include_macro_storage(parameters: &BTreeMap<String, String>) -> Result<String> {
+    let mut parameters = parameters.clone();
+    let page = parameters.remove("page").ok_or_else(|| {
+        anyhow::anyhow!("confluence excerpt-include macro requires a `page` parameter")
+    })?;
+    let placeholder = parse_page_placeholder_url(&page).ok_or_else(|| {
+        anyhow::anyhow!(
+            "confluence excerpt-include `page` must be a confluence-page placeholder; local paths are resolved during sync apply"
+        )
+    })?;
+    let excerpt_target = build_excerpt_include_target(&placeholder)?;
+    parameters.insert("default-parameter".to_string(), excerpt_target);
+    Ok(build_parameter_only_macro_storage(
+        "excerpt-include",
+        &parameters,
+    ))
+}
+
+fn parse_excerpt_include_target(target: &str) -> PageLinkPlaceholder {
+    let trimmed = target.trim();
+    let mut placeholder = PageLinkPlaceholder::default();
+    if let Some((space_key, title)) = trimmed.split_once(':') {
+        let space_key = space_key.trim();
+        let title = title.trim();
+        if !space_key.is_empty()
+            && !title.is_empty()
+            && space_key
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+        {
+            placeholder.space_key = Some(space_key.to_string());
+            placeholder.content_title = Some(title.to_string());
+            return placeholder;
+        }
+    }
+    placeholder.content_title = (!trimmed.is_empty()).then(|| trimmed.to_string());
+    placeholder
+}
+
+fn build_excerpt_include_target(placeholder: &PageLinkPlaceholder) -> Result<String> {
+    let title = placeholder.content_title.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("confluence excerpt-include page references require a title")
+    })?;
+    if let Some(space_key) = placeholder.space_key.as_deref() {
+        Ok(format!("{space_key}:{title}"))
+    } else {
+        Ok(title.to_string())
+    }
+}
+
 fn build_macro_parameters_xml(parameters: &BTreeMap<String, String>) -> String {
     let parameters_xml = parameters
         .iter()
@@ -1774,7 +1874,7 @@ mod tests {
 
     #[test]
     fn storage_macro_round_trips_through_sentinel_block() {
-        let storage = r#"<p>Hello</p><ac:structured-macro ac:name="children" />"#;
+        let storage = r#"<p>Hello</p><ac:structured-macro ac:name="view-file" />"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("```confluence-storage"));
         let rendered = markdown_to_storage(&markdown, false).expect("conversion succeeds");
@@ -1783,7 +1883,7 @@ mod tests {
 
     #[test]
     fn mixed_content_preserves_only_unsupported_confluence_fragments() {
-        let storage = r#"<h1>Title</h1><ac:structured-macro ac:name="children" /><p>After</p>"#;
+        let storage = r#"<h1>Title</h1><ac:structured-macro ac:name="view-file" /><p>After</p>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("# Title"));
         assert!(markdown.contains("```confluence-storage"));
@@ -1868,6 +1968,54 @@ mod tests {
         assert!(markdown.contains(":::confluence-toc"));
         assert!(markdown.contains("maxLevel: 3"));
         assert!(markdown.contains("style: square"));
+    }
+
+    #[test]
+    fn excerpt_include_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="excerpt-include"><ac:parameter ac:name="nopanel">true</ac:parameter><ri:page ri:space-key="TEST" ri:content-title="Docs Home" /></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-excerpt-include"));
+        assert!(markdown.contains("nopanel: true"));
+        assert!(markdown.contains("page: confluence-page://page?"));
+        assert!(markdown.contains("content-title=Docs+Home"));
+    }
+
+    #[test]
+    fn excerpt_include_default_parameter_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="excerpt-include"><ac:parameter ac:name="default-parameter">TEST:Docs Home</ac:parameter><ac:parameter ac:name="nopanel">true</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-excerpt-include"));
+        assert!(markdown.contains("nopanel: true"));
+        assert!(markdown.contains("page: confluence-page://page?"));
+        assert!(markdown.contains("content-title=Docs+Home"));
+        assert!(!markdown.contains("default-parameter:"));
+    }
+
+    #[test]
+    fn whitespace_between_supported_blocks_does_not_force_fallback_export() {
+        let storage = concat!(
+            "<h1>Macro Source</h1>\n",
+            "<ac:structured-macro ac:name=\"excerpt-include\">",
+            "<ac:parameter ac:name=\"default-parameter\">TEST:Docs Home</ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"children\">",
+            "<ac:parameter ac:name=\"all\">true</ac:parameter>",
+            "</ac:structured-macro>"
+        );
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains("# Macro Source"));
+        assert!(markdown.contains(":::confluence-excerpt-include"));
+        assert!(markdown.contains(":::confluence-children"));
+        assert!(!markdown.contains("CONFLUENCE_XML_PLACEHOLDER"));
+    }
+
+    #[test]
+    fn children_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="children"><ac:parameter ac:name="all">true</ac:parameter><ac:parameter ac:name="sort">creation</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-children"));
+        assert!(markdown.contains("all: true"));
+        assert!(markdown.contains("sort: creation"));
     }
 
     #[test]
@@ -1971,6 +2119,52 @@ mod tests {
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="style">square</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn excerpt_include_blocks_round_trip_back_to_structured_macros() {
+        let page = build_page_placeholder_url(&PageLinkPlaceholder {
+            space_key: Some("TEST".to_string()),
+            content_title: Some("Docs Home".to_string()),
+            ..PageLinkPlaceholder::default()
+        });
+        let markdown = format!(":::confluence-excerpt-include\nnopanel: true\npage: {page}\n:::");
+        let rendered =
+            markdown_to_storage(&markdown, false).expect("excerpt-include block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="excerpt-include">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="nopanel">true</ac:parameter>"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="default-parameter">TEST:Docs Home</ac:parameter>"#
+        ));
+    }
+
+    #[test]
+    fn children_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-children\nall: true\nsort: creation\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("children block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="children">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="all">true</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="sort">creation</ac:parameter>"#)
         );
     }
 
