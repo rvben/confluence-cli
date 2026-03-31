@@ -603,6 +603,9 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "pagetreesearch" {
         return render_page_tree_search_macro_block(node);
     }
+    if name == "contentbylabel" {
+        return render_parameter_only_macro_block("content-by-label", node);
+    }
     if name == "toc" {
         return render_parameter_only_macro_block("toc", node);
     }
@@ -1427,6 +1430,7 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-include-page" => Some("include-page"),
             ":::confluence-page-tree" => Some("page-tree"),
             ":::confluence-page-tree-search" => Some("page-tree-search"),
+            ":::confluence-content-by-label" => Some("content-by-label"),
             _ => None,
         };
 
@@ -1480,6 +1484,11 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters =
                     parse_macro_parameter_lines(&body, "confluence page-tree-search macro")?;
                 build_page_tree_search_macro_storage(&parameters)
+            }
+            "content-by-label" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence content-by-label macro")?;
+                build_parameter_only_macro_storage("contentbylabel", &parameters)
             }
             _ => unreachable!(),
         };
@@ -2203,6 +2212,15 @@ mod tests {
     }
 
     #[test]
+    fn content_by_label_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="contentbylabel"><ac:parameter ac:name="cql">label = "e2e-macro-target"</ac:parameter><ac:parameter ac:name="maxResults">5</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-content-by-label"));
+        assert!(markdown.contains(r#"cql: label = "e2e-macro-target""#));
+        assert!(markdown.contains("maxResults: 5"));
+    }
+
+    #[test]
     fn whitespace_between_supported_blocks_does_not_force_fallback_export() {
         let storage = concat!(
             "<h1>Macro Source</h1>\n",
@@ -2218,6 +2236,9 @@ mod tests {
             "<ac:structured-macro ac:name=\"pagetreesearch\">",
             "<ac:parameter ac:name=\"root\">TEST:Docs Home</ac:parameter>",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"contentbylabel\">",
+            "<ac:parameter ac:name=\"cql\">label = &quot;e2e-macro-target&quot;</ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"children\">",
             "<ac:parameter ac:name=\"all\">true</ac:parameter>",
             "</ac:structured-macro>"
@@ -2228,6 +2249,7 @@ mod tests {
         assert!(markdown.contains(":::confluence-include-page"));
         assert!(markdown.contains(":::confluence-page-tree"));
         assert!(markdown.contains(":::confluence-page-tree-search"));
+        assert!(markdown.contains(":::confluence-content-by-label"));
         assert!(markdown.contains(":::confluence-children"));
         assert!(!markdown.contains("CONFLUENCE_XML_PLACEHOLDER"));
     }
@@ -2443,6 +2465,27 @@ mod tests {
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="spaceKey">TEST</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn content_by_label_blocks_round_trip_back_to_structured_macros() {
+        let markdown =
+            ":::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("content-by-label block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="contentbylabel">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="cql">label = &quot;e2e-macro-target&quot;</ac:parameter>"#
+        ));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="maxResults">5</ac:parameter>"#)
         );
     }
 
