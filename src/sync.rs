@@ -560,15 +560,24 @@ fn rewrite_macro_page_references(
         output.push_str(lines[index]);
         output.push('\n');
 
-        if lines[index].trim() != ":::confluence-excerpt-include" {
+        let macro_mode = match lines[index].trim() {
+            ":::confluence-excerpt-include" => Some(MacroPageReferenceMode::ExcerptInclude),
+            ":::confluence-include-page" => Some(MacroPageReferenceMode::IncludePage),
+            _ => None,
+        };
+        let Some(macro_mode) = macro_mode else {
             index += 1;
             continue;
-        }
+        };
 
         index += 1;
         while index < lines.len() && lines[index].trim() != ":::" {
-            let rewritten =
-                rewrite_excerpt_include_parameter_line(lines[index], current_dir, link_index);
+            let rewritten = rewrite_page_reference_parameter_line(
+                lines[index],
+                current_dir,
+                link_index,
+                macro_mode,
+            );
             output.push_str(&rewritten);
             output.push('\n');
             index += 1;
@@ -588,10 +597,17 @@ fn rewrite_macro_page_references(
     output
 }
 
-fn rewrite_excerpt_include_parameter_line(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacroPageReferenceMode {
+    ExcerptInclude,
+    IncludePage,
+}
+
+fn rewrite_page_reference_parameter_line(
     line: &str,
     current_dir: &Path,
     link_index: &LinkIndex,
+    mode: MacroPageReferenceMode,
 ) -> String {
     let Some((name, value)) = line.split_once(':') else {
         return line.to_string();
@@ -600,15 +616,16 @@ fn rewrite_excerpt_include_parameter_line(
         return line.to_string();
     }
     let target = value.trim();
-    let rewritten = local_target_to_excerpt_include_placeholder(current_dir, target, link_index)
+    let rewritten = local_target_to_page_placeholder(current_dir, target, link_index, mode)
         .unwrap_or_else(|| target.to_string());
     format!("{}: {}", name.trim_end(), rewritten)
 }
 
-fn local_target_to_excerpt_include_placeholder(
+fn local_target_to_page_placeholder(
     current_dir: &Path,
     target: &str,
     link_index: &LinkIndex,
+    mode: MacroPageReferenceMode,
 ) -> Option<String> {
     if parse_page_placeholder_url(target).is_some() {
         return Some(target.to_string());
@@ -631,11 +648,19 @@ fn local_target_to_excerpt_include_placeholder(
         resolved
     };
     let link = link_index.by_markdown_path.get(&markdown_target)?;
-    let placeholder = PageLinkPlaceholder {
-        content_id: None,
-        space_key: link.space_key.clone(),
-        content_title: Some(link.title.clone()),
-        anchor: None,
+    let placeholder = match mode {
+        MacroPageReferenceMode::ExcerptInclude => PageLinkPlaceholder {
+            content_id: None,
+            space_key: link.space_key.clone(),
+            content_title: Some(link.title.clone()),
+            anchor: None,
+        },
+        MacroPageReferenceMode::IncludePage => PageLinkPlaceholder {
+            content_id: None,
+            space_key: link.space_key.clone(),
+            content_title: Some(link.title.clone()),
+            anchor: None,
+        },
     };
     Some(build_page_placeholder_url(&placeholder))
 }
@@ -1614,5 +1639,62 @@ mod tests {
                 r#"<ac:parameter ac:name="default-parameter">MFS:Sibling</ac:parameter>"#
             )
         );
+    }
+
+    #[test]
+    fn render_body_storage_rewrites_include_page_parameters_to_storage_macros() {
+        let current_dir = PathBuf::from("/tmp/root/current-page--123");
+        let sibling_dir = PathBuf::from("/tmp/root/sibling-page--456");
+        let current = LocalDocument {
+            directory: current_dir.clone(),
+            markdown_path: current_dir.join("index.md"),
+            sidecar_path: current_dir.join(".confluence.json"),
+            frontmatter: Frontmatter {
+                title: "Current".to_string(),
+                kind: "page".to_string(),
+                labels: vec![],
+                status: "current".to_string(),
+                parent: None,
+                properties: BTreeMap::new(),
+            },
+            body_markdown: ":::confluence-include-page\npage: ../sibling-page--456/index.md\n:::\n"
+                .to_string(),
+            sidecar: Sidecar {
+                content_id: Some("123".to_string()),
+                space_key: Some("MFS".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                web_path_prefix: Some("/wiki".to_string()),
+                ..Sidecar::default()
+            },
+        };
+        let sibling = LocalDocument {
+            directory: sibling_dir.clone(),
+            markdown_path: sibling_dir.join("index.md"),
+            sidecar_path: sibling_dir.join(".confluence.json"),
+            frontmatter: Frontmatter {
+                title: "Sibling".to_string(),
+                kind: "page".to_string(),
+                labels: vec![],
+                status: "current".to_string(),
+                parent: None,
+                properties: BTreeMap::new(),
+            },
+            body_markdown: "# Sibling".to_string(),
+            sidecar: Sidecar {
+                content_id: Some("456".to_string()),
+                space_key: Some("MFS".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                web_path_prefix: Some("/wiki".to_string()),
+                ..Sidecar::default()
+            },
+        };
+
+        let index = build_link_index(&[current.clone(), sibling]);
+        let storage =
+            render_body_storage(&current, &index, false, "/wiki").expect("render body storage");
+
+        assert!(storage.contains(r#"<ac:structured-macro ac:name="include">"#));
+        assert!(storage.contains(r#"ri:content-title="Sibling""#));
+        assert!(storage.contains(r#"ri:space-key="MFS""#));
     }
 }

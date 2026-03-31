@@ -592,7 +592,10 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
         return render_excerpt_macro_block(node, source);
     }
     if name == "excerpt-include" {
-        return render_excerpt_include_macro_block(node);
+        return render_page_reference_macro_block("excerpt-include", node);
+    }
+    if matches!(name, "include" | "include-page") {
+        return render_include_page_macro_block(node);
     }
     if name == "toc" {
         return render_parameter_only_macro_block("toc", node);
@@ -632,24 +635,39 @@ fn render_excerpt_macro_block(node: Node<'_, '_>, source: &str) -> Option<String
     ))
 }
 
-fn render_excerpt_include_macro_block(node: Node<'_, '_>) -> Option<String> {
+fn render_page_reference_macro_block(block_name: &str, node: Node<'_, '_>) -> Option<String> {
     let mut parameters = collect_macro_parameters(node);
     if let Some(target) = parameters.remove("default-parameter") {
-        let placeholder = parse_excerpt_include_target(&target);
+        let placeholder = parse_default_parameter_page_target(&target);
         parameters.insert("page".to_string(), build_page_placeholder_url(&placeholder));
     } else if let Some(page) = namespaced_child(node, RI_NS, "page") {
-        let placeholder = PageLinkPlaceholder {
-            content_id: page.attribute((RI_NS, "content-id")).map(ToOwned::to_owned),
-            space_key: page.attribute((RI_NS, "space-key")).map(ToOwned::to_owned),
-            content_title: page
-                .attribute((RI_NS, "content-title"))
-                .map(ToOwned::to_owned),
-            anchor: None,
-        };
+        let placeholder = page_resource_placeholder(page);
         parameters.insert("page".to_string(), build_page_placeholder_url(&placeholder));
     }
     Some(render_parameter_only_macro_block_with_parameters(
-        "excerpt-include",
+        block_name,
+        &parameters,
+    ))
+}
+
+fn render_include_page_macro_block(node: Node<'_, '_>) -> Option<String> {
+    let mut parameters = collect_macro_parameters(node);
+    let placeholder = if let Some(parameter) = find_macro_parameter(node, "") {
+        parameters.remove("");
+        namespaced_child(parameter, AC_NS, "link")
+            .and_then(|link| namespaced_child(link, RI_NS, "page"))
+            .map(page_resource_placeholder)
+    } else if let Some(target) = parameters.remove("default-parameter") {
+        Some(parse_default_parameter_page_target(&target))
+    } else {
+        namespaced_child(node, RI_NS, "page").map(page_resource_placeholder)
+    };
+
+    if let Some(placeholder) = placeholder {
+        parameters.insert("page".to_string(), build_page_placeholder_url(&placeholder));
+    }
+    Some(render_parameter_only_macro_block_with_parameters(
+        "include-page",
         &parameters,
     ))
 }
@@ -695,6 +713,17 @@ fn render_parameter_only_macro_block_with_parameters(
     }
     markdown.push_str(":::");
     markdown
+}
+
+fn page_resource_placeholder(node: Node<'_, '_>) -> PageLinkPlaceholder {
+    PageLinkPlaceholder {
+        content_id: node.attribute((RI_NS, "content-id")).map(ToOwned::to_owned),
+        space_key: node.attribute((RI_NS, "space-key")).map(ToOwned::to_owned),
+        content_title: node
+            .attribute((RI_NS, "content-title"))
+            .map(ToOwned::to_owned),
+        anchor: None,
+    }
 }
 
 fn render_rich_text_macro_block(
@@ -1103,6 +1132,15 @@ fn collect_macro_parameters(node: Node<'_, '_>) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn find_macro_parameter<'a>(node: Node<'a, 'a>, name: &str) -> Option<Node<'a, 'a>> {
+    node.children().find(|child| {
+        child.is_element()
+            && child.tag_name().namespace() == Some(AC_NS)
+            && child.tag_name().name() == "parameter"
+            && child.attribute((AC_NS, "name")) == Some(name)
+    })
+}
+
 pub(crate) fn build_page_placeholder_url(link: &PageLinkPlaceholder) -> String {
     let mut url = Url::parse(&format!("{CONFLUENCE_PAGE_SCHEME}://page"))
         .expect("valid confluence page placeholder base");
@@ -1337,6 +1375,7 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-toc" => Some("toc"),
             ":::confluence-children" => Some("children"),
             ":::confluence-excerpt-include" => Some("excerpt-include"),
+            ":::confluence-include-page" => Some("include-page"),
             _ => None,
         };
 
@@ -1376,6 +1415,11 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters =
                     parse_macro_parameter_lines(&body, "confluence excerpt-include macro")?;
                 build_excerpt_include_macro_storage(&parameters)?
+            }
+            "include-page" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence include-page macro")?;
+                build_include_page_macro_storage(&parameters)?
             }
             _ => unreachable!(),
         };
@@ -1660,18 +1704,30 @@ fn build_excerpt_include_macro_storage(parameters: &BTreeMap<String, String>) ->
     ))
 }
 
-fn parse_excerpt_include_target(target: &str) -> PageLinkPlaceholder {
+fn build_include_page_macro_storage(parameters: &BTreeMap<String, String>) -> Result<String> {
+    let mut parameters = parameters.clone();
+    let page = parameters.remove("page").ok_or_else(|| {
+        anyhow::anyhow!("confluence include-page macro requires a `page` parameter")
+    })?;
+    let placeholder = parse_page_placeholder_url(&page).ok_or_else(|| {
+        anyhow::anyhow!(
+            "confluence include-page `page` must be a confluence-page placeholder; local paths are resolved during sync apply"
+        )
+    })?;
+    let page_xml = build_page_title_resource_xml(&placeholder)?;
+    let parameters_xml = build_macro_parameters_xml(&parameters);
+    Ok(format!(
+        r#"<ac:structured-macro ac:name="include">{parameters_xml}<ac:parameter ac:name=""><ac:link>{page_xml}</ac:link></ac:parameter></ac:structured-macro>"#
+    ))
+}
+
+fn parse_default_parameter_page_target(target: &str) -> PageLinkPlaceholder {
     let trimmed = target.trim();
     let mut placeholder = PageLinkPlaceholder::default();
     if let Some((space_key, title)) = trimmed.split_once(':') {
         let space_key = space_key.trim();
         let title = title.trim();
-        if !space_key.is_empty()
-            && !title.is_empty()
-            && space_key
-                .chars()
-                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
-        {
+        if !space_key.is_empty() && !title.is_empty() && looks_like_space_key(space_key) {
             placeholder.space_key = Some(space_key.to_string());
             placeholder.content_title = Some(title.to_string());
             return placeholder;
@@ -1679,6 +1735,13 @@ fn parse_excerpt_include_target(target: &str) -> PageLinkPlaceholder {
     }
     placeholder.content_title = (!trimmed.is_empty()).then(|| trimmed.to_string());
     placeholder
+}
+
+fn looks_like_space_key(space_key: &str) -> bool {
+    space_key.starts_with('~')
+        || space_key
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
 }
 
 fn build_excerpt_include_target(placeholder: &PageLinkPlaceholder) -> Result<String> {
@@ -1690,6 +1753,30 @@ fn build_excerpt_include_target(placeholder: &PageLinkPlaceholder) -> Result<Str
     } else {
         Ok(title.to_string())
     }
+}
+
+fn build_page_resource_xml(placeholder: &PageLinkPlaceholder) -> Result<String> {
+    if let Some(title) = placeholder.content_title.as_deref() {
+        let mut attrs = vec![format!(r#"ri:content-title="{}""#, escape_xml(title))];
+        if let Some(space_key) = placeholder.space_key.as_deref() {
+            attrs.push(format!(r#"ri:space-key="{}""#, escape_xml(space_key)));
+        }
+        return Ok(format!(r#"<ri:page {} />"#, attrs.join(" ")));
+    }
+    if let Some(content_id) = placeholder.content_id.as_deref() {
+        return Ok(format!(
+            r#"<ri:page ri:content-id="{}" />"#,
+            escape_xml(content_id)
+        ));
+    }
+    bail!("confluence page placeholder requires a content id or content title")
+}
+
+fn build_page_title_resource_xml(placeholder: &PageLinkPlaceholder) -> Result<String> {
+    if placeholder.content_title.is_some() {
+        return build_page_resource_xml(placeholder);
+    }
+    bail!("confluence include-page references require a page title")
 }
 
 fn build_macro_parameters_xml(parameters: &BTreeMap<String, String>) -> String {
@@ -1992,11 +2079,23 @@ mod tests {
     }
 
     #[test]
+    fn include_page_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="include"><ac:parameter ac:name=""><ac:link><ri:page ri:space-key="TEST" ri:content-title="Docs Home" /></ac:link></ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-include-page"));
+        assert!(markdown.contains("page: confluence-page://page?"));
+        assert!(markdown.contains("content-title=Docs+Home"));
+    }
+
+    #[test]
     fn whitespace_between_supported_blocks_does_not_force_fallback_export() {
         let storage = concat!(
             "<h1>Macro Source</h1>\n",
             "<ac:structured-macro ac:name=\"excerpt-include\">",
             "<ac:parameter ac:name=\"default-parameter\">TEST:Docs Home</ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"include\">",
+            "<ri:page ri:content-title=\"Shared Page\" />",
             "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"children\">",
             "<ac:parameter ac:name=\"all\">true</ac:parameter>",
@@ -2005,6 +2104,7 @@ mod tests {
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("# Macro Source"));
         assert!(markdown.contains(":::confluence-excerpt-include"));
+        assert!(markdown.contains(":::confluence-include-page"));
         assert!(markdown.contains(":::confluence-children"));
         assert!(!markdown.contains("CONFLUENCE_XML_PLACEHOLDER"));
     }
@@ -2145,6 +2245,29 @@ mod tests {
         assert!(rendered.storage.contains(
             r#"<ac:parameter ac:name="default-parameter">TEST:Docs Home</ac:parameter>"#
         ));
+    }
+
+    #[test]
+    fn include_page_blocks_round_trip_back_to_structured_macros() {
+        let page = build_page_placeholder_url(&PageLinkPlaceholder {
+            space_key: Some("TEST".to_string()),
+            content_title: Some("Docs Home".to_string()),
+            ..PageLinkPlaceholder::default()
+        });
+        let markdown = format!(":::confluence-include-page\npage: {page}\n:::");
+        let rendered = markdown_to_storage(&markdown, false).expect("include-page block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="include">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name=""><ac:link>"#)
+        );
+        assert!(rendered.storage.contains(r#"ri:content-title="Docs Home""#));
+        assert!(rendered.storage.contains(r#"ri:space-key="TEST""#));
     }
 
     #[test]
