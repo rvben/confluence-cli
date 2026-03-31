@@ -239,6 +239,9 @@ fn render_block_element(node: Node<'_, '_>, source: &str) -> Option<String> {
 
     match node.tag_name().name() {
         "p" => {
+            if node.children().any(is_block_like_confluence_node) {
+                return render_container_blocks(node, source);
+            }
             let inline = render_inline_children(node, source)?;
             if inline.trim().is_empty() {
                 None
@@ -591,6 +594,9 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "code" {
         return render_code_macro_block(node);
     }
+    if name == "noformat" {
+        return render_noformat_macro_block(node);
+    }
     if name == "excerpt" {
         return render_excerpt_macro_block(node, source);
     }
@@ -662,6 +668,15 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     }
     if matches!(name, "change-history" | "changehistory") {
         return Some(":::confluence-change-history\n:::".to_string());
+    }
+    if name == "spaces" {
+        return render_default_parameter_macro_block("spaces-list", "scope", node);
+    }
+    if name == "space-details" {
+        return render_parameter_only_macro_block("space-details", node);
+    }
+    if name == "space-attachments" {
+        return render_parameter_only_macro_block("space-attachments", node);
     }
     if name == "profile" {
         return render_parameter_only_macro_block("profile", node);
@@ -967,6 +982,26 @@ fn render_code_macro_block(node: Node<'_, '_>) -> Option<String> {
     Some(markdown)
 }
 
+fn render_noformat_macro_block(node: Node<'_, '_>) -> Option<String> {
+    let body = namespaced_child(node, AC_NS, "plain-text-body")?;
+    let text = body.text().unwrap_or_default().trim_end_matches('\n');
+    let parameters = collect_macro_parameters(node);
+
+    let mut markdown = "~~~confluence-noformat\n".to_string();
+    if !parameters.is_empty() {
+        for (name, value) in parameters {
+            markdown.push_str(&format!("{name}: {value}\n"));
+        }
+        markdown.push_str("---\n");
+    }
+    markdown.push_str(text);
+    if !text.is_empty() {
+        markdown.push('\n');
+    }
+    markdown.push_str("~~~");
+    Some(markdown)
+}
+
 fn render_inline_children(node: Node<'_, '_>, source: &str) -> Option<String> {
     let mut rendered = String::new();
     for child in node.children() {
@@ -1186,6 +1221,17 @@ fn is_confluence_node(node: Node<'_, '_>) -> bool {
 
 fn is_confluence_inline(node: Node<'_, '_>) -> bool {
     is_confluence_node(node) && matches!(node.tag_name().name(), "image" | "link")
+}
+
+fn is_block_like_confluence_node(node: Node<'_, '_>) -> bool {
+    if !node.is_element() || node.tag_name().namespace() != Some(AC_NS) {
+        return false;
+    }
+    match node.tag_name().name() {
+        "layout" | "task-list" => true,
+        "structured-macro" | "macro" => node.attribute((AC_NS, "name")) != Some("status"),
+        _ => false,
+    }
 }
 
 fn contains_confluence_markup(node: Node<'_, '_>) -> bool {
@@ -1596,7 +1642,25 @@ fn replace_confluence_macro_blocks(
     }
     code_normalized.push_str(&expanded[last..]);
 
-    Ok((code_normalized, fragments))
+    let noformat_macro_re =
+        Regex::new(r"(?ms)^~~~confluence-noformat[ \t]*\n(.*?)\n~~~[ \t]*(?:\n|$)")?;
+    let mut noformat_normalized = String::with_capacity(code_normalized.len());
+    last = 0;
+    for captures in noformat_macro_re.captures_iter(&code_normalized) {
+        let Some(full_match) = captures.get(0) else {
+            continue;
+        };
+        noformat_normalized.push_str(&code_normalized[last..full_match.start()]);
+        let block_body = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let (parameters, text) = parse_noformat_macro_block(block_body)?;
+        let idx = fragments.len();
+        fragments.push(build_noformat_macro_storage(&parameters, &text));
+        noformat_normalized.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
+        last = full_match.end();
+    }
+    noformat_normalized.push_str(&code_normalized[last..]);
+
+    Ok((noformat_normalized, fragments))
 }
 
 fn replace_parameterized_colon_macro_blocks(
@@ -1637,6 +1701,9 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-gallery" => Some("gallery"),
             ":::confluence-favorite-pages" => Some("favorite-pages"),
             ":::confluence-change-history" => Some("change-history"),
+            ":::confluence-spaces-list" => Some("spaces-list"),
+            ":::confluence-space-details" => Some("space-details"),
+            ":::confluence-space-attachments" => Some("space-attachments"),
             ":::confluence-profile" => Some("profile"),
             ":::confluence-status-list" => Some("status-list"),
             ":::confluence-network" => Some("network"),
@@ -1811,6 +1878,23 @@ fn replace_parameterized_colon_macro_blocks(
                 } else {
                     build_parameter_only_macro_storage("change-history", &parameters)
                 }
+            }
+            "spaces-list" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence spaces-list macro")?;
+                build_default_parameter_macro_storage("spaces", "scope", &parameters)
+            }
+            "space-details" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence space-details macro")?;
+                build_parameter_only_macro_storage("space-details", &parameters)
+            }
+            "space-attachments" => {
+                let parameters = parse_macro_parameter_lines(
+                    &body,
+                    "confluence space-attachments macro",
+                )?;
+                build_single_space_parameter_macro_storage("space-attachments", "space", &parameters)
             }
             "profile" => {
                 let parameters = parse_macro_parameter_lines(&body, "confluence profile macro")?;
@@ -2066,11 +2150,29 @@ fn parse_code_macro_header(header: &str) -> Result<BTreeMap<String, String>> {
     parse_macro_parameter_lines(header, "confluence code macro")
 }
 
+fn parse_noformat_macro_block(block_body: &str) -> Result<(BTreeMap<String, String>, String)> {
+    let trimmed_body = block_body.trim_end_matches('\n');
+    if let Some((header, text)) = trimmed_body.split_once("\n---\n") {
+        let parameters = parse_macro_parameter_lines(header, "confluence noformat macro")?;
+        Ok((parameters, text.to_string()))
+    } else {
+        Ok((BTreeMap::new(), trimmed_body.to_string()))
+    }
+}
+
 fn build_code_macro_storage(parameters: &BTreeMap<String, String>, code: &str) -> String {
     let parameters_xml = build_macro_parameters_xml(parameters);
     let body = wrap_cdata(code);
     format!(
         r#"<ac:structured-macro ac:name="code">{parameters_xml}<ac:plain-text-body><![CDATA[{body}]]></ac:plain-text-body></ac:structured-macro>"#
+    )
+}
+
+fn build_noformat_macro_storage(parameters: &BTreeMap<String, String>, text: &str) -> String {
+    let parameters_xml = build_macro_parameters_xml(parameters);
+    let body = wrap_cdata(text);
+    format!(
+        r#"<ac:structured-macro ac:name="noformat">{parameters_xml}<ac:plain-text-body><![CDATA[{body}]]></ac:plain-text-body></ac:structured-macro>"#
     )
 }
 
@@ -2258,6 +2360,34 @@ fn build_network_macro_storage(parameters: &BTreeMap<String, String>) -> String 
     let parameters_xml = build_macro_parameters_xml(&parameters);
     format!(
         r#"<ac:structured-macro ac:name="network">{parameters_xml}{username_xml}</ac:structured-macro>"#
+    )
+}
+
+fn build_default_parameter_macro_storage(
+    name: &str,
+    default_parameter_name: &str,
+    parameters: &BTreeMap<String, String>,
+) -> String {
+    let mut parameters = parameters.clone();
+    if let Some(value) = parameters.remove(default_parameter_name) {
+        parameters.insert(String::new(), value);
+    }
+    build_parameter_only_macro_storage(name, &parameters)
+}
+
+fn build_single_space_parameter_macro_storage(
+    name: &str,
+    parameter_name: &str,
+    parameters: &BTreeMap<String, String>,
+) -> String {
+    let mut parameters = parameters.clone();
+    let space_xml = parameters
+        .remove(parameter_name)
+        .and_then(|space| build_space_parameter_xml(parameter_name, &space));
+    let parameters_xml = build_macro_parameters_xml(&parameters);
+    format!(
+        r#"<ac:structured-macro ac:name="{name}">{parameters_xml}{}</ac:structured-macro>"#,
+        space_xml.unwrap_or_default()
     )
 }
 
@@ -2582,6 +2712,15 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_wrappers_with_block_macros_are_unwrapped() {
+        let storage = r#"<p><ac:structured-macro ac:name="noformat"><ac:parameter ac:name="nopanel">true</ac:parameter><ac:plain-text-body><![CDATA[<xml>literal</xml>]]></ac:plain-text-body></ac:structured-macro><ac:structured-macro ac:name="profile"><ac:parameter ac:name="user"><ri:user ri:account-id="abc123" /></ac:parameter></ac:structured-macro></p>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains("~~~confluence-noformat"));
+        assert!(markdown.contains(":::confluence-profile"));
+        assert!(!markdown.contains("```confluence-storage"));
+    }
+
+    #[test]
     fn task_lists_round_trip_between_storage_and_markdown() {
         let storage = r#"<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>Write docs</ac:task-body></ac:task><ac:task><ac:task-status>complete</ac:task-status><ac:task-body>Ship it</ac:task-body></ac:task></ac:task-list>"#;
         let markdown = storage_to_markdown(storage);
@@ -2770,6 +2909,44 @@ mod tests {
         assert!(markdown.contains("username: confluence-user://user?userkey=user-123"));
         assert!(markdown.contains("max: 10"));
         assert!(markdown.contains("theme: full"));
+    }
+
+    #[test]
+    fn spaces_list_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="spaces"><ac:parameter ac:name="">all</ac:parameter><ac:parameter ac:name="width">80%</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-spaces-list"));
+        assert!(markdown.contains("scope: all"));
+        assert!(markdown.contains("width: 80%"));
+    }
+
+    #[test]
+    fn space_details_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="space-details"><ac:parameter ac:name="width">50%</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-space-details"));
+        assert!(markdown.contains("width: 50%"));
+    }
+
+    #[test]
+    fn space_attachments_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="space-attachments"><ac:parameter ac:name="space"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="showFilter">false</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-space-attachments"));
+        assert!(markdown.contains("space: TEST"));
+        assert!(markdown.contains("showFilter: false"));
+    }
+
+    #[test]
+    fn noformat_macros_export_to_fenced_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="noformat"><ac:parameter ac:name="nopanel">true</ac:parameter><ac:plain-text-body><![CDATA[<xml>literal</xml>
+line 2]]></ac:plain-text-body></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains("~~~confluence-noformat"));
+        assert!(markdown.contains("nopanel: true"));
+        assert!(markdown.contains("---"));
+        assert!(markdown.contains("<xml>literal</xml>"));
+        assert!(markdown.contains("line 2"));
     }
 
     #[test]
@@ -2964,6 +3141,18 @@ mod tests {
             "<ac:parameter ac:name=\"\">followers</ac:parameter>",
             "<ac:parameter ac:name=\"username\"><ri:user ri:userkey=\"user-123\" /></ac:parameter>",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"spaces\">",
+            "<ac:parameter ac:name=\"\">all</ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"space-details\">",
+            "<ac:parameter ac:name=\"width\">50%</ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"space-attachments\">",
+            "<ac:parameter ac:name=\"space\">TEST</ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"noformat\">",
+            "<ac:plain-text-body><![CDATA[<xml>literal</xml>]]></ac:plain-text-body>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"listlabels\">",
             "<ac:parameter ac:name=\"spaceKey\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
             "</ac:structured-macro>\n",
@@ -3000,6 +3189,10 @@ mod tests {
         assert!(markdown.contains(":::confluence-profile"));
         assert!(markdown.contains(":::confluence-status-list"));
         assert!(markdown.contains(":::confluence-network"));
+        assert!(markdown.contains(":::confluence-spaces-list"));
+        assert!(markdown.contains(":::confluence-space-details"));
+        assert!(markdown.contains(":::confluence-space-attachments"));
+        assert!(markdown.contains("~~~confluence-noformat"));
         assert!(markdown.contains(":::confluence-labels-list"));
         assert!(markdown.contains(":::confluence-popular-labels"));
         assert!(markdown.contains(":::confluence-related-labels"));
@@ -3381,6 +3574,86 @@ mod tests {
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="theme">full</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn spaces_list_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-spaces-list\nscope: all\nwidth: 80%\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("spaces-list block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="spaces">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="">all</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="width">80%</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn space_details_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-space-details\nwidth: 50%\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("space-details block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="space-details">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="width">50%</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn space_attachments_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-space-attachments\nspace: TEST\nshowFilter: false\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("space-attachments block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="space-attachments">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="space"><ri:space ri:space-key="TEST" /></ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="showFilter">false</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn noformat_blocks_round_trip_back_to_structured_macros() {
+        let markdown = "~~~confluence-noformat\nnopanel: true\n---\n<xml>literal</xml>\nline 2\n~~~";
+        let rendered = markdown_to_storage(markdown, false).expect("noformat block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="noformat">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="nopanel">true</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains("<ac:plain-text-body><![CDATA[<xml>literal</xml>\nline 2]]>")
         );
     }
 

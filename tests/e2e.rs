@@ -783,7 +783,7 @@ fn e2e_cli_lifecycle() {
     fs::write(
         macro_source_dir.join("index.md"),
         format!(
-            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-contributors\nspaces: {space},@personal\nlabels: e2e-macro-target\nmode: list\n:::\n\n:::confluence-contributors-summary\nspaces: {space}\ncolumns: edits,comments,labels\nlimit: 10\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nspaces: {space}\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-recently-used-labels\nscope: space\nstyle: cloud\n:::\n\n:::confluence-gallery\nsortBy: name\ncolumns: 2\n:::\n\n:::confluence-favorite-pages\n:::\n\n:::confluence-change-history\n:::\n\n:::confluence-profile\nuser: {macro_user}\n:::\n\n:::confluence-status-list\nusername: {macro_user}\n:::\n\n:::confluence-network\nmode: followers\nusername: {macro_user}\nmax: 10\ntheme: full\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
+            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-contributors\nspaces: {space},@personal\nlabels: e2e-macro-target\nmode: list\n:::\n\n:::confluence-contributors-summary\nspaces: {space}\ncolumns: edits,comments,labels\nlimit: 10\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nspaces: {space}\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-recently-used-labels\nscope: space\nstyle: cloud\n:::\n\n:::confluence-gallery\nsortBy: name\ncolumns: 2\n:::\n\n:::confluence-favorite-pages\n:::\n\n:::confluence-change-history\n:::\n\n:::confluence-spaces-list\nscope: all\nwidth: 80%\n:::\n\n:::confluence-space-details\nwidth: 50%\n:::\n\n:::confluence-space-attachments\nspace: {space}\nshowFilter: false\n:::\n\n~~~confluence-noformat\nnopanel: true\n---\n<xml>literal</xml>\nline 2\n~~~\n\n:::confluence-profile\nuser: {macro_user}\n:::\n\n:::confluence-status-list\nusername: {macro_user}\n:::\n\n:::confluence-network\nmode: followers\nusername: {macro_user}\nmax: 10\ntheme: full\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
             space = cfg.space,
             macro_user = macro_user
         ),
@@ -1149,6 +1149,44 @@ fn e2e_cli_lifecycle() {
         "expected change-history macro in source body: {macro_source_body}"
     );
     assert!(
+        macro_source_body.contains(r#"ac:name="spaces""#),
+        "expected spaces-list macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="">all</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="width">80%</ac:parameter>"#),
+        "expected spaces-list parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="space-details""#),
+        "expected space-details macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="width">50%</ac:parameter>"#),
+        "expected space-details parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="space-attachments""#),
+        "expected space-attachments macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="space"><ri:space ri:space-key="{}" /></ac:parameter>"#,
+            cfg.space
+        )) && macro_source_body.contains(r#"<ac:parameter ac:name="showFilter">false</ac:parameter>"#),
+        "expected space-attachments parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="noformat""#),
+        "expected noformat macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="nopanel">true</ac:parameter>"#)
+            && macro_source_body.contains("<ac:plain-text-body><![CDATA[<xml>literal</xml>")
+            && macro_source_body.contains("line 2"),
+        "expected noformat parameters and plain-text body to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
         macro_source_body.contains(r#"ac:name="profile""#),
         "expected profile macro in source body: {macro_source_body}"
     );
@@ -1400,6 +1438,42 @@ fn e2e_cli_lifecycle() {
     assert!(
         pulled_macro_source_markdown.contains(":::confluence-change-history"),
         "expected pulled macro source to preserve change-history block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-spaces-list"),
+        "expected pulled macro source to preserve spaces-list block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("scope: all")
+            && pulled_macro_source_markdown.contains("width: 80%"),
+        "expected pulled spaces-list parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-space-details"),
+        "expected pulled macro source to preserve space-details block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("width: 50%"),
+        "expected pulled space-details parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-space-attachments"),
+        "expected pulled macro source to preserve space-attachments block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(&format!("space: {}", cfg.space))
+            && pulled_macro_source_markdown.contains("showFilter: false"),
+        "expected pulled space-attachments parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("~~~confluence-noformat"),
+        "expected pulled macro source to preserve noformat block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("nopanel: true")
+            && pulled_macro_source_markdown.contains("<xml>literal</xml>")
+            && pulled_macro_source_markdown.contains("line 2"),
+        "expected pulled noformat parameters and body to survive export: {pulled_macro_source_markdown}"
     );
     assert!(
         pulled_macro_source_markdown.contains(":::confluence-profile"),
