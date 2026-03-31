@@ -600,6 +600,9 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "pagetree" {
         return render_page_tree_macro_block(node);
     }
+    if name == "pagetreesearch" {
+        return render_page_tree_search_macro_block(node);
+    }
     if name == "toc" {
         return render_parameter_only_macro_block("toc", node);
     }
@@ -699,6 +702,21 @@ fn render_page_tree_macro_block(node: Node<'_, '_>) -> Option<String> {
     }
     Some(render_parameter_only_macro_block_with_parameters(
         "page-tree",
+        &parameters,
+    ))
+}
+
+fn render_page_tree_search_macro_block(node: Node<'_, '_>) -> Option<String> {
+    let mut parameters = collect_macro_parameters(node);
+    if let Some(root) = parameters.get("root").cloned() {
+        let trimmed = root.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('@') {
+            let placeholder = parse_default_parameter_page_target(trimmed);
+            parameters.insert("root".to_string(), build_page_placeholder_url(&placeholder));
+        }
+    }
+    Some(render_parameter_only_macro_block_with_parameters(
+        "page-tree-search",
         &parameters,
     ))
 }
@@ -1408,6 +1426,7 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-excerpt-include" => Some("excerpt-include"),
             ":::confluence-include-page" => Some("include-page"),
             ":::confluence-page-tree" => Some("page-tree"),
+            ":::confluence-page-tree-search" => Some("page-tree-search"),
             _ => None,
         };
 
@@ -1456,6 +1475,11 @@ fn replace_parameterized_colon_macro_blocks(
             "page-tree" => {
                 let parameters = parse_macro_parameter_lines(&body, "confluence page-tree macro")?;
                 build_page_tree_macro_storage(&parameters)?
+            }
+            "page-tree-search" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence page-tree-search macro")?;
+                build_page_tree_search_macro_storage(&parameters)
             }
             _ => unreachable!(),
         };
@@ -1777,6 +1801,18 @@ fn build_page_tree_macro_storage(parameters: &BTreeMap<String, String>) -> Resul
         r#"<ac:structured-macro ac:name="pagetree">{parameters_xml}{}</ac:structured-macro>"#,
         root_xml.unwrap_or_default()
     ))
+}
+
+fn build_page_tree_search_macro_storage(parameters: &BTreeMap<String, String>) -> String {
+    let mut parameters = parameters.clone();
+    if let Some(root) = parameters.get("root").cloned() {
+        if let Some(placeholder) = parse_page_placeholder_url(&root) {
+            if let Ok(root_target) = build_title_page_target(&placeholder) {
+                parameters.insert("root".to_string(), root_target);
+            }
+        }
+    }
+    build_parameter_only_macro_storage("pagetreesearch", &parameters)
 }
 
 fn parse_default_parameter_page_target(target: &str) -> PageLinkPlaceholder {
@@ -2157,6 +2193,16 @@ mod tests {
     }
 
     #[test]
+    fn page_tree_search_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="pagetreesearch"><ac:parameter ac:name="root">TEST:Docs Home</ac:parameter><ac:parameter ac:name="spaceKey">TEST</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-page-tree-search"));
+        assert!(markdown.contains("root: confluence-page://page?"));
+        assert!(markdown.contains("content-title=Docs+Home"));
+        assert!(markdown.contains("spaceKey: TEST"));
+    }
+
+    #[test]
     fn whitespace_between_supported_blocks_does_not_force_fallback_export() {
         let storage = concat!(
             "<h1>Macro Source</h1>\n",
@@ -2169,6 +2215,9 @@ mod tests {
             "<ac:structured-macro ac:name=\"pagetree\">",
             "<ac:parameter ac:name=\"root\"><ac:link><ri:page ri:space-key=\"TEST\" ri:content-title=\"Docs Home\" /></ac:link></ac:parameter>",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"pagetreesearch\">",
+            "<ac:parameter ac:name=\"root\">TEST:Docs Home</ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"children\">",
             "<ac:parameter ac:name=\"all\">true</ac:parameter>",
             "</ac:structured-macro>"
@@ -2178,6 +2227,7 @@ mod tests {
         assert!(markdown.contains(":::confluence-excerpt-include"));
         assert!(markdown.contains(":::confluence-include-page"));
         assert!(markdown.contains(":::confluence-page-tree"));
+        assert!(markdown.contains(":::confluence-page-tree-search"));
         assert!(markdown.contains(":::confluence-children"));
         assert!(!markdown.contains("CONFLUENCE_XML_PLACEHOLDER"));
     }
@@ -2366,6 +2416,33 @@ mod tests {
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="searchBox">true</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn page_tree_search_blocks_round_trip_back_to_structured_macros() {
+        let page = build_page_placeholder_url(&PageLinkPlaceholder {
+            space_key: Some("TEST".to_string()),
+            content_title: Some("Docs Home".to_string()),
+            ..PageLinkPlaceholder::default()
+        });
+        let markdown = format!(":::confluence-page-tree-search\nroot: {page}\nspaceKey: TEST\n:::");
+        let rendered =
+            markdown_to_storage(&markdown, false).expect("page-tree-search block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="pagetreesearch">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="root">TEST:Docs Home</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="spaceKey">TEST</ac:parameter>"#)
         );
     }
 

@@ -564,6 +564,7 @@ fn rewrite_macro_page_references(
             ":::confluence-excerpt-include" => Some(MacroPageReferenceMode::ExcerptInclude),
             ":::confluence-include-page" => Some(MacroPageReferenceMode::IncludePage),
             ":::confluence-page-tree" => Some(MacroPageReferenceMode::PageTree),
+            ":::confluence-page-tree-search" => Some(MacroPageReferenceMode::PageTreeSearch),
             _ => None,
         };
         let Some(macro_mode) = macro_mode else {
@@ -603,6 +604,7 @@ enum MacroPageReferenceMode {
     ExcerptInclude,
     IncludePage,
     PageTree,
+    PageTreeSearch,
 }
 
 fn rewrite_page_reference_parameter_line(
@@ -615,7 +617,7 @@ fn rewrite_page_reference_parameter_line(
         return line.to_string();
     };
     let expected_parameter = match mode {
-        MacroPageReferenceMode::PageTree => "root",
+        MacroPageReferenceMode::PageTree | MacroPageReferenceMode::PageTreeSearch => "root",
         MacroPageReferenceMode::ExcerptInclude | MacroPageReferenceMode::IncludePage => "page",
     };
     if name.trim() != expected_parameter {
@@ -668,6 +670,12 @@ fn local_target_to_page_placeholder(
             anchor: None,
         },
         MacroPageReferenceMode::PageTree => PageLinkPlaceholder {
+            content_id: None,
+            space_key: link.space_key.clone(),
+            content_title: Some(link.title.clone()),
+            anchor: None,
+        },
+        MacroPageReferenceMode::PageTreeSearch => PageLinkPlaceholder {
             content_id: None,
             space_key: link.space_key.clone(),
             content_title: Some(link.title.clone()),
@@ -1768,5 +1776,63 @@ mod tests {
             r#"<ac:parameter ac:name="root"><ac:link><ri:page ri:content-title="Sibling" ri:space-key="MFS" /></ac:link></ac:parameter>"#
         ));
         assert!(storage.contains(r#"<ac:parameter ac:name="searchBox">true</ac:parameter>"#));
+    }
+
+    #[test]
+    fn render_body_storage_rewrites_page_tree_search_root_parameters_to_storage_macros() {
+        let current_dir = PathBuf::from("/tmp/root/current-page--123");
+        let sibling_dir = PathBuf::from("/tmp/root/sibling-page--456");
+        let current = LocalDocument {
+            directory: current_dir.clone(),
+            markdown_path: current_dir.join("index.md"),
+            sidecar_path: current_dir.join(".confluence.json"),
+            frontmatter: Frontmatter {
+                title: "Current".to_string(),
+                kind: "page".to_string(),
+                labels: vec![],
+                status: "current".to_string(),
+                parent: None,
+                properties: BTreeMap::new(),
+            },
+            body_markdown:
+                ":::confluence-page-tree-search\nroot: ../sibling-page--456/index.md\nspaceKey: MFS\n:::\n"
+                    .to_string(),
+            sidecar: Sidecar {
+                content_id: Some("123".to_string()),
+                space_key: Some("MFS".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                web_path_prefix: Some("/wiki".to_string()),
+                ..Sidecar::default()
+            },
+        };
+        let sibling = LocalDocument {
+            directory: sibling_dir.clone(),
+            markdown_path: sibling_dir.join("index.md"),
+            sidecar_path: sibling_dir.join(".confluence.json"),
+            frontmatter: Frontmatter {
+                title: "Sibling".to_string(),
+                kind: "page".to_string(),
+                labels: vec![],
+                status: "current".to_string(),
+                parent: None,
+                properties: BTreeMap::new(),
+            },
+            body_markdown: "# Sibling".to_string(),
+            sidecar: Sidecar {
+                content_id: Some("456".to_string()),
+                space_key: Some("MFS".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                web_path_prefix: Some("/wiki".to_string()),
+                ..Sidecar::default()
+            },
+        };
+
+        let index = build_link_index(&[current.clone(), sibling]);
+        let storage =
+            render_body_storage(&current, &index, false, "/wiki").expect("render body storage");
+
+        assert!(storage.contains(r#"<ac:structured-macro ac:name="pagetreesearch">"#));
+        assert!(storage.contains(r#"<ac:parameter ac:name="root">MFS:Sibling</ac:parameter>"#));
+        assert!(storage.contains(r#"<ac:parameter ac:name="spaceKey">MFS</ac:parameter>"#));
     }
 }
