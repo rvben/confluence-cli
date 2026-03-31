@@ -587,6 +587,12 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "code" {
         return render_code_macro_block(node);
     }
+    if name == "excerpt" {
+        return render_excerpt_macro_block(node, source);
+    }
+    if name == "toc" {
+        return render_parameter_only_macro_block("toc", node);
+    }
     if name == "expand" {
         return render_expand_macro_block(node, source);
     }
@@ -606,6 +612,17 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
             body_markdown.trim()
         ))
     }
+}
+
+fn render_excerpt_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let body = namespaced_child(node, AC_NS, "rich-text-body")?;
+    let body_markdown = storage_to_markdown(&inner_xml_fragment(body, source));
+    let parameters = collect_macro_parameters(node);
+    Some(render_rich_text_macro_block(
+        "excerpt",
+        &parameters,
+        &body_markdown,
+    ))
 }
 
 fn render_expand_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
@@ -629,6 +646,36 @@ fn render_expand_macro_block(node: Node<'_, '_>, source: &str) -> Option<String>
     } else {
         Some(format!("{header}\n{}\n:::", body_markdown.trim()))
     }
+}
+
+fn render_parameter_only_macro_block(name: &str, node: Node<'_, '_>) -> Option<String> {
+    let parameters = collect_macro_parameters(node);
+    let mut markdown = format!(":::confluence-{name}\n");
+    for (parameter, value) in parameters {
+        markdown.push_str(&format!("{parameter}: {value}\n"));
+    }
+    markdown.push_str(":::");
+    Some(markdown)
+}
+
+fn render_rich_text_macro_block(
+    name: &str,
+    parameters: &BTreeMap<String, String>,
+    body_markdown: &str,
+) -> String {
+    let mut markdown = format!(":::confluence-{name}\n");
+    if !parameters.is_empty() {
+        for (parameter, value) in parameters {
+            markdown.push_str(&format!("{parameter}: {value}\n"));
+        }
+        markdown.push_str("---\n");
+    }
+    if !body_markdown.trim().is_empty() {
+        markdown.push_str(body_markdown.trim());
+        markdown.push('\n');
+    }
+    markdown.push_str(":::");
+    markdown
 }
 
 fn render_code_macro_block(node: Node<'_, '_>) -> Option<String> {
@@ -1178,16 +1225,19 @@ fn replace_confluence_macro_blocks(
     }
     normalized.push_str(&markdown[last..]);
 
+    let parameterized =
+        replace_parameterized_colon_macro_blocks(&normalized, allow_lossy, &mut fragments)?;
+
     let expand_macro_re = Regex::new(
         r"(?ms)^:::confluence-expand(?:[ \t]+([^\n]+))?[ \t]*\n(.*?)\n:::[ \t]*(?:\n|$)",
     )?;
-    let mut expanded = String::with_capacity(normalized.len());
+    let mut expanded = String::with_capacity(parameterized.len());
     last = 0;
-    for captures in expand_macro_re.captures_iter(&normalized) {
+    for captures in expand_macro_re.captures_iter(&parameterized) {
         let Some(full_match) = captures.get(0) else {
             continue;
         };
-        expanded.push_str(&normalized[last..full_match.start()]);
+        expanded.push_str(&parameterized[last..full_match.start()]);
         let title = captures.get(1).map(|m| m.as_str().trim());
         let body_markdown = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
         let body_storage = markdown_to_storage(body_markdown, allow_lossy)?.storage;
@@ -1207,7 +1257,7 @@ fn replace_confluence_macro_blocks(
         expanded.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
         last = full_match.end();
     }
-    expanded.push_str(&normalized[last..]);
+    expanded.push_str(&parameterized[last..]);
 
     let code_macro_re = Regex::new(
         r"(?ms)^~~~confluence-code(?:[ \t]+([^\n~]+))?[ \t]*\n(.*?)\n~~~[ \t]*(?:\n|$)",
@@ -1230,6 +1280,106 @@ fn replace_confluence_macro_blocks(
     code_normalized.push_str(&expanded[last..]);
 
     Ok((code_normalized, fragments))
+}
+
+fn replace_parameterized_colon_macro_blocks(
+    markdown: &str,
+    allow_lossy: bool,
+    fragments: &mut Vec<String>,
+) -> Result<String> {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut output = String::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        let macro_name = match trimmed {
+            ":::confluence-excerpt" => Some("excerpt"),
+            ":::confluence-toc" => Some("toc"),
+            _ => None,
+        };
+
+        let Some(macro_name) = macro_name else {
+            output.push_str(lines[index]);
+            output.push('\n');
+            index += 1;
+            continue;
+        };
+
+        let mut body_lines = Vec::new();
+        index += 1;
+        while index < lines.len() && lines[index].trim() != ":::" {
+            body_lines.push(lines[index]);
+            index += 1;
+        }
+        if index >= lines.len() {
+            bail!("unterminated confluence {macro_name} block");
+        }
+
+        let body = body_lines.join("\n");
+        let fragment = match macro_name {
+            "excerpt" => {
+                let (parameters, body_storage) =
+                    parse_rich_text_macro_block("confluence excerpt macro", &body, allow_lossy)?;
+                build_rich_text_macro_storage("excerpt", &parameters, &body_storage)
+            }
+            "toc" => {
+                let parameters = parse_macro_parameter_lines(&body, "confluence toc macro")?;
+                build_parameter_only_macro_storage("toc", &parameters)
+            }
+            _ => unreachable!(),
+        };
+
+        let placeholder_index = fragments.len();
+        fragments.push(fragment);
+        output.push_str(&format!(
+            "CONFLUENCE_MACRO_PLACEHOLDER_{placeholder_index}\n"
+        ));
+        index += 1;
+    }
+
+    if !markdown.ends_with('\n') && output.ends_with('\n') {
+        output.pop();
+    }
+
+    Ok(output)
+}
+
+fn parse_rich_text_macro_block(
+    context: &str,
+    block_body: &str,
+    allow_lossy: bool,
+) -> Result<(BTreeMap<String, String>, String)> {
+    let trimmed_body = block_body.trim_end_matches('\n');
+    if let Some((header, body_markdown)) = trimmed_body.split_once("\n---\n") {
+        let parameters = parse_macro_parameter_lines(header, context)?;
+        let body_storage = markdown_to_storage(body_markdown, allow_lossy)?.storage;
+        Ok((parameters, body_storage))
+    } else {
+        Ok((
+            BTreeMap::new(),
+            markdown_to_storage(trimmed_body, allow_lossy)?.storage,
+        ))
+    }
+}
+
+fn parse_macro_parameter_lines(body: &str, context: &str) -> Result<BTreeMap<String, String>> {
+    let mut parameters = BTreeMap::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = trimmed.split_once(':') else {
+            bail!("invalid {context} header line: {trimmed}");
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("invalid {context} header line: {trimmed}");
+        }
+        parameters.insert(name.to_string(), value.trim().to_string());
+    }
+    Ok(parameters)
 }
 
 fn replace_layout_blocks(markdown: &str, allow_lossy: bool) -> Result<(String, Vec<String>)> {
@@ -1415,25 +1565,34 @@ fn parse_code_macro_block(
 }
 
 fn parse_code_macro_header(header: &str) -> Result<BTreeMap<String, String>> {
-    let mut parameters = BTreeMap::new();
-    for line in header.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Some((name, value)) = trimmed.split_once(':') else {
-            bail!("invalid confluence code macro header line: {trimmed}");
-        };
-        let name = name.trim();
-        if name.is_empty() {
-            bail!("invalid confluence code macro header line: {trimmed}");
-        }
-        parameters.insert(name.to_string(), value.trim().to_string());
-    }
-    Ok(parameters)
+    parse_macro_parameter_lines(header, "confluence code macro")
 }
 
 fn build_code_macro_storage(parameters: &BTreeMap<String, String>, code: &str) -> String {
+    let parameters_xml = build_macro_parameters_xml(parameters);
+    let body = wrap_cdata(code);
+    format!(
+        r#"<ac:structured-macro ac:name="code">{parameters_xml}<ac:plain-text-body><![CDATA[{body}]]></ac:plain-text-body></ac:structured-macro>"#
+    )
+}
+
+fn build_rich_text_macro_storage(
+    name: &str,
+    parameters: &BTreeMap<String, String>,
+    body_storage: &str,
+) -> String {
+    let parameters_xml = build_macro_parameters_xml(parameters);
+    format!(
+        r#"<ac:structured-macro ac:name="{name}">{parameters_xml}<ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:structured-macro>"#
+    )
+}
+
+fn build_parameter_only_macro_storage(name: &str, parameters: &BTreeMap<String, String>) -> String {
+    let parameters_xml = build_macro_parameters_xml(parameters);
+    format!(r#"<ac:structured-macro ac:name="{name}">{parameters_xml}</ac:structured-macro>"#)
+}
+
+fn build_macro_parameters_xml(parameters: &BTreeMap<String, String>) -> String {
     let parameters_xml = parameters
         .iter()
         .map(|(name, value)| {
@@ -1444,10 +1603,7 @@ fn build_code_macro_storage(parameters: &BTreeMap<String, String>, code: &str) -
             )
         })
         .collect::<String>();
-    let body = wrap_cdata(code);
-    format!(
-        r#"<ac:structured-macro ac:name="code">{parameters_xml}<ac:plain-text-body><![CDATA[{body}]]></ac:plain-text-body></ac:structured-macro>"#
-    )
+    parameters_xml
 }
 
 fn escape_xml(value: &str) -> String {
@@ -1618,7 +1774,7 @@ mod tests {
 
     #[test]
     fn storage_macro_round_trips_through_sentinel_block() {
-        let storage = r#"<p>Hello</p><ac:structured-macro ac:name="toc" />"#;
+        let storage = r#"<p>Hello</p><ac:structured-macro ac:name="children" />"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("```confluence-storage"));
         let rendered = markdown_to_storage(&markdown, false).expect("conversion succeeds");
@@ -1627,7 +1783,7 @@ mod tests {
 
     #[test]
     fn mixed_content_preserves_only_unsupported_confluence_fragments() {
-        let storage = r#"<h1>Title</h1><ac:structured-macro ac:name="toc" /><p>After</p>"#;
+        let storage = r#"<h1>Title</h1><ac:structured-macro ac:name="children" /><p>After</p>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("# Title"));
         assert!(markdown.contains("```confluence-storage"));
@@ -1695,6 +1851,26 @@ mod tests {
     }
 
     #[test]
+    fn excerpt_macros_export_to_excerpt_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="excerpt"><ac:parameter ac:name="hidden">true</ac:parameter><ac:rich-text-body><p>Hello</p><ul><li>World</li></ul></ac:rich-text-body></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-excerpt"));
+        assert!(markdown.contains("hidden: true"));
+        assert!(markdown.contains("---"));
+        assert!(markdown.contains("Hello"));
+        assert!(markdown.contains("- World"));
+    }
+
+    #[test]
+    fn toc_macros_export_to_toc_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="toc"><ac:parameter ac:name="maxLevel">3</ac:parameter><ac:parameter ac:name="style">square</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-toc"));
+        assert!(markdown.contains("maxLevel: 3"));
+        assert!(markdown.contains("style: square"));
+    }
+
+    #[test]
     fn layouts_export_to_section_blocks() {
         let storage = r#"<ac:layout><ac:layout-section ac:type="two_equal" ac:breakout-mode="default"><ac:layout-cell><h2>Left</h2><p>Alpha</p></ac:layout-cell><ac:layout-cell><p>Right</p></ac:layout-cell></ac:layout-section><ac:layout-section ac:type="single"><ac:layout-cell><p>Bottom</p></ac:layout-cell></ac:layout-section></ac:layout>"#;
         let markdown = storage_to_markdown(storage);
@@ -1756,6 +1932,46 @@ mod tests {
         assert!(rendered.storage.contains("<ac:rich-text-body>"));
         assert!(rendered.storage.contains("<h2>Heads up</h2>"));
         assert!(rendered.storage.contains("<p>Body text.</p>"));
+    }
+
+    #[test]
+    fn excerpt_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-excerpt\nhidden: true\n---\n## Heads up\n\nBody text.\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("excerpt block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="excerpt">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="hidden">true</ac:parameter>"#)
+        );
+        assert!(rendered.storage.contains("<ac:rich-text-body>"));
+        assert!(rendered.storage.contains("<h2>Heads up</h2>"));
+        assert!(rendered.storage.contains("<p>Body text.</p>"));
+    }
+
+    #[test]
+    fn toc_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-toc\nmaxLevel: 3\nstyle: square\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("toc block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="toc">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="maxLevel">3</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="style">square</ac:parameter>"#)
+        );
     }
 
     #[test]
