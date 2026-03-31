@@ -648,7 +648,7 @@ fn e2e_cli_lifecycle() {
     fs::write(
         macro_source_dir.join("index.md"),
         format!(
-            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
+            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
             space = cfg.space
         ),
     )
@@ -656,7 +656,7 @@ fn e2e_cli_lifecycle() {
     fs::write(
         macro_target_dir.join("index.md"),
         format!(
-            "---\ntitle: {macro_target_title}\ntype: page\nlabels:\n  - e2e-macro-target\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Shared Excerpt\n\nPulled and reapplied through the e2e macro test.\n"
+            "---\ntitle: {macro_target_title}\ntype: page\nlabels:\n  - e2e-macro-target\n  - e2e-content-properties\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Shared Excerpt\n\nPulled and reapplied through the e2e macro test.\n\n:::confluence-content-properties\nid: decision\n---\n| Field | Value |\n| --- | --- |\n| Owner | Ada |\n| Status | Approved |\n:::\n"
         ),
     )
     .expect("write macro target markdown");
@@ -814,6 +814,16 @@ fn e2e_cli_lifecycle() {
         "expected content-by-label cql to survive storage rendering: {macro_source_body}"
     );
     assert!(
+        macro_source_body.contains(r#"ac:name="detailssummary""#),
+        "expected content-properties-report macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body
+            .contains(r#"<ac:parameter ac:name="label">e2e-content-properties</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="id">decision</ac:parameter>"#),
+        "expected content-properties-report parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
         macro_source_body.contains(r#"ac:name="recently-updated""#),
         "expected recently-updated macro in source body: {macro_source_body}"
     );
@@ -908,6 +918,24 @@ fn e2e_cli_lifecycle() {
         "expected related-labels labels parameter to survive storage rendering: {macro_source_body}"
     );
 
+    let macro_target_get = cfg.run_json(&["page", "get", &macro_target_id, "--show-body"]);
+    let macro_target_body = string_field(
+        first_item(&macro_target_get, "macro target get"),
+        "body_storage",
+    );
+    assert!(
+        macro_target_body.contains(r#"ac:name="details""#),
+        "expected content-properties macro in target body: {macro_target_body}"
+    );
+    assert!(
+        macro_target_body.contains(r#"<ac:parameter ac:name="id">decision</ac:parameter>"#)
+            && macro_target_body.contains("<ac:rich-text-body>")
+            && macro_target_body.contains("<table>")
+            && macro_target_body.contains("<th>Field</th>")
+            && macro_target_body.contains("<td>Ada</td>"),
+        "expected content-properties parameters and table body to survive storage rendering: {macro_target_body}"
+    );
+
     let macro_pull_arg = macro_pull_dir.to_string_lossy().into_owned();
     cfg.run(&["pull", "tree", &macro_root_id, &macro_pull_arg]);
     let pulled_macro_source = find_index_md_by_title(&macro_pull_dir, &macro_source_title);
@@ -969,6 +997,15 @@ fn e2e_cli_lifecycle() {
         "expected pulled content-by-label cql to survive export: {pulled_macro_source_markdown}"
     );
     assert!(
+        pulled_macro_source_markdown.contains(":::confluence-content-properties-report"),
+        "expected pulled macro source to preserve content-properties-report block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("label: e2e-content-properties")
+            && pulled_macro_source_markdown.contains("id: decision"),
+        "expected pulled content-properties-report parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
         pulled_macro_source_markdown.contains(":::confluence-recently-updated"),
         "expected pulled macro source to preserve recently-updated block: {pulled_macro_source_markdown}"
     );
@@ -1027,6 +1064,21 @@ fn e2e_cli_lifecycle() {
     assert!(
         pulled_macro_source_markdown.contains("labels: e2e-macro-target"),
         "expected pulled related-labels labels parameter to survive export: {pulled_macro_source_markdown}"
+    );
+
+    let pulled_macro_target = find_index_md_by_title(&macro_pull_dir, &macro_target_title);
+    let pulled_macro_target_markdown =
+        fs::read_to_string(&pulled_macro_target).expect("read pulled macro target markdown");
+    assert!(
+        pulled_macro_target_markdown.contains(":::confluence-content-properties"),
+        "expected pulled macro target to preserve content-properties block: {pulled_macro_target_markdown}"
+    );
+    assert!(
+        pulled_macro_target_markdown.contains("id: decision")
+            && pulled_macro_target_markdown.contains("| Field | Value |")
+            && pulled_macro_target_markdown.contains("| Owner | Ada |")
+            && pulled_macro_target_markdown.contains("| Status | Approved |"),
+        "expected pulled content-properties parameters and table to survive export: {pulled_macro_target_markdown}"
     );
 
     let macro_plan = cfg.run_json(&["plan", &macro_pull_arg]);

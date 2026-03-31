@@ -594,6 +594,12 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "excerpt" {
         return render_excerpt_macro_block(node, source);
     }
+    if matches!(name, "details" | "content-properties") {
+        return render_excerpt_macro_block_named("content-properties", node, source);
+    }
+    if matches!(name, "detailssummary" | "content-properties-report") {
+        return render_parameter_only_macro_block("content-properties-report", node);
+    }
     if name == "excerpt-include" {
         return render_page_reference_macro_block("excerpt-include", node);
     }
@@ -1499,6 +1505,8 @@ fn replace_parameterized_colon_macro_blocks(
         let trimmed = lines[index].trim();
         let macro_name = match trimmed {
             ":::confluence-excerpt" => Some("excerpt"),
+            ":::confluence-content-properties" => Some("content-properties"),
+            ":::confluence-content-properties-report" => Some("content-properties-report"),
             ":::confluence-toc-zone" => Some("toc-zone"),
             ":::confluence-toc" => Some("toc"),
             ":::confluence-children" => Some("children"),
@@ -1539,6 +1547,21 @@ fn replace_parameterized_colon_macro_blocks(
                 let (parameters, body_storage) =
                     parse_rich_text_macro_block("confluence excerpt macro", &body, allow_lossy)?;
                 build_rich_text_macro_storage("excerpt", &parameters, &body_storage)
+            }
+            "content-properties" => {
+                let (parameters, body_storage) = parse_rich_text_macro_block(
+                    "confluence content-properties macro",
+                    &body,
+                    allow_lossy,
+                )?;
+                build_legacy_rich_text_macro_storage("details", &parameters, &body_storage)
+            }
+            "content-properties-report" => {
+                let parameters = parse_macro_parameter_lines(
+                    &body,
+                    "confluence content-properties-report macro",
+                )?;
+                build_legacy_parameter_only_macro_storage("detailssummary", &parameters)
             }
             "toc-zone" => {
                 let (parameters, body_storage) =
@@ -1869,9 +1892,28 @@ fn build_rich_text_macro_storage(
     )
 }
 
+fn build_legacy_rich_text_macro_storage(
+    name: &str,
+    parameters: &BTreeMap<String, String>,
+    body_storage: &str,
+) -> String {
+    let parameters_xml = build_macro_parameters_xml(parameters);
+    format!(
+        r#"<ac:macro ac:name="{name}">{parameters_xml}<ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:macro>"#
+    )
+}
+
 fn build_parameter_only_macro_storage(name: &str, parameters: &BTreeMap<String, String>) -> String {
     let parameters_xml = build_macro_parameters_xml(parameters);
     format!(r#"<ac:structured-macro ac:name="{name}">{parameters_xml}</ac:structured-macro>"#)
+}
+
+fn build_legacy_parameter_only_macro_storage(
+    name: &str,
+    parameters: &BTreeMap<String, String>,
+) -> String {
+    let parameters_xml = build_macro_parameters_xml(parameters);
+    format!(r#"<ac:macro ac:name="{name}">{parameters_xml}</ac:macro>"#)
 }
 
 fn build_simple_macro_storage(name: &str) -> String {
@@ -2325,6 +2367,25 @@ mod tests {
     }
 
     #[test]
+    fn content_properties_macros_export_to_blocks() {
+        let storage = r#"<ac:macro ac:name="details"><ac:parameter ac:name="id">decision</ac:parameter><ac:rich-text-body><table><tbody><tr><th>Owner</th><td>Ada</td></tr><tr><th>Status</th><td>Approved</td></tr></tbody></table></ac:rich-text-body></ac:macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-content-properties"));
+        assert!(markdown.contains("id: decision"));
+        assert!(markdown.contains("| Owner | Ada |"));
+        assert!(markdown.contains("| Status | Approved |"));
+    }
+
+    #[test]
+    fn content_properties_report_macros_export_to_blocks() {
+        let storage = r#"<ac:macro ac:name="detailssummary"><ac:parameter ac:name="label">decision-record</ac:parameter><ac:parameter ac:name="id">decision</ac:parameter></ac:macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-content-properties-report"));
+        assert!(markdown.contains("label: decision-record"));
+        assert!(markdown.contains("id: decision"));
+    }
+
+    #[test]
     fn toc_zone_macros_export_to_blocks() {
         let storage = r#"<ac:structured-macro ac:name="toc-zone"><ac:parameter ac:name="location">top</ac:parameter><ac:parameter ac:name="maxLevel">3</ac:parameter><ac:rich-text-body><h2>Scoped Heading</h2><p>Only this section counts.</p></ac:rich-text-body></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
@@ -2604,6 +2665,46 @@ mod tests {
         assert!(rendered.storage.contains("<ac:rich-text-body>"));
         assert!(rendered.storage.contains("<h2>Heads up</h2>"));
         assert!(rendered.storage.contains("<p>Body text.</p>"));
+    }
+
+    #[test]
+    fn content_properties_blocks_round_trip_back_to_legacy_macros() {
+        let markdown = ":::confluence-content-properties\nid: decision\n---\n| Field | Value |\n| --- | --- |\n| Owner | Ada |\n| Status | Approved |\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("content-properties block converts");
+        assert!(rendered.storage.contains(r#"<ac:macro ac:name="details">"#));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="id">decision</ac:parameter>"#)
+        );
+        assert!(rendered.storage.contains("<ac:rich-text-body>"));
+        assert!(rendered.storage.contains("<table>"));
+        assert!(rendered.storage.contains("<th>Field</th>"));
+        assert!(rendered.storage.contains("<td>Ada</td>"));
+    }
+
+    #[test]
+    fn content_properties_report_blocks_round_trip_back_to_legacy_macros() {
+        let markdown =
+            ":::confluence-content-properties-report\nlabel: decision-record\nid: decision\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("content-properties-report block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:macro ac:name="detailssummary">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="label">decision-record</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="id">decision</ac:parameter>"#)
+        );
     }
 
     #[test]
