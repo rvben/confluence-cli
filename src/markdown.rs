@@ -151,8 +151,9 @@ fn storage_to_markdown_fallback(storage: &str) -> String {
 }
 
 pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<ConversionOutput> {
+    let (normalized_layouts, layout_fragments) = replace_layout_blocks(markdown, allow_lossy)?;
     let (normalized_macros, macro_fragments) =
-        replace_confluence_macro_blocks(markdown, allow_lossy)?;
+        replace_confluence_macro_blocks(&normalized_layouts, allow_lossy)?;
     let block_re = Regex::new(r"(?s)```confluence-storage\s*\n(.*?)\n```")?;
     let mut raw_fragments = Vec::new();
     let normalized = block_re
@@ -172,6 +173,14 @@ pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<Conversi
             &fragment,
         );
         html_output = html_output.replace(&format!("CONFLUENCE_XML_PLACEHOLDER_{idx}"), &fragment);
+    }
+    for (idx, fragment) in layout_fragments.into_iter().enumerate() {
+        html_output = html_output.replace(
+            &format!("<p>CONFLUENCE_LAYOUT_PLACEHOLDER_{idx}</p>"),
+            &fragment,
+        );
+        html_output =
+            html_output.replace(&format!("CONFLUENCE_LAYOUT_PLACEHOLDER_{idx}"), &fragment);
     }
     for (idx, fragment) in macro_fragments.into_iter().enumerate() {
         html_output = html_output.replace(
@@ -265,11 +274,79 @@ fn render_confluence_block(node: Node<'_, '_>, source: &str) -> Option<String> {
     }
 
     match node.tag_name().name() {
+        "layout" => render_layout(node, source),
         "task-list" => render_task_list(node, source),
         "structured-macro" => render_supported_macro_block(node, source),
         "image" | "link" => render_inline_node(node, source).map(|value| value.trim().to_string()),
         _ => Some(confluence_raw_block(raw_xml_fragment(node, source))),
     }
+}
+
+fn render_layout(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let sections: Vec<_> = node
+        .children()
+        .filter(|child| {
+            child.is_element()
+                && child.tag_name().namespace() == Some(AC_NS)
+                && child.tag_name().name() == "layout-section"
+        })
+        .collect();
+    if sections.is_empty() {
+        return None;
+    }
+    if node.children().any(|child| {
+        child.is_element()
+            && (child.tag_name().namespace() != Some(AC_NS)
+                || child.tag_name().name() != "layout-section")
+    }) {
+        return Some(confluence_raw_block(raw_xml_fragment(node, source)));
+    }
+
+    let mut rendered_sections = Vec::new();
+    for section in sections {
+        let mut attrs = section.attributes();
+        let section_type = section.attribute((AC_NS, "type"))?;
+        let breakout_mode = section.attribute((AC_NS, "breakout-mode"));
+        if attrs.any(|attr| {
+            attr.namespace() != Some(AC_NS) || !matches!(attr.name(), "type" | "breakout-mode")
+        }) {
+            return Some(confluence_raw_block(raw_xml_fragment(node, source)));
+        }
+        let cells: Vec<_> = section
+            .children()
+            .filter(|child| {
+                child.is_element()
+                    && child.tag_name().namespace() == Some(AC_NS)
+                    && child.tag_name().name() == "layout-cell"
+            })
+            .collect();
+        if cells.is_empty()
+            || section.children().any(|child| {
+                child.is_element()
+                    && (child.tag_name().namespace() != Some(AC_NS)
+                        || child.tag_name().name() != "layout-cell")
+            })
+        {
+            return Some(confluence_raw_block(raw_xml_fragment(node, source)));
+        }
+
+        let mut block = format!("~~~~confluence-layout-section {section_type}\n");
+        if let Some(breakout_mode) = breakout_mode.filter(|value| !value.is_empty()) {
+            block.push_str(&format!("breakout-mode: {breakout_mode}\n"));
+        }
+        for cell in cells {
+            block.push_str("--- cell ---\n");
+            let cell_markdown = storage_to_markdown(&inner_xml_fragment(cell, source));
+            if !cell_markdown.trim().is_empty() {
+                block.push_str(cell_markdown.trim());
+                block.push('\n');
+            }
+        }
+        block.push_str("~~~~");
+        rendered_sections.push(block);
+    }
+
+    Some(rendered_sections.join("\n\n"))
 }
 
 fn render_container_blocks(node: Node<'_, '_>, source: &str) -> Option<String> {
@@ -1155,6 +1232,167 @@ fn replace_confluence_macro_blocks(
     Ok((code_normalized, fragments))
 }
 
+fn replace_layout_blocks(markdown: &str, allow_lossy: bool) -> Result<(String, Vec<String>)> {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut fragments = Vec::new();
+    let mut output = String::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        if !lines[index]
+            .trim_start()
+            .starts_with("~~~~confluence-layout-section")
+        {
+            output.push_str(lines[index]);
+            output.push('\n');
+            index += 1;
+            continue;
+        }
+
+        let (next_index, layout_storage) = parse_layout_group(&lines, index, allow_lossy)?;
+        let idx = fragments.len();
+        fragments.push(layout_storage);
+        output.push_str(&format!("CONFLUENCE_LAYOUT_PLACEHOLDER_{idx}\n"));
+        index = next_index;
+    }
+
+    if !markdown.ends_with('\n') && output.ends_with('\n') {
+        output.pop();
+    }
+
+    Ok((output, fragments))
+}
+
+fn parse_layout_group(lines: &[&str], start: usize, allow_lossy: bool) -> Result<(usize, String)> {
+    let mut index = start;
+    let mut sections = Vec::new();
+
+    loop {
+        let (next_index, section_storage) = parse_layout_section_block(lines, index, allow_lossy)?;
+        sections.push(section_storage);
+        index = next_index;
+
+        let mut scan = index;
+        while scan < lines.len() && lines[scan].trim().is_empty() {
+            scan += 1;
+        }
+        if scan >= lines.len()
+            || !lines[scan]
+                .trim_start()
+                .starts_with("~~~~confluence-layout-section")
+        {
+            index = scan;
+            break;
+        }
+        index = scan;
+    }
+
+    Ok((
+        index,
+        format!("<ac:layout>{}</ac:layout>", sections.join("")),
+    ))
+}
+
+fn parse_layout_section_block(
+    lines: &[&str],
+    start: usize,
+    allow_lossy: bool,
+) -> Result<(usize, String)> {
+    let header = lines
+        .get(start)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("missing layout section header"))?;
+    let section_re = Regex::new(r"^~~~~confluence-layout-section(?:[ \t]+([^\n]+))?[ \t]*$")?;
+    let captures = section_re
+        .captures(header.trim_end())
+        .ok_or_else(|| anyhow::anyhow!("invalid confluence layout section header: {header}"))?;
+    let section_type = captures
+        .get(1)
+        .map(|m| m.as_str().trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing layout section type in: {header}"))?;
+
+    let mut body_lines = Vec::new();
+    let mut index = start + 1;
+    while index < lines.len() && lines[index].trim_end() != "~~~~" {
+        body_lines.push(lines[index]);
+        index += 1;
+    }
+    if index >= lines.len() {
+        bail!("unterminated confluence layout section `{section_type}`");
+    }
+
+    let (metadata, cells) = parse_layout_section_body(&body_lines)?;
+    let mut attrs = vec![format!(r#"ac:type="{}""#, escape_xml(section_type))];
+    if let Some(breakout_mode) = metadata.get("breakout-mode") {
+        attrs.push(format!(
+            r#"ac:breakout-mode="{}""#,
+            escape_xml(breakout_mode)
+        ));
+    }
+    let cells_xml = cells
+        .into_iter()
+        .map(|cell| {
+            let body_storage = markdown_to_storage(&cell, allow_lossy)?.storage;
+            Ok(format!("<ac:layout-cell>{body_storage}</ac:layout-cell>"))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join("");
+
+    Ok((
+        index + 1,
+        format!(
+            r#"<ac:layout-section {}>{}</ac:layout-section>"#,
+            attrs.join(" "),
+            cells_xml
+        ),
+    ))
+}
+
+fn parse_layout_section_body(lines: &[&str]) -> Result<(BTreeMap<String, String>, Vec<String>)> {
+    let mut metadata = BTreeMap::new();
+    let mut cells = Vec::new();
+    let mut current_cell = Vec::new();
+    let mut saw_cell = false;
+
+    for line in lines {
+        if line.trim_end() == "--- cell ---" {
+            if saw_cell {
+                cells.push(current_cell.join("\n").trim_end().to_string());
+                current_cell.clear();
+            } else {
+                saw_cell = true;
+            }
+            continue;
+        }
+
+        if !saw_cell {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = trimmed.split_once(':') else {
+                bail!("invalid confluence layout metadata line: {trimmed}");
+            };
+            let name = name.trim();
+            if name != "breakout-mode" {
+                bail!("unsupported confluence layout metadata key: {name}");
+            }
+            metadata.insert(name.to_string(), value.trim().to_string());
+            continue;
+        }
+
+        current_cell.push(*line);
+    }
+
+    if !saw_cell {
+        bail!("confluence layout section is missing `--- cell ---` delimiters");
+    }
+
+    cells.push(current_cell.join("\n").trim_end().to_string());
+    Ok((metadata, cells))
+}
+
 fn parse_code_macro_block(
     language: Option<&str>,
     block_body: &str,
@@ -1457,6 +1695,19 @@ mod tests {
     }
 
     #[test]
+    fn layouts_export_to_section_blocks() {
+        let storage = r#"<ac:layout><ac:layout-section ac:type="two_equal" ac:breakout-mode="default"><ac:layout-cell><h2>Left</h2><p>Alpha</p></ac:layout-cell><ac:layout-cell><p>Right</p></ac:layout-cell></ac:layout-section><ac:layout-section ac:type="single"><ac:layout-cell><p>Bottom</p></ac:layout-cell></ac:layout-section></ac:layout>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains("~~~~confluence-layout-section two_equal"));
+        assert!(markdown.contains("breakout-mode: default"));
+        assert!(markdown.contains("--- cell ---"));
+        assert!(markdown.contains("## Left"));
+        assert!(markdown.contains("Alpha"));
+        assert!(markdown.contains("~~~~confluence-layout-section single"));
+        assert!(markdown.contains("Bottom"));
+    }
+
+    #[test]
     fn supported_panel_macros_export_to_macro_blocks() {
         let storage = r#"<ac:structured-macro ac:name="info"><ac:rich-text-body><p>Hello</p><ul><li>World</li></ul></ac:rich-text-body></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
@@ -1505,6 +1756,45 @@ mod tests {
         assert!(rendered.storage.contains("<ac:rich-text-body>"));
         assert!(rendered.storage.contains("<h2>Heads up</h2>"));
         assert!(rendered.storage.contains("<p>Body text.</p>"));
+    }
+
+    #[test]
+    fn layout_section_blocks_round_trip_back_to_layout_storage() {
+        let markdown = r#"~~~~confluence-layout-section two_equal
+breakout-mode: default
+--- cell ---
+## Left
+
+Alpha
+--- cell ---
+:::confluence-info
+Right
+:::
+~~~~
+
+~~~~confluence-layout-section single
+--- cell ---
+Bottom
+~~~~"#;
+        let rendered = markdown_to_storage(markdown, false).expect("layout block converts");
+        assert!(rendered.storage.contains("<ac:layout>"));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:layout-section ac:type="two_equal" ac:breakout-mode="default">"#)
+        );
+        assert!(rendered.storage.contains("<ac:layout-cell><h2>Left</h2>"));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="info">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:layout-section ac:type="single">"#)
+        );
+        assert!(rendered.storage.contains("<p>Bottom</p>"));
     }
 
     #[test]
