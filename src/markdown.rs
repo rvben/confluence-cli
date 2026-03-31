@@ -663,6 +663,9 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "search" {
         return render_generic_alias_macro_block("search", node, source);
     }
+    if name == "navmap" {
+        return render_generic_alias_macro_block("navmap", node, source);
+    }
     if matches!(name, "tasks-report-macro" | "task-report") {
         return render_parameter_only_macro_block("task-report", node);
     }
@@ -1961,6 +1964,7 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-content-by-user" => Some("content-by-user"),
             ":::confluence-content-report-table" => Some("content-report-table"),
             ":::confluence-search" => Some("search"),
+            ":::confluence-navmap" => Some("navmap"),
             ":::confluence-task-report" => Some("task-report"),
             ":::confluence-recently-updated" => Some("recently-updated"),
             ":::confluence-livesearch" => Some("livesearch"),
@@ -2118,6 +2122,11 @@ fn replace_parameterized_colon_macro_blocks(
                 let (parameters, body_storage) =
                     parse_generic_macro_block("confluence search macro", &body, allow_lossy)?;
                 build_generic_macro_storage("search", &parameters, body_storage.as_deref())?
+            }
+            "navmap" => {
+                let (parameters, body_storage) =
+                    parse_generic_macro_block("confluence navmap macro", &body, allow_lossy)?;
+                build_generic_macro_storage("navmap", &parameters, body_storage.as_deref())?
             }
             "task-report" => {
                 let parameters =
@@ -3609,6 +3618,16 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
     }
 
     #[test]
+    fn navmap_macros_export_to_first_class_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="navmap"><ac:parameter ac:name="">Docs Home,Shared Excerpt</ac:parameter><ac:parameter ac:name="title">Macro navigation</ac:parameter><ac:parameter ac:name="wrapAfter">4</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-navmap"));
+        assert!(markdown.contains("$default: Docs Home,Shared Excerpt"));
+        assert!(markdown.contains("title: Macro navigation"));
+        assert!(markdown.contains("wrapAfter: 4"));
+    }
+
+    #[test]
     fn task_report_macros_export_to_blocks() {
         let storage = r#"<ac:structured-macro ac:name="tasks-report-macro"><ac:parameter ac:name="spaceAndPage">TEST</ac:parameter><ac:parameter ac:name="labels">e2e-macro-target</ac:parameter><ac:parameter ac:name="status">incomplete</ac:parameter><ac:parameter ac:name="pageSize">20</ac:parameter><ac:parameter ac:name="columns">description,assignee,location</ac:parameter><ac:parameter ac:name="sortBy">page title</ac:parameter><ac:parameter ac:name="reverseSort">false</ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
@@ -3733,6 +3752,10 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
             "<ac:parameter ac:name=\"contributor\"><ri:user ri:userkey=\"user-123\" /></ac:parameter>",
             "<ac:parameter ac:name=\"query\">docs</ac:parameter>",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"navmap\">",
+            "<ac:parameter ac:name=\"\">Docs Home,Shared Excerpt</ac:parameter>",
+            "<ac:parameter ac:name=\"title\">Macro navigation</ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"tasks-report-macro\">",
             "<ac:parameter ac:name=\"spaceAndPage\">TEST</ac:parameter>",
             "<ac:parameter ac:name=\"status\">incomplete</ac:parameter>",
@@ -3830,6 +3853,7 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
         assert!(markdown.contains(":::confluence-content-by-user"));
         assert!(markdown.contains(":::confluence-content-report-table"));
         assert!(markdown.contains(":::confluence-search"));
+        assert!(markdown.contains(":::confluence-navmap"));
         assert!(markdown.contains(":::confluence-task-report"));
         assert!(markdown.contains(":::confluence-recently-updated"));
         assert!(markdown.contains(":::confluence-livesearch"));
@@ -4679,6 +4703,32 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="query">docs</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn navmap_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-navmap\n$default: Docs Home,Shared Excerpt\ntitle: Macro navigation\nwrapAfter: 4\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("navmap block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="navmap">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="">Docs Home,Shared Excerpt</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="title">Macro navigation</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="wrapAfter">4</ac:parameter>"#)
         );
     }
 
