@@ -720,18 +720,21 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "status" {
         return render_status_macro(node);
     }
-    if !matches!(name, "info" | "note" | "tip" | "warning") {
-        return Some(confluence_raw_block(raw_xml_fragment(node, source)));
-    }
-    let body = namespaced_child(node, AC_NS, "rich-text-body")?;
-    let body_markdown = storage_to_markdown(&inner_xml_fragment(body, source));
-    if body_markdown.trim().is_empty() {
-        Some(format!(":::confluence-{name}\n:::"))
+    if matches!(name, "info" | "note" | "tip" | "warning") {
+        let body = namespaced_child(node, AC_NS, "rich-text-body")?;
+        let body_markdown = storage_to_markdown(&inner_xml_fragment(body, source));
+        if body_markdown.trim().is_empty() {
+            Some(format!(":::confluence-{name}\n:::"))
+        } else {
+            Some(format!(
+                ":::confluence-{name}\n{}\n:::",
+                body_markdown.trim()
+            ))
+        }
+    } else if let Some(markdown) = render_generic_macro_block(node, source) {
+        Some(markdown)
     } else {
-        Some(format!(
-            ":::confluence-{name}\n{}\n:::",
-            body_markdown.trim()
-        ))
+        Some(confluence_raw_block(raw_xml_fragment(node, source)))
     }
 }
 
@@ -957,6 +960,70 @@ fn render_parameter_only_macro_block_with_parameters(
     let mut markdown = format!(":::confluence-{name}\n");
     for (parameter, value) in parameters {
         markdown.push_str(&format!("{parameter}: {value}\n"));
+    }
+    markdown.push_str(":::");
+    markdown
+}
+
+fn render_generic_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let name = node.attribute((AC_NS, "name"))?;
+    if !macro_parameters_are_plain_text(node) {
+        return None;
+    }
+    let rich_text_body = namespaced_child(node, AC_NS, "rich-text-body");
+    if node.children().any(|child| {
+        child.is_element()
+            && !matches!(
+                (child.tag_name().namespace(), child.tag_name().name()),
+                (Some(AC_NS), "parameter") | (Some(AC_NS), "rich-text-body")
+            )
+    }) {
+        return None;
+    }
+
+    let parameters = collect_macro_parameters(node);
+    let body_markdown = rich_text_body.map(|body| storage_to_markdown(&inner_xml_fragment(body, source)));
+    Some(render_generic_macro_block_with_parameters(
+        name,
+        &parameters,
+        body_markdown.as_deref(),
+    ))
+}
+
+fn macro_parameters_are_plain_text(node: Node<'_, '_>) -> bool {
+    node.children()
+        .filter(|child| {
+            child.is_element()
+                && child.tag_name().namespace() == Some(AC_NS)
+                && child.tag_name().name() == "parameter"
+        })
+        .all(|parameter| {
+            parameter.children().all(|child| {
+                if matches!(child.node_type(), NodeType::Text | NodeType::Comment) {
+                    true
+                } else {
+                    !child.is_element()
+                }
+            })
+        })
+}
+
+fn render_generic_macro_block_with_parameters(
+    name: &str,
+    parameters: &BTreeMap<String, String>,
+    body_markdown: Option<&str>,
+) -> String {
+    let mut markdown = format!(":::confluence-macro {name}\n");
+    for (parameter_name, parameter_value) in parameters {
+        markdown.push_str(&format!("{parameter_name}: {parameter_value}\n"));
+    }
+    if let Some(body_markdown) = body_markdown {
+        markdown.push_str("---\n");
+        let trimmed = body_markdown.trim();
+        if !trimmed.is_empty() {
+            markdown.push_str(trimmed);
+            markdown.push('\n');
+        }
     }
     markdown.push_str(":::");
     markdown
@@ -1711,6 +1778,10 @@ fn replace_parameterized_colon_macro_blocks(
 
     while index < lines.len() {
         let trimmed = lines[index].trim();
+        let generic_macro_name = trimmed
+            .strip_prefix(":::confluence-macro ")
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
         let macro_name = match trimmed {
             ":::confluence-excerpt" => Some("excerpt"),
             ":::confluence-content-properties" => Some("content-properties"),
@@ -1753,12 +1824,12 @@ fn replace_parameterized_colon_macro_blocks(
             _ => None,
         };
 
-        let Some(macro_name) = macro_name else {
+        if macro_name.is_none() && generic_macro_name.is_none() {
             output.push_str(lines[index]);
             output.push('\n');
             index += 1;
             continue;
-        };
+        }
 
         let mut body_lines = Vec::new();
         index += 1;
@@ -1766,12 +1837,13 @@ fn replace_parameterized_colon_macro_blocks(
             body_lines.push(lines[index]);
             index += 1;
         }
+        let macro_label = macro_name.or(generic_macro_name).unwrap_or("macro");
         if index >= lines.len() {
-            bail!("unterminated confluence {macro_name} block");
+            bail!("unterminated confluence {macro_label} block");
         }
 
         let body = body_lines.join("\n");
-        let fragment = match macro_name {
+        let fragment = match macro_name.unwrap_or("__generic__") {
             "excerpt" => {
                 let (parameters, body_storage) =
                     parse_rich_text_macro_block("confluence excerpt macro", &body, allow_lossy)?;
@@ -1984,7 +2056,20 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters = parse_macro_parameter_lines(&body, "confluence network macro")?;
                 build_network_macro_storage(&parameters)
             }
-            _ => unreachable!(),
+            _ => {
+                let generic_name = generic_macro_name.expect("generic macro name");
+                let (parameters, body_storage) = parse_generic_macro_block(
+                    &format!("confluence macro `{generic_name}`"),
+                    &body,
+                    allow_lossy,
+                )?;
+                match body_storage {
+                    Some(body_storage) => {
+                        build_rich_text_macro_storage(generic_name, &parameters, &body_storage)
+                    }
+                    None => build_parameter_only_macro_storage(generic_name, &parameters),
+                }
+            }
         };
 
         let placeholder_index = fragments.len();
@@ -2018,6 +2103,26 @@ fn parse_rich_text_macro_block(
             markdown_to_storage(trimmed_body, allow_lossy)?.storage,
         ))
     }
+}
+
+fn parse_generic_macro_block(
+    context: &str,
+    block_body: &str,
+    allow_lossy: bool,
+) -> Result<(BTreeMap<String, String>, Option<String>)> {
+    let trimmed_body = block_body.trim_end_matches('\n');
+    if let Some(body_markdown) = trimmed_body.strip_prefix("---\n") {
+        let body_storage = markdown_to_storage(body_markdown, allow_lossy)?.storage;
+        return Ok((BTreeMap::new(), Some(body_storage)));
+    }
+    if let Some((header, body_markdown)) = trimmed_body.split_once("\n---\n") {
+        let parameters = parse_macro_parameter_lines(header, context)?;
+        let body_storage = markdown_to_storage(body_markdown, allow_lossy)?.storage;
+        return Ok((parameters, Some(body_storage)));
+    }
+
+    let parameters = parse_macro_parameter_lines(trimmed_body, context)?;
+    Ok((parameters, None))
 }
 
 fn parse_macro_parameter_lines(body: &str, context: &str) -> Result<BTreeMap<String, String>> {
@@ -2807,7 +2912,7 @@ mod tests {
 
     #[test]
     fn storage_macro_round_trips_through_sentinel_block() {
-        let storage = r#"<p>Hello</p><ac:structured-macro ac:name="chart" />"#;
+        let storage = r#"<p>Hello</p><ac:structured-macro ac:name="chart"><ac:parameter ac:name="attachment"><ri:attachment ri:filename="data.csv" /></ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("```confluence-storage"));
         let rendered = markdown_to_storage(&markdown, false).expect("conversion succeeds");
@@ -2816,7 +2921,7 @@ mod tests {
 
     #[test]
     fn mixed_content_preserves_only_unsupported_confluence_fragments() {
-        let storage = r#"<h1>Title</h1><ac:structured-macro ac:name="chart" /><p>After</p>"#;
+        let storage = r#"<h1>Title</h1><ac:structured-macro ac:name="chart"><ac:parameter ac:name="attachment"><ri:attachment ri:filename="data.csv" /></ac:parameter></ac:structured-macro><p>After</p>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("# Title"));
         assert!(markdown.contains("```confluence-storage"));
@@ -3258,6 +3363,25 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
     }
 
     #[test]
+    fn unsupported_plain_parameter_macros_export_to_generic_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="userlister"><ac:parameter ac:name="group">confluence-users</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-macro userlister"));
+        assert!(markdown.contains("group: confluence-users"));
+    }
+
+    #[test]
+    fn unsupported_rich_text_macros_export_to_generic_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="custom-rich"><ac:parameter ac:name="mode">summary</ac:parameter><ac:rich-text-body><h2>Heads up</h2><p>Body text.</p></ac:rich-text-body></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-macro custom-rich"));
+        assert!(markdown.contains("mode: summary"));
+        assert!(markdown.contains("---"));
+        assert!(markdown.contains("## Heads up"));
+        assert!(markdown.contains("Body text."));
+    }
+
+    #[test]
     fn whitespace_between_supported_blocks_does_not_force_fallback_export() {
         let storage = concat!(
             "<h1>Macro Source</h1>\n",
@@ -3359,6 +3483,9 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
             "<ac:structured-macro ac:name=\"related-labels\">",
             "<ac:parameter ac:name=\"labels\">docs</ac:parameter>",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"userlister\">",
+            "<ac:parameter ac:name=\"group\">confluence-users</ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"children\">",
             "<ac:parameter ac:name=\"all\">true</ac:parameter>",
             "</ac:structured-macro>"
@@ -3398,6 +3525,7 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
         assert!(markdown.contains(":::confluence-labels-list"));
         assert!(markdown.contains(":::confluence-popular-labels"));
         assert!(markdown.contains(":::confluence-related-labels"));
+        assert!(markdown.contains(":::confluence-macro userlister"));
         assert!(markdown.contains(":::confluence-children"));
         assert!(!markdown.contains("CONFLUENCE_XML_PLACEHOLDER"));
     }
@@ -4204,6 +4332,44 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
                 .storage
                 .contains(r#"<ac:parameter ac:name="reverseSort">false</ac:parameter>"#)
         );
+    }
+
+    #[test]
+    fn generic_parameter_only_macro_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-macro userlister\ngroup: confluence-users\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("generic parameter macro converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="userlister">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="group">confluence-users</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn generic_rich_text_macro_blocks_round_trip_back_to_structured_macros() {
+        let markdown =
+            ":::confluence-macro custom-rich\nmode: summary\n---\n## Heads up\n\nBody text.\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("generic rich-text macro converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="custom-rich">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="mode">summary</ac:parameter>"#)
+        );
+        assert!(rendered.storage.contains("<ac:rich-text-body>"));
+        assert!(rendered.storage.contains("<h2>Heads up</h2>"));
+        assert!(rendered.storage.contains("<p>Body text.</p>"));
     }
 
     #[test]
