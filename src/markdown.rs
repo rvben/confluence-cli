@@ -651,6 +651,12 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "contentbylabel" {
         return render_parameter_only_macro_block("content-by-label", node);
     }
+    if name == "content-report-table" {
+        return render_spaces_macro_block("content-report-table", node);
+    }
+    if matches!(name, "tasks-report-macro" | "task-report") {
+        return render_parameter_only_macro_block("task-report", node);
+    }
     if name == "recently-updated" || name == "recentlyupdated" {
         return render_recently_updated_macro_block(node);
     }
@@ -1726,6 +1732,8 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-page-tree" => Some("page-tree"),
             ":::confluence-page-tree-search" => Some("page-tree-search"),
             ":::confluence-content-by-label" => Some("content-by-label"),
+            ":::confluence-content-report-table" => Some("content-report-table"),
+            ":::confluence-task-report" => Some("task-report"),
             ":::confluence-recently-updated" => Some("recently-updated"),
             ":::confluence-livesearch" => Some("livesearch"),
             ":::confluence-page-index" => Some("page-index"),
@@ -1868,6 +1876,18 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters =
                     parse_macro_parameter_lines(&body, "confluence content-by-label macro")?;
                 build_parameter_only_macro_storage("contentbylabel", &parameters)
+            }
+            "content-report-table" => {
+                let parameters = parse_macro_parameter_lines(
+                    &body,
+                    "confluence content-report-table macro",
+                )?;
+                build_spaces_macro_storage("content-report-table", &parameters)
+            }
+            "task-report" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence task-report macro")?;
+                build_parameter_only_macro_storage("tasks-report-macro", &parameters)
             }
             "recently-updated" => {
                 let parameters =
@@ -3178,6 +3198,30 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
     }
 
     #[test]
+    fn content_report_table_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="content-report-table"><ac:parameter ac:name="labels">e2e-macro-target</ac:parameter><ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="maxResults">5</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-content-report-table"));
+        assert!(markdown.contains("labels: e2e-macro-target"));
+        assert!(markdown.contains("spaces: TEST"));
+        assert!(markdown.contains("maxResults: 5"));
+    }
+
+    #[test]
+    fn task_report_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="tasks-report-macro"><ac:parameter ac:name="spaceAndPage">TEST</ac:parameter><ac:parameter ac:name="labels">e2e-macro-target</ac:parameter><ac:parameter ac:name="status">incomplete</ac:parameter><ac:parameter ac:name="pageSize">20</ac:parameter><ac:parameter ac:name="columns">description,assignee,location</ac:parameter><ac:parameter ac:name="sortBy">page title</ac:parameter><ac:parameter ac:name="reverseSort">false</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-task-report"));
+        assert!(markdown.contains("spaceAndPage: TEST"));
+        assert!(markdown.contains("labels: e2e-macro-target"));
+        assert!(markdown.contains("status: incomplete"));
+        assert!(markdown.contains("pageSize: 20"));
+        assert!(markdown.contains("columns: description,assignee,location"));
+        assert!(markdown.contains("sortBy: page title"));
+        assert!(markdown.contains("reverseSort: false"));
+    }
+
+    #[test]
     fn recently_updated_macros_export_to_blocks() {
         let storage = r#"<ac:structured-macro ac:name="recently-updated"><ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="max">10</ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
@@ -3231,6 +3275,14 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
             "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"contentbylabel\">",
             "<ac:parameter ac:name=\"cql\">label = &quot;e2e-macro-target&quot;</ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"content-report-table\">",
+            "<ac:parameter ac:name=\"labels\">e2e-macro-target</ac:parameter>",
+            "<ac:parameter ac:name=\"spaces\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"tasks-report-macro\">",
+            "<ac:parameter ac:name=\"spaceAndPage\">TEST</ac:parameter>",
+            "<ac:parameter ac:name=\"status\">incomplete</ac:parameter>",
             "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"recently-updated\">",
             "<ac:parameter ac:name=\"spaces\">TEST</ac:parameter>",
@@ -3318,6 +3370,8 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
         assert!(markdown.contains(":::confluence-page-tree"));
         assert!(markdown.contains(":::confluence-page-tree-search"));
         assert!(markdown.contains(":::confluence-content-by-label"));
+        assert!(markdown.contains(":::confluence-content-report-table"));
+        assert!(markdown.contains(":::confluence-task-report"));
         assert!(markdown.contains(":::confluence-recently-updated"));
         assert!(markdown.contains(":::confluence-livesearch"));
         assert!(markdown.contains(":::confluence-page-index"));
@@ -4075,6 +4129,80 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="maxResults">5</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn content_report_table_blocks_round_trip_back_to_structured_macros() {
+        let markdown =
+            ":::confluence-content-report-table\nlabels: e2e-macro-target\nspaces: TEST\nmaxResults: 5\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("content-report-table block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="content-report-table">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="labels">e2e-macro-target</ac:parameter>"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter>"#
+        ));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="maxResults">5</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn task_report_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-task-report\nspaceAndPage: TEST\nlabels: e2e-macro-target\nstatus: incomplete\npageSize: 20\ncolumns: description,assignee,location\nsortBy: page title\nreverseSort: false\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("task-report block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="tasks-report-macro">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="spaceAndPage">TEST</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="labels">e2e-macro-target</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="status">incomplete</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="pageSize">20</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(
+                    r#"<ac:parameter ac:name="columns">description,assignee,location</ac:parameter>"#
+                )
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="sortBy">page title</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="reverseSort">false</ac:parameter>"#)
         );
     }
 

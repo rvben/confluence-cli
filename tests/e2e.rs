@@ -795,7 +795,7 @@ fn e2e_cli_lifecycle() {
     fs::write(
         macro_source_dir.join("index.md"),
         format!(
-            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-view-file\nattachment: preview.pdf\n:::\n\n:::confluence-view-doc\npage: ../target/index.md\nattachment: manual.docx\n:::\n\n:::confluence-view-xls\nattachment: sheet.xlsx\n:::\n\n:::confluence-view-ppt\nattachment: slides.pptx\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-contributors\nspaces: {space},@personal\nlabels: e2e-macro-target\nmode: list\n:::\n\n:::confluence-contributors-summary\nspaces: {space}\ncolumns: edits,comments,labels\nlimit: 10\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nspaces: {space}\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-recently-used-labels\nscope: space\nstyle: cloud\n:::\n\n:::confluence-gallery\nsortBy: name\ncolumns: 2\n:::\n\n:::confluence-favorite-pages\n:::\n\n:::confluence-change-history\n:::\n\n:::confluence-spaces-list\nscope: all\nwidth: 80%\n:::\n\n:::confluence-space-details\nwidth: 50%\n:::\n\n:::confluence-space-attachments\nspace: {space}\nshowFilter: false\n:::\n\n~~~confluence-noformat\nnopanel: true\n---\n<xml>literal</xml>\nline 2\n~~~\n\n:::confluence-profile\nuser: {macro_user}\n:::\n\n:::confluence-status-list\nusername: {macro_user}\n:::\n\n:::confluence-network\nmode: followers\nusername: {macro_user}\nmax: 10\ntheme: full\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
+            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-report-table\nlabels: e2e-macro-target\nspaces: {space}\nmaxResults: 5\n:::\n\n:::confluence-task-report\nspaceAndPage: {space}\nlabels: e2e-macro-target\nstatus: incomplete\npageSize: 20\ncolumns: description,assignee,location\nsortBy: page title\nreverseSort: false\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-view-file\nattachment: preview.pdf\n:::\n\n:::confluence-view-doc\npage: ../target/index.md\nattachment: manual.docx\n:::\n\n:::confluence-view-xls\nattachment: sheet.xlsx\n:::\n\n:::confluence-view-ppt\nattachment: slides.pptx\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-contributors\nspaces: {space},@personal\nlabels: e2e-macro-target\nmode: list\n:::\n\n:::confluence-contributors-summary\nspaces: {space}\ncolumns: edits,comments,labels\nlimit: 10\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nspaces: {space}\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-recently-used-labels\nscope: space\nstyle: cloud\n:::\n\n:::confluence-gallery\nsortBy: name\ncolumns: 2\n:::\n\n:::confluence-favorite-pages\n:::\n\n:::confluence-change-history\n:::\n\n:::confluence-spaces-list\nscope: all\nwidth: 80%\n:::\n\n:::confluence-space-details\nwidth: 50%\n:::\n\n:::confluence-space-attachments\nspace: {space}\nshowFilter: false\n:::\n\n~~~confluence-noformat\nnopanel: true\n---\n<xml>literal</xml>\nline 2\n~~~\n\n:::confluence-profile\nuser: {macro_user}\n:::\n\n:::confluence-status-list\nusername: {macro_user}\n:::\n\n:::confluence-network\nmode: followers\nusername: {macro_user}\nmax: 10\ntheme: full\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
             space = cfg.space,
             macro_user = macro_user
         ),
@@ -960,6 +960,39 @@ fn e2e_cli_lifecycle() {
             r#"<ac:parameter ac:name="cql">label = &quot;e2e-macro-target&quot;</ac:parameter>"#
         ),
         "expected content-by-label cql to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="content-report-table""#),
+        "expected content-report-table macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body
+            .contains(r#"<ac:parameter ac:name="labels">e2e-macro-target</ac:parameter>"#)
+            && macro_source_body.contains(&format!(
+                r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="{}" /></ac:parameter>"#,
+                cfg.space
+            ))
+            && macro_source_body.contains(r#"<ac:parameter ac:name="maxResults">5</ac:parameter>"#),
+        "expected content-report-table parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="tasks-report-macro""#),
+        "expected task-report macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="spaceAndPage">{}</ac:parameter>"#,
+            cfg.space
+        )) && macro_source_body
+            .contains(r#"<ac:parameter ac:name="labels">e2e-macro-target</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="status">incomplete</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="pageSize">20</ac:parameter>"#)
+            && macro_source_body.contains(
+                r#"<ac:parameter ac:name="columns">description,assignee,location</ac:parameter>"#
+            )
+            && macro_source_body.contains(r#"<ac:parameter ac:name="sortBy">page title</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="reverseSort">false</ac:parameter>"#),
+        "expected task-report parameters to survive storage rendering: {macro_source_body}"
     );
     assert!(
         macro_source_body.contains(r#"ac:name="detailssummary""#),
@@ -1347,6 +1380,30 @@ fn e2e_cli_lifecycle() {
     assert!(
         pulled_macro_source_markdown.contains(r#"cql: label = "e2e-macro-target""#),
         "expected pulled content-by-label cql to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-content-report-table"),
+        "expected pulled macro source to preserve content-report-table block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("labels: e2e-macro-target")
+            && pulled_macro_source_markdown.contains(&format!("spaces: {}", cfg.space))
+            && pulled_macro_source_markdown.contains("maxResults: 5"),
+        "expected pulled content-report-table parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-task-report"),
+        "expected pulled macro source to preserve task-report block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(&format!("spaceAndPage: {}", cfg.space))
+            && pulled_macro_source_markdown.contains("labels: e2e-macro-target")
+            && pulled_macro_source_markdown.contains("status: incomplete")
+            && pulled_macro_source_markdown.contains("pageSize: 20")
+            && pulled_macro_source_markdown.contains("columns: description,assignee,location")
+            && pulled_macro_source_markdown.contains("sortBy: page title")
+            && pulled_macro_source_markdown.contains("reverseSort: false"),
+        "expected pulled task-report parameters to survive export: {pulled_macro_source_markdown}"
     );
     assert!(
         pulled_macro_source_markdown.contains(":::confluence-content-properties-report"),
