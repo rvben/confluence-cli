@@ -606,6 +606,9 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "contentbylabel" {
         return render_parameter_only_macro_block("content-by-label", node);
     }
+    if name == "recently-updated" || name == "recentlyupdated" {
+        return render_recently_updated_macro_block(node);
+    }
     if name == "toc" {
         return render_parameter_only_macro_block("toc", node);
     }
@@ -720,6 +723,23 @@ fn render_page_tree_search_macro_block(node: Node<'_, '_>) -> Option<String> {
     }
     Some(render_parameter_only_macro_block_with_parameters(
         "page-tree-search",
+        &parameters,
+    ))
+}
+
+fn render_recently_updated_macro_block(node: Node<'_, '_>) -> Option<String> {
+    let mut parameters = collect_macro_parameters(node);
+    if let Some(parameter) = find_macro_parameter(node, "spaces") {
+        if let Some(space) = namespaced_child(parameter, RI_NS, "space") {
+            let space_key = space
+                .attribute((RI_NS, "space-key"))
+                .or_else(|| space.attribute("ri:space-key"))
+                .or_else(|| space.attribute("space-key"))?;
+            parameters.insert("spaces".to_string(), space_key.to_string());
+        }
+    }
+    Some(render_parameter_only_macro_block_with_parameters(
+        "recently-updated",
         &parameters,
     ))
 }
@@ -1431,6 +1451,7 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-page-tree" => Some("page-tree"),
             ":::confluence-page-tree-search" => Some("page-tree-search"),
             ":::confluence-content-by-label" => Some("content-by-label"),
+            ":::confluence-recently-updated" => Some("recently-updated"),
             _ => None,
         };
 
@@ -1489,6 +1510,11 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters =
                     parse_macro_parameter_lines(&body, "confluence content-by-label macro")?;
                 build_parameter_only_macro_storage("contentbylabel", &parameters)
+            }
+            "recently-updated" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence recently-updated macro")?;
+                build_recently_updated_macro_storage(&parameters)
             }
             _ => unreachable!(),
         };
@@ -1822,6 +1848,33 @@ fn build_page_tree_search_macro_storage(parameters: &BTreeMap<String, String>) -
         }
     }
     build_parameter_only_macro_storage("pagetreesearch", &parameters)
+}
+
+fn build_recently_updated_macro_storage(parameters: &BTreeMap<String, String>) -> String {
+    let mut parameters = parameters.clone();
+    let spaces_xml = if let Some(spaces) = parameters.remove("spaces") {
+        let trimmed = spaces.trim();
+        if trimmed.is_empty() {
+            None
+        } else if trimmed.starts_with('@') || trimmed.contains(',') {
+            Some(format!(
+                r#"<ac:parameter ac:name="spaces">{}</ac:parameter>"#,
+                escape_xml(trimmed)
+            ))
+        } else {
+            Some(format!(
+                r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="{}" /></ac:parameter>"#,
+                escape_xml(trimmed)
+            ))
+        }
+    } else {
+        None
+    };
+    let parameters_xml = build_macro_parameters_xml(&parameters);
+    format!(
+        r#"<ac:structured-macro ac:name="recently-updated">{parameters_xml}{}</ac:structured-macro>"#,
+        spaces_xml.unwrap_or_default()
+    )
 }
 
 fn parse_default_parameter_page_target(target: &str) -> PageLinkPlaceholder {
@@ -2221,6 +2274,15 @@ mod tests {
     }
 
     #[test]
+    fn recently_updated_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="recently-updated"><ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="max">10</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-recently-updated"));
+        assert!(markdown.contains("spaces: TEST"));
+        assert!(markdown.contains("max: 10"));
+    }
+
+    #[test]
     fn whitespace_between_supported_blocks_does_not_force_fallback_export() {
         let storage = concat!(
             "<h1>Macro Source</h1>\n",
@@ -2239,6 +2301,9 @@ mod tests {
             "<ac:structured-macro ac:name=\"contentbylabel\">",
             "<ac:parameter ac:name=\"cql\">label = &quot;e2e-macro-target&quot;</ac:parameter>",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"recently-updated\">",
+            "<ac:parameter ac:name=\"spaces\">TEST</ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"children\">",
             "<ac:parameter ac:name=\"all\">true</ac:parameter>",
             "</ac:structured-macro>"
@@ -2250,6 +2315,7 @@ mod tests {
         assert!(markdown.contains(":::confluence-page-tree"));
         assert!(markdown.contains(":::confluence-page-tree-search"));
         assert!(markdown.contains(":::confluence-content-by-label"));
+        assert!(markdown.contains(":::confluence-recently-updated"));
         assert!(markdown.contains(":::confluence-children"));
         assert!(!markdown.contains("CONFLUENCE_XML_PLACEHOLDER"));
     }
@@ -2486,6 +2552,26 @@ mod tests {
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="maxResults">5</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn recently_updated_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-recently-updated\nspaces: TEST\nmax: 10\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("recently-updated block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="recently-updated">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter>"#
+        ));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="max">10</ac:parameter>"#)
         );
     }
 
