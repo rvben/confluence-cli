@@ -168,14 +168,16 @@ pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<Conversi
     let parser = Parser::new_ext(&normalized, Options::all());
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
-    for (idx, fragment) in raw_fragments.into_iter().enumerate() {
+    for idx in (0..raw_fragments.len()).rev() {
+        let fragment = &raw_fragments[idx];
         html_output = html_output.replace(
             &format!("<p>CONFLUENCE_XML_PLACEHOLDER_{idx}</p>"),
             &fragment,
         );
         html_output = html_output.replace(&format!("CONFLUENCE_XML_PLACEHOLDER_{idx}"), &fragment);
     }
-    for (idx, fragment) in layout_fragments.into_iter().enumerate() {
+    for idx in (0..layout_fragments.len()).rev() {
+        let fragment = &layout_fragments[idx];
         html_output = html_output.replace(
             &format!("<p>CONFLUENCE_LAYOUT_PLACEHOLDER_{idx}</p>"),
             &fragment,
@@ -183,7 +185,8 @@ pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<Conversi
         html_output =
             html_output.replace(&format!("CONFLUENCE_LAYOUT_PLACEHOLDER_{idx}"), &fragment);
     }
-    for (idx, fragment) in macro_fragments.into_iter().enumerate() {
+    for idx in (0..macro_fragments.len()).rev() {
+        let fragment = &macro_fragments[idx];
         html_output = html_output.replace(
             &format!("<p>CONFLUENCE_MACRO_PLACEHOLDER_{idx}</p>"),
             &fragment,
@@ -277,7 +280,7 @@ fn render_confluence_block(node: Node<'_, '_>, source: &str) -> Option<String> {
     match node.tag_name().name() {
         "layout" => render_layout(node, source),
         "task-list" => render_task_list(node, source),
-        "structured-macro" => render_supported_macro_block(node, source),
+        "structured-macro" | "macro" => render_supported_macro_block(node, source),
         "image" | "link" => render_inline_node(node, source).map(|value| value.trim().to_string()),
         _ => Some(confluence_raw_block(raw_xml_fragment(node, source))),
     }
@@ -609,6 +612,12 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "recently-updated" || name == "recentlyupdated" {
         return render_recently_updated_macro_block(node);
     }
+    if name == "livesearch" {
+        return render_space_key_macro_block("livesearch", node);
+    }
+    if matches!(name, "page-index" | "pageindex") {
+        return Some(":::confluence-page-index\n:::".to_string());
+    }
     if matches!(name, "listlabels" | "labels-list") {
         return render_space_key_macro_block("labels-list", node);
     }
@@ -620,6 +629,9 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     }
     if name == "toc" {
         return render_parameter_only_macro_block("toc", node);
+    }
+    if name == "toc-zone" {
+        return render_excerpt_macro_block_named("toc-zone", node, source);
     }
     if name == "children" {
         return render_parameter_only_macro_block("children", node);
@@ -646,11 +658,19 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
 }
 
 fn render_excerpt_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
+    render_excerpt_macro_block_named("excerpt", node, source)
+}
+
+fn render_excerpt_macro_block_named(
+    block_name: &str,
+    node: Node<'_, '_>,
+    source: &str,
+) -> Option<String> {
     let body = namespaced_child(node, AC_NS, "rich-text-body")?;
     let body_markdown = storage_to_markdown(&inner_xml_fragment(body, source));
     let parameters = collect_macro_parameters(node);
     Some(render_rich_text_macro_block(
-        "excerpt",
+        block_name,
         &parameters,
         &body_markdown,
     ))
@@ -1479,6 +1499,7 @@ fn replace_parameterized_colon_macro_blocks(
         let trimmed = lines[index].trim();
         let macro_name = match trimmed {
             ":::confluence-excerpt" => Some("excerpt"),
+            ":::confluence-toc-zone" => Some("toc-zone"),
             ":::confluence-toc" => Some("toc"),
             ":::confluence-children" => Some("children"),
             ":::confluence-excerpt-include" => Some("excerpt-include"),
@@ -1487,6 +1508,8 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-page-tree-search" => Some("page-tree-search"),
             ":::confluence-content-by-label" => Some("content-by-label"),
             ":::confluence-recently-updated" => Some("recently-updated"),
+            ":::confluence-livesearch" => Some("livesearch"),
+            ":::confluence-page-index" => Some("page-index"),
             ":::confluence-labels-list" => Some("labels-list"),
             ":::confluence-popular-labels" => Some("popular-labels"),
             ":::confluence-related-labels" => Some("related-labels"),
@@ -1516,6 +1539,11 @@ fn replace_parameterized_colon_macro_blocks(
                 let (parameters, body_storage) =
                     parse_rich_text_macro_block("confluence excerpt macro", &body, allow_lossy)?;
                 build_rich_text_macro_storage("excerpt", &parameters, &body_storage)
+            }
+            "toc-zone" => {
+                let (parameters, body_storage) =
+                    parse_rich_text_macro_block("confluence toc-zone macro", &body, allow_lossy)?;
+                build_rich_text_macro_storage("toc-zone", &parameters, &body_storage)
             }
             "toc" => {
                 let parameters = parse_macro_parameter_lines(&body, "confluence toc macro")?;
@@ -1553,6 +1581,18 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters =
                     parse_macro_parameter_lines(&body, "confluence recently-updated macro")?;
                 build_recently_updated_macro_storage(&parameters)
+            }
+            "livesearch" => {
+                let parameters = parse_macro_parameter_lines(&body, "confluence livesearch macro")?;
+                build_space_key_macro_storage("livesearch", &parameters)
+            }
+            "page-index" => {
+                let parameters = parse_macro_parameter_lines(&body, "confluence page-index macro")?;
+                if parameters.is_empty() {
+                    build_simple_macro_storage("page-index")
+                } else {
+                    build_parameter_only_macro_storage("page-index", &parameters)
+                }
             }
             "labels-list" => {
                 let parameters =
@@ -1832,6 +1872,10 @@ fn build_rich_text_macro_storage(
 fn build_parameter_only_macro_storage(name: &str, parameters: &BTreeMap<String, String>) -> String {
     let parameters_xml = build_macro_parameters_xml(parameters);
     format!(r#"<ac:structured-macro ac:name="{name}">{parameters_xml}</ac:structured-macro>"#)
+}
+
+fn build_simple_macro_storage(name: &str) -> String {
+    format!(r#"<ac:macro ac:name="{name}" />"#)
 }
 
 fn build_excerpt_include_macro_storage(parameters: &BTreeMap<String, String>) -> Result<String> {
@@ -2281,12 +2325,41 @@ mod tests {
     }
 
     #[test]
+    fn toc_zone_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="toc-zone"><ac:parameter ac:name="location">top</ac:parameter><ac:parameter ac:name="maxLevel">3</ac:parameter><ac:rich-text-body><h2>Scoped Heading</h2><p>Only this section counts.</p></ac:rich-text-body></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-toc-zone"));
+        assert!(markdown.contains("location: top"));
+        assert!(markdown.contains("maxLevel: 3"));
+        assert!(markdown.contains("---"));
+        assert!(markdown.contains("## Scoped Heading"));
+        assert!(markdown.contains("Only this section counts."));
+    }
+
+    #[test]
     fn toc_macros_export_to_toc_blocks() {
         let storage = r#"<ac:structured-macro ac:name="toc"><ac:parameter ac:name="maxLevel">3</ac:parameter><ac:parameter ac:name="style">square</ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains(":::confluence-toc"));
         assert!(markdown.contains("maxLevel: 3"));
         assert!(markdown.contains("style: square"));
+    }
+
+    #[test]
+    fn livesearch_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="livesearch"><ac:parameter ac:name="spaceKey"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="labels">docs,howto</ac:parameter><ac:parameter ac:name="size">large</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-livesearch"));
+        assert!(markdown.contains("spaceKey: TEST"));
+        assert!(markdown.contains("labels: docs,howto"));
+        assert!(markdown.contains("size: large"));
+    }
+
+    #[test]
+    fn page_index_macros_export_to_blocks() {
+        let storage = r#"<ac:macro ac:name="page-index" />"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-page-index"));
     }
 
     #[test]
@@ -2406,6 +2479,10 @@ mod tests {
             "<ac:structured-macro ac:name=\"recently-updated\">",
             "<ac:parameter ac:name=\"spaces\">TEST</ac:parameter>",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"livesearch\">",
+            "<ac:parameter ac:name=\"spaceKey\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:macro ac:name=\"page-index\" />\n",
             "<ac:structured-macro ac:name=\"listlabels\">",
             "<ac:parameter ac:name=\"spaceKey\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
             "</ac:structured-macro>\n",
@@ -2428,6 +2505,8 @@ mod tests {
         assert!(markdown.contains(":::confluence-page-tree-search"));
         assert!(markdown.contains(":::confluence-content-by-label"));
         assert!(markdown.contains(":::confluence-recently-updated"));
+        assert!(markdown.contains(":::confluence-livesearch"));
+        assert!(markdown.contains(":::confluence-page-index"));
         assert!(markdown.contains(":::confluence-labels-list"));
         assert!(markdown.contains(":::confluence-popular-labels"));
         assert!(markdown.contains(":::confluence-related-labels"));
@@ -2528,6 +2607,30 @@ mod tests {
     }
 
     #[test]
+    fn toc_zone_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Scoped Heading\n\nBody text.\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("toc-zone block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="toc-zone">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="location">top</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="maxLevel">3</ac:parameter>"#)
+        );
+        assert!(rendered.storage.contains("<ac:rich-text-body>"));
+        assert!(rendered.storage.contains("<h2>Scoped Heading</h2>"));
+        assert!(rendered.storage.contains("<p>Body text.</p>"));
+    }
+
+    #[test]
     fn toc_blocks_round_trip_back_to_structured_macros() {
         let markdown = ":::confluence-toc\nmaxLevel: 3\nstyle: square\n:::";
         let rendered = markdown_to_storage(markdown, false).expect("toc block converts");
@@ -2545,6 +2648,42 @@ mod tests {
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="style">square</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn livesearch_blocks_round_trip_back_to_structured_macros() {
+        let markdown =
+            ":::confluence-livesearch\nspaceKey: TEST\nlabels: docs,howto\nsize: large\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("livesearch block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="livesearch">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="spaceKey"><ri:space ri:space-key="TEST" /></ac:parameter>"#
+        ));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="labels">docs,howto</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="size">large</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn page_index_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-page-index\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("page-index block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:macro ac:name="page-index" />"#)
         );
     }
 
@@ -2749,6 +2888,23 @@ mod tests {
                 .storage
                 .contains(r#"<ac:parameter ac:name="labels">docs,howto</ac:parameter>"#)
         );
+    }
+
+    #[test]
+    fn macro_placeholder_replacement_is_stable_beyond_single_digits() {
+        let mut markdown = String::new();
+        for _ in 0..12 {
+            markdown.push_str(":::confluence-include-page\n");
+            markdown
+                .push_str("page: confluence-page://page?space-key=TEST&content-title=Docs+Home\n");
+            markdown.push_str(":::\n\n");
+        }
+        let rendered =
+            markdown_to_storage(&markdown, false).expect("many macro placeholders convert");
+        assert_eq!(rendered.storage.matches(r#"ac:name="include""#).count(), 12);
+        assert!(!rendered.storage.contains("CONFLUENCE_MACRO_PLACEHOLDER_"));
+        assert!(!rendered.storage.contains("</ac:structured-macro>0"));
+        assert!(!rendered.storage.contains("</ac:structured-macro>1"));
     }
 
     #[test]

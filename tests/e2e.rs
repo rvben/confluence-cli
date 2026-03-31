@@ -648,7 +648,7 @@ fn e2e_cli_lifecycle() {
     fs::write(
         macro_source_dir.join("index.md"),
         format!(
-            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
+            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
             space = cfg.space
         ),
     )
@@ -825,6 +825,45 @@ fn e2e_cli_lifecycle() {
         "expected recently-updated spaces parameter to survive storage rendering: {macro_source_body}"
     );
     assert!(
+        macro_source_body.contains(r#"ac:name="livesearch""#),
+        "expected livesearch macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body
+            .contains(r#"<ac:parameter ac:name="labels">e2e-macro-target</ac:parameter>"#),
+        "expected livesearch labels parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="size">large</ac:parameter>"#),
+        "expected livesearch size parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="spaceKey">{}</ac:parameter>"#,
+            cfg.space
+        )) || macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="spaceKey"><ri:space ri:space-key="{}" /></ac:parameter>"#,
+            cfg.space
+        )),
+        "expected livesearch spaceKey parameter to survive storage rendering as either a plain string or a space resource: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="page-index""#)
+            || macro_source_body.contains(r#"ac:name="pageindex""#),
+        "expected page-index macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="toc-zone""#),
+        "expected toc-zone macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="location">top</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="maxLevel">3</ac:parameter>"#)
+            && macro_source_body.contains("<ac:rich-text-body>")
+            && macro_source_body.contains("<h2>Zoned Heading</h2>"),
+        "expected toc-zone parameters and body to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
         macro_source_body.contains(r#"ac:name="listlabels""#),
         "expected labels-list macro in source body: {macro_source_body}"
     );
@@ -936,6 +975,29 @@ fn e2e_cli_lifecycle() {
     assert!(
         pulled_macro_source_markdown.contains(&format!("spaces: {}", cfg.space)),
         "expected pulled recently-updated spaces to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-livesearch"),
+        "expected pulled macro source to preserve livesearch block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("labels: e2e-macro-target")
+            && pulled_macro_source_markdown.contains("size: large"),
+        "expected pulled livesearch parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-page-index"),
+        "expected pulled macro source to preserve page-index block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-toc-zone"),
+        "expected pulled macro source to preserve toc-zone block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("location: top")
+            && pulled_macro_source_markdown.contains("maxLevel: 3")
+            && pulled_macro_source_markdown.contains("## Zoned Heading"),
+        "expected pulled toc-zone parameters and body to survive export: {pulled_macro_source_markdown}"
     );
     assert!(
         pulled_macro_source_markdown.contains(":::confluence-labels-list"),
