@@ -606,11 +606,17 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if matches!(name, "blog-posts" | "blogposts") {
         return render_parameter_only_macro_block("blog-posts", node);
     }
+    if name == "contributors" {
+        return render_spaces_macro_block("contributors", node);
+    }
+    if name == "contributors-summary" {
+        return render_spaces_macro_block("contributors-summary", node);
+    }
     if matches!(
         name,
         "recently-updated-dashboard" | "recentlyupdated-dashboard"
     ) {
-        return render_parameter_only_macro_block("recently-updated-dashboard", node);
+        return render_spaces_macro_block("recently-updated-dashboard", node);
     }
     if name == "excerpt-include" {
         return render_page_reference_macro_block("excerpt-include", node);
@@ -644,6 +650,18 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     }
     if name == "related-labels" {
         return render_parameter_only_macro_block("related-labels", node);
+    }
+    if name == "recently-used-labels" {
+        return render_parameter_only_macro_block("recently-used-labels", node);
+    }
+    if name == "gallery" {
+        return render_parameter_only_macro_block("gallery", node);
+    }
+    if matches!(name, "favpages" | "favorite-pages" | "favourite-pages") {
+        return Some(":::confluence-favorite-pages\n:::".to_string());
+    }
+    if matches!(name, "change-history" | "changehistory") {
+        return Some(":::confluence-change-history\n:::".to_string());
     }
     if name == "toc" {
         return render_parameter_only_macro_block("toc", node);
@@ -811,6 +829,14 @@ fn render_space_key_macro_block(name: &str, node: Node<'_, '_>) -> Option<String
             parameters.insert("spaceKey".to_string(), space_key.to_string());
         }
     }
+    Some(render_parameter_only_macro_block_with_parameters(
+        name,
+        &parameters,
+    ))
+}
+
+fn render_spaces_macro_block(name: &str, node: Node<'_, '_>) -> Option<String> {
+    let parameters = collect_macro_parameters(node);
     Some(render_parameter_only_macro_block_with_parameters(
         name,
         &parameters,
@@ -1269,12 +1295,57 @@ fn collect_macro_parameters(node: Node<'_, '_>) -> BTreeMap<String, String> {
         })
         .filter_map(|parameter| {
             let name = parameter.attribute((AC_NS, "name"))?;
-            Some((
-                name.to_string(),
-                parameter.text().unwrap_or_default().trim().to_string(),
-            ))
+            Some((name.to_string(), collect_macro_parameter_value(parameter)))
         })
         .collect()
+}
+
+fn collect_macro_parameter_value(parameter: Node<'_, '_>) -> String {
+    let space_keys: Vec<_> = parameter
+        .children()
+        .filter(|child| {
+            child.is_element()
+                && child.tag_name().namespace() == Some(RI_NS)
+                && child.tag_name().name() == "space"
+        })
+        .filter_map(|space| {
+            space
+                .attribute((RI_NS, "space-key"))
+                .or_else(|| space.attribute("ri:space-key"))
+                .or_else(|| space.attribute("space-key"))
+                .map(ToOwned::to_owned)
+        })
+        .collect();
+    if !space_keys.is_empty() {
+        return space_keys.join(",");
+    }
+
+    if let Some(user) = namespaced_child(parameter, RI_NS, "user") {
+        let placeholder = UserMentionPlaceholder {
+            account_id: user.attribute((RI_NS, "account-id")).map(ToOwned::to_owned),
+            user_key: user.attribute((RI_NS, "userkey")).map(ToOwned::to_owned),
+            username: user.attribute((RI_NS, "username")).map(ToOwned::to_owned),
+        };
+        return build_user_placeholder_url(&placeholder);
+    }
+
+    if let Some(page) = namespaced_child(parameter, RI_NS, "page") {
+        return build_page_placeholder_url(&page_resource_placeholder(page));
+    }
+
+    if let Some(page) = namespaced_child(parameter, AC_NS, "link")
+        .and_then(|link| namespaced_child(link, RI_NS, "page"))
+    {
+        return build_page_placeholder_url(&page_resource_placeholder(page));
+    }
+
+    if let Some(attachment) = namespaced_child(parameter, RI_NS, "attachment") {
+        if let Some(file_name) = attachment.attribute((RI_NS, "filename")) {
+            return file_name.to_string();
+        }
+    }
+
+    parameter.text().unwrap_or_default().trim().to_string()
 }
 
 fn find_macro_parameter<'a>(node: Node<'a, 'a>, name: &str) -> Option<Node<'a, 'a>> {
@@ -1521,6 +1592,8 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-content-properties-report" => Some("content-properties-report"),
             ":::confluence-attachments" => Some("attachments"),
             ":::confluence-blog-posts" => Some("blog-posts"),
+            ":::confluence-contributors" => Some("contributors"),
+            ":::confluence-contributors-summary" => Some("contributors-summary"),
             ":::confluence-recently-updated-dashboard" => Some("recently-updated-dashboard"),
             ":::confluence-toc-zone" => Some("toc-zone"),
             ":::confluence-toc" => Some("toc"),
@@ -1536,6 +1609,10 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-labels-list" => Some("labels-list"),
             ":::confluence-popular-labels" => Some("popular-labels"),
             ":::confluence-related-labels" => Some("related-labels"),
+            ":::confluence-recently-used-labels" => Some("recently-used-labels"),
+            ":::confluence-gallery" => Some("gallery"),
+            ":::confluence-favorite-pages" => Some("favorite-pages"),
+            ":::confluence-change-history" => Some("change-history"),
             _ => None,
         };
 
@@ -1587,12 +1664,24 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters = parse_macro_parameter_lines(&body, "confluence blog-posts macro")?;
                 build_parameter_only_macro_storage("blog-posts", &parameters)
             }
+            "contributors" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence contributors macro")?;
+                build_spaces_macro_storage("contributors", &parameters)
+            }
+            "contributors-summary" => {
+                let parameters = parse_macro_parameter_lines(
+                    &body,
+                    "confluence contributors-summary macro",
+                )?;
+                build_spaces_macro_storage("contributors-summary", &parameters)
+            }
             "recently-updated-dashboard" => {
                 let parameters = parse_macro_parameter_lines(
                     &body,
                     "confluence recently-updated-dashboard macro",
                 )?;
-                build_parameter_only_macro_storage("recently-updated-dashboard", &parameters)
+                build_spaces_macro_storage("recently-updated-dashboard", &parameters)
             }
             "toc-zone" => {
                 let (parameters, body_storage) =
@@ -1662,6 +1751,39 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters =
                     parse_macro_parameter_lines(&body, "confluence related-labels macro")?;
                 build_parameter_only_macro_storage("related-labels", &parameters)
+            }
+            "recently-used-labels" => {
+                let parameters = parse_macro_parameter_lines(
+                    &body,
+                    "confluence recently-used-labels macro",
+                )?;
+                build_parameter_only_macro_storage("recently-used-labels", &parameters)
+            }
+            "gallery" => {
+                let parameters = parse_macro_parameter_lines(&body, "confluence gallery macro")?;
+                build_parameter_only_macro_storage("gallery", &parameters)
+            }
+            "favorite-pages" => {
+                let parameters = parse_macro_parameter_lines(
+                    &body,
+                    "confluence favorite-pages macro",
+                )?;
+                if parameters.is_empty() {
+                    build_simple_macro_storage("favpages")
+                } else {
+                    build_parameter_only_macro_storage("favpages", &parameters)
+                }
+            }
+            "change-history" => {
+                let parameters = parse_macro_parameter_lines(
+                    &body,
+                    "confluence change-history macro",
+                )?;
+                if parameters.is_empty() {
+                    build_simple_macro_storage("change-history")
+                } else {
+                    build_parameter_only_macro_storage("change-history", &parameters)
+                }
             }
             _ => unreachable!(),
         };
@@ -2023,26 +2145,25 @@ fn build_page_tree_search_macro_storage(parameters: &BTreeMap<String, String>) -
 fn build_recently_updated_macro_storage(parameters: &BTreeMap<String, String>) -> String {
     let mut parameters = parameters.clone();
     let spaces_xml = if let Some(spaces) = parameters.remove("spaces") {
-        let trimmed = spaces.trim();
-        if trimmed.is_empty() {
-            None
-        } else if trimmed.starts_with('@') || trimmed.contains(',') {
-            Some(format!(
-                r#"<ac:parameter ac:name="spaces">{}</ac:parameter>"#,
-                escape_xml(trimmed)
-            ))
-        } else {
-            Some(format!(
-                r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="{}" /></ac:parameter>"#,
-                escape_xml(trimmed)
-            ))
-        }
+        build_space_parameter_xml("spaces", &spaces)
     } else {
         None
     };
     let parameters_xml = build_macro_parameters_xml(&parameters);
     format!(
         r#"<ac:structured-macro ac:name="recently-updated">{parameters_xml}{}</ac:structured-macro>"#,
+        spaces_xml.unwrap_or_default()
+    )
+}
+
+fn build_spaces_macro_storage(name: &str, parameters: &BTreeMap<String, String>) -> String {
+    let mut parameters = parameters.clone();
+    let spaces_xml = parameters
+        .remove("spaces")
+        .and_then(|spaces| build_space_parameter_xml("spaces", &spaces));
+    let parameters_xml = build_macro_parameters_xml(&parameters);
+    format!(
+        r#"<ac:structured-macro ac:name="{name}">{parameters_xml}{}</ac:structured-macro>"#,
         spaces_xml.unwrap_or_default()
     )
 }
@@ -2067,6 +2188,34 @@ fn build_space_key_macro_storage(name: &str, parameters: &BTreeMap<String, Strin
         r#"<ac:structured-macro ac:name="{name}">{parameters_xml}{}</ac:structured-macro>"#,
         space_key_xml.unwrap_or_default()
     )
+}
+
+fn build_space_parameter_xml(name: &str, spaces: &str) -> Option<String> {
+    let trimmed = spaces.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let values: Vec<_> = trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    if values.len() == 1 && !values[0].starts_with('@') && values[0] != "*" {
+        return Some(format!(
+            r#"<ac:parameter ac:name="{name}"><ri:space ri:space-key="{}" /></ac:parameter>"#,
+            escape_xml(values[0])
+        ));
+    }
+    let resources = values
+        .iter()
+        .map(|value| format!(r#"<ri:space ri:space-key="{}" />"#, escape_xml(value)))
+        .collect::<String>();
+    Some(format!(
+        r#"<ac:parameter ac:name="{name}">{resources}</ac:parameter>"#
+    ))
 }
 
 fn parse_default_parameter_page_target(target: &str) -> PageLinkPlaceholder {
@@ -2435,12 +2584,64 @@ mod tests {
     }
 
     #[test]
+    fn contributors_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="contributors"><ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /><ri:space ri:space-key="@personal" /></ac:parameter><ac:parameter ac:name="labels">docs,howto</ac:parameter><ac:parameter ac:name="mode">list</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-contributors"));
+        assert!(markdown.contains("spaces: TEST,@personal"));
+        assert!(markdown.contains("labels: docs,howto"));
+        assert!(markdown.contains("mode: list"));
+    }
+
+    #[test]
+    fn contributors_summary_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="contributors-summary"><ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="columns">edits,comments,labels</ac:parameter><ac:parameter ac:name="limit">10</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-contributors-summary"));
+        assert!(markdown.contains("spaces: TEST"));
+        assert!(markdown.contains("columns: edits,comments,labels"));
+        assert!(markdown.contains("limit: 10"));
+    }
+
+    #[test]
     fn recently_updated_dashboard_macros_export_to_blocks() {
         let storage = r#"<ac:structured-macro ac:name="recently-updated-dashboard"><ac:parameter ac:name="limit">10</ac:parameter><ac:parameter ac:name="theme">concise</ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains(":::confluence-recently-updated-dashboard"));
         assert!(markdown.contains("limit: 10"));
         assert!(markdown.contains("theme: concise"));
+    }
+
+    #[test]
+    fn recently_used_labels_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="recently-used-labels"><ac:parameter ac:name="scope">space</ac:parameter><ac:parameter ac:name="style">cloud</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-recently-used-labels"));
+        assert!(markdown.contains("scope: space"));
+        assert!(markdown.contains("style: cloud"));
+    }
+
+    #[test]
+    fn gallery_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="gallery"><ac:parameter ac:name="sortBy">name</ac:parameter><ac:parameter ac:name="columns">2</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-gallery"));
+        assert!(markdown.contains("sortBy: name"));
+        assert!(markdown.contains("columns: 2"));
+    }
+
+    #[test]
+    fn favorite_pages_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="favpages"/>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-favorite-pages"));
+    }
+
+    #[test]
+    fn change_history_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="change-history"/>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-change-history"));
     }
 
     #[test]
@@ -2608,9 +2809,23 @@ mod tests {
             "<ac:structured-macro ac:name=\"blog-posts\">",
             "<ac:parameter ac:name=\"max\">5</ac:parameter>",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"contributors\">",
+            "<ac:parameter ac:name=\"spaces\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"contributors-summary\">",
+            "<ac:parameter ac:name=\"spaces\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"recently-updated-dashboard\">",
             "<ac:parameter ac:name=\"limit\">10</ac:parameter>",
             "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"recently-used-labels\">",
+            "<ac:parameter ac:name=\"scope\">space</ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"gallery\">",
+            "<ac:parameter ac:name=\"sortBy\">name</ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"favpages\"/>\n",
+            "<ac:structured-macro ac:name=\"change-history\"/>\n",
             "<ac:structured-macro ac:name=\"listlabels\">",
             "<ac:parameter ac:name=\"spaceKey\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
             "</ac:structured-macro>\n",
@@ -2637,7 +2852,13 @@ mod tests {
         assert!(markdown.contains(":::confluence-page-index"));
         assert!(markdown.contains(":::confluence-attachments"));
         assert!(markdown.contains(":::confluence-blog-posts"));
+        assert!(markdown.contains(":::confluence-contributors"));
+        assert!(markdown.contains(":::confluence-contributors-summary"));
         assert!(markdown.contains(":::confluence-recently-updated-dashboard"));
+        assert!(markdown.contains(":::confluence-recently-used-labels"));
+        assert!(markdown.contains(":::confluence-gallery"));
+        assert!(markdown.contains(":::confluence-favorite-pages"));
+        assert!(markdown.contains(":::confluence-change-history"));
         assert!(markdown.contains(":::confluence-labels-list"));
         assert!(markdown.contains(":::confluence-popular-labels"));
         assert!(markdown.contains(":::confluence-related-labels"));
@@ -2820,6 +3041,56 @@ mod tests {
     }
 
     #[test]
+    fn contributors_blocks_round_trip_back_to_structured_macros() {
+        let markdown =
+            ":::confluence-contributors\nspaces: TEST,@personal\nlabels: docs,howto\nmode: list\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("contributors block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="contributors">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /><ri:space ri:space-key="@personal" /></ac:parameter>"#
+        ));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="labels">docs,howto</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="mode">list</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn contributors_summary_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-contributors-summary\nspaces: TEST\ncolumns: edits,comments,labels\nlimit: 10\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("contributors-summary block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="contributors-summary">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="TEST" /></ac:parameter>"#
+        ));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="columns">edits,comments,labels</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="limit">10</ac:parameter>"#)
+        );
+    }
+
+    #[test]
     fn recently_updated_dashboard_blocks_round_trip_back_to_structured_macros() {
         let markdown = ":::confluence-recently-updated-dashboard\nlimit: 10\ntheme: concise\n:::";
         let rendered = markdown_to_storage(markdown, false)
@@ -2840,6 +3111,80 @@ mod tests {
                 .contains(r#"<ac:parameter ac:name="theme">concise</ac:parameter>"#)
         );
     }
+
+    #[test]
+    fn recently_used_labels_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-recently-used-labels\nscope: space\nstyle: cloud\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("recently-used-labels block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="recently-used-labels">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="scope">space</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="style">cloud</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn gallery_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-gallery\nsortBy: name\ncolumns: 2\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("gallery block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="gallery">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="sortBy">name</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="columns">2</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn favorite_pages_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-favorite-pages\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("favorite-pages block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:macro ac:name="favpages" />"#)
+                || rendered
+                    .storage
+                    .contains(r#"<ac:structured-macro ac:name="favpages">"#)
+        );
+    }
+
+    #[test]
+    fn change_history_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-change-history\n:::";
+        let rendered =
+            markdown_to_storage(markdown, false).expect("change-history block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:macro ac:name="change-history" />"#)
+                || rendered
+                    .storage
+                    .contains(r#"<ac:structured-macro ac:name="change-history">"#)
+        );
+    }
+
 
     #[test]
     fn toc_zone_blocks_round_trip_back_to_structured_macros() {

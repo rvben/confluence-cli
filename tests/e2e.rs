@@ -648,7 +648,7 @@ fn e2e_cli_lifecycle() {
     fs::write(
         macro_source_dir.join("index.md"),
         format!(
-            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
+            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-contributors\nspaces: {space},@personal\nlabels: e2e-macro-target\nmode: list\n:::\n\n:::confluence-contributors-summary\nspaces: {space}\ncolumns: edits,comments,labels\nlimit: 10\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nspaces: {space}\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-recently-used-labels\nscope: space\nstyle: cloud\n:::\n\n:::confluence-gallery\nsortBy: name\ncolumns: 2\n:::\n\n:::confluence-favorite-pages\n:::\n\n:::confluence-change-history\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
             space = cfg.space
         ),
     )
@@ -842,6 +842,40 @@ fn e2e_cli_lifecycle() {
         "expected blog-posts parameters to survive storage rendering: {macro_source_body}"
     );
     assert!(
+        macro_source_body.contains(r#"ac:name="contributors""#),
+        "expected contributors macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="{}" /><ri:space ri:space-key="@personal" /></ac:parameter>"#,
+            cfg.space
+        )),
+        "expected contributors spaces parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body
+            .contains(r#"<ac:parameter ac:name="labels">e2e-macro-target</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="mode">list</ac:parameter>"#),
+        "expected contributors parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="contributors-summary""#),
+        "expected contributors-summary macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="{}" /></ac:parameter>"#,
+            cfg.space
+        )),
+        "expected contributors-summary spaces parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body
+            .contains(r#"<ac:parameter ac:name="columns">edits,comments,labels</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="limit">10</ac:parameter>"#),
+        "expected contributors-summary parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
         macro_source_body.contains(r#"ac:name="recently-updated""#),
         "expected recently-updated macro in source body: {macro_source_body}"
     );
@@ -855,6 +889,13 @@ fn e2e_cli_lifecycle() {
     assert!(
         macro_source_body.contains(r#"ac:name="recently-updated-dashboard""#),
         "expected recently-updated-dashboard macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(&format!(
+            r#"<ac:parameter ac:name="spaces"><ri:space ri:space-key="{}" /></ac:parameter>"#,
+            cfg.space
+        )),
+        "expected recently-updated-dashboard spaces parameter to survive storage rendering: {macro_source_body}"
     );
     assert!(
         macro_source_body.contains(r#"<ac:parameter ac:name="limit">10</ac:parameter>"#)
@@ -944,6 +985,32 @@ fn e2e_cli_lifecycle() {
         macro_source_body
             .contains(r#"<ac:parameter ac:name="labels">e2e-macro-target</ac:parameter>"#),
         "expected related-labels labels parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="recently-used-labels""#),
+        "expected recently-used-labels macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="scope">space</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="style">cloud</ac:parameter>"#),
+        "expected recently-used-labels parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="gallery""#),
+        "expected gallery macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="sortBy">name</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="columns">2</ac:parameter>"#),
+        "expected gallery parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="favpages""#),
+        "expected favorite-pages macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="change-history""#),
+        "expected change-history macro in source body: {macro_source_body}"
     );
 
     let macro_target_get = cfg.run_json(&["page", "get", &macro_target_id, "--show-body"]);
@@ -1052,6 +1119,26 @@ fn e2e_cli_lifecycle() {
         "expected pulled blog-posts parameters to survive export: {pulled_macro_source_markdown}"
     );
     assert!(
+        pulled_macro_source_markdown.contains(":::confluence-contributors"),
+        "expected pulled macro source to preserve contributors block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(&format!("spaces: {},@personal", cfg.space))
+            && pulled_macro_source_markdown.contains("labels: e2e-macro-target")
+            && pulled_macro_source_markdown.contains("mode: list"),
+        "expected pulled contributors parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-contributors-summary"),
+        "expected pulled macro source to preserve contributors-summary block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(&format!("spaces: {}", cfg.space))
+            && pulled_macro_source_markdown.contains("columns: edits,comments,labels")
+            && pulled_macro_source_markdown.contains("limit: 10"),
+        "expected pulled contributors-summary parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
         pulled_macro_source_markdown.contains(":::confluence-recently-updated"),
         "expected pulled macro source to preserve recently-updated block: {pulled_macro_source_markdown}"
     );
@@ -1067,6 +1154,10 @@ fn e2e_cli_lifecycle() {
         pulled_macro_source_markdown.contains("limit: 10")
             && pulled_macro_source_markdown.contains("theme: concise"),
         "expected pulled recently-updated-dashboard parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(&format!("spaces: {}", cfg.space)),
+        "expected pulled recently-updated-dashboard spaces to survive export: {pulled_macro_source_markdown}"
     );
     assert!(
         pulled_macro_source_markdown.contains(":::confluence-livesearch"),
@@ -1119,6 +1210,32 @@ fn e2e_cli_lifecycle() {
     assert!(
         pulled_macro_source_markdown.contains("labels: e2e-macro-target"),
         "expected pulled related-labels labels parameter to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-recently-used-labels"),
+        "expected pulled macro source to preserve recently-used-labels block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("scope: space")
+            && pulled_macro_source_markdown.contains("style: cloud"),
+        "expected pulled recently-used-labels parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-gallery"),
+        "expected pulled macro source to preserve gallery block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("sortBy: name")
+            && pulled_macro_source_markdown.contains("columns: 2"),
+        "expected pulled gallery parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-favorite-pages"),
+        "expected pulled macro source to preserve favorite-pages block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-change-history"),
+        "expected pulled macro source to preserve change-history block: {pulled_macro_source_markdown}"
     );
 
     let pulled_macro_target = find_index_md_by_title(&macro_pull_dir, &macro_target_title);
