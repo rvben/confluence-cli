@@ -591,6 +591,9 @@ fn render_task_list(node: Node<'_, '_>, source: &str) -> Option<String> {
 
 fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
     let name = node.attribute((AC_NS, "name"))?;
+    if name == "anchor" {
+        return render_default_parameter_macro_block("anchor", "name", node);
+    }
     if name == "code" {
         return render_code_macro_block(node);
     }
@@ -656,6 +659,9 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     }
     if name == "content-report-table" {
         return render_spaces_macro_block("content-report-table", node);
+    }
+    if name == "search" {
+        return render_generic_alias_macro_block("search", node, source);
     }
     if matches!(name, "tasks-report-macro" | "task-report") {
         return render_parameter_only_macro_block("task-report", node);
@@ -968,6 +974,32 @@ fn render_parameter_only_macro_block_with_parameters(
     markdown
 }
 
+fn render_generic_alias_macro_block(
+    name: &str,
+    node: Node<'_, '_>,
+    source: &str,
+) -> Option<String> {
+    let rich_text_body = namespaced_child(node, AC_NS, "rich-text-body");
+    if node.children().any(|child| {
+        child.is_element()
+            && !matches!(
+                (child.tag_name().namespace(), child.tag_name().name()),
+                (Some(AC_NS), "parameter") | (Some(AC_NS), "rich-text-body")
+            )
+    }) {
+        return None;
+    }
+
+    let parameters = collect_generic_macro_parameters(node)?;
+    let body_markdown =
+        rich_text_body.map(|body| storage_to_markdown(&inner_xml_fragment(body, source)));
+    Some(render_generic_alias_macro_block_with_parameters(
+        name,
+        &parameters,
+        body_markdown.as_deref(),
+    ))
+}
+
 fn render_generic_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
     let name = node.attribute((AC_NS, "name"))?;
     let rich_text_body = namespaced_child(node, AC_NS, "rich-text-body");
@@ -989,6 +1021,27 @@ fn render_generic_macro_block(node: Node<'_, '_>, source: &str) -> Option<String
         &parameters,
         body_markdown.as_deref(),
     ))
+}
+
+fn render_generic_alias_macro_block_with_parameters(
+    name: &str,
+    parameters: &BTreeMap<String, String>,
+    body_markdown: Option<&str>,
+) -> String {
+    let mut markdown = format!(":::confluence-{name}\n");
+    for (parameter_name, parameter_value) in parameters {
+        markdown.push_str(&format!("{parameter_name}: {parameter_value}\n"));
+    }
+    if let Some(body_markdown) = body_markdown {
+        markdown.push_str("---\n");
+        let trimmed = body_markdown.trim();
+        if !trimmed.is_empty() {
+            markdown.push_str(trimmed);
+            markdown.push('\n');
+        }
+    }
+    markdown.push_str(":::");
+    markdown
 }
 
 fn collect_generic_macro_parameters(node: Node<'_, '_>) -> Option<BTreeMap<String, String>> {
@@ -1884,6 +1937,7 @@ fn replace_parameterized_colon_macro_blocks(
             .map(str::trim)
             .filter(|name| !name.is_empty());
         let macro_name = match trimmed {
+            ":::confluence-anchor" => Some("anchor"),
             ":::confluence-excerpt" => Some("excerpt"),
             ":::confluence-content-properties" => Some("content-properties"),
             ":::confluence-content-properties-report" => Some("content-properties-report"),
@@ -1906,6 +1960,7 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-content-by-label" => Some("content-by-label"),
             ":::confluence-content-by-user" => Some("content-by-user"),
             ":::confluence-content-report-table" => Some("content-report-table"),
+            ":::confluence-search" => Some("search"),
             ":::confluence-task-report" => Some("task-report"),
             ":::confluence-recently-updated" => Some("recently-updated"),
             ":::confluence-livesearch" => Some("livesearch"),
@@ -1946,6 +2001,10 @@ fn replace_parameterized_colon_macro_blocks(
 
         let body = body_lines.join("\n");
         let fragment = match macro_name.unwrap_or("__generic__") {
+            "anchor" => {
+                let parameters = parse_macro_parameter_lines(&body, "confluence anchor macro")?;
+                build_default_parameter_macro_storage("anchor", "name", &parameters)
+            }
             "excerpt" => {
                 let (parameters, body_storage) =
                     parse_rich_text_macro_block("confluence excerpt macro", &body, allow_lossy)?;
@@ -2054,6 +2113,11 @@ fn replace_parameterized_colon_macro_blocks(
                 let parameters =
                     parse_macro_parameter_lines(&body, "confluence content-report-table macro")?;
                 build_spaces_macro_storage("content-report-table", &parameters)
+            }
+            "search" => {
+                let (parameters, body_storage) =
+                    parse_generic_macro_block("confluence search macro", &body, allow_lossy)?;
+                build_generic_macro_storage("search", &parameters, body_storage.as_deref())?
             }
             "task-report" => {
                 let parameters =
@@ -3179,6 +3243,14 @@ mod tests {
     }
 
     #[test]
+    fn anchor_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="anchor"><ac:parameter ac:name="">intro</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-anchor"));
+        assert!(markdown.contains("name: intro"));
+    }
+
+    #[test]
     fn user_mentions_export_to_placeholders() {
         let storage = r#"<p><ac:link><ri:user ri:account-id="abc123" /><ac:plain-text-link-body><![CDATA[@Ruben]]></ac:plain-text-link-body></ac:link></p>"#;
         let markdown = storage_to_markdown(storage);
@@ -3527,6 +3599,16 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
     }
 
     #[test]
+    fn search_macros_export_to_first_class_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="search"><ac:parameter ac:name="spacekey"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="contributor"><ri:user ri:userkey="user-123" /></ac:parameter><ac:parameter ac:name="query">docs</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-search"));
+        assert!(markdown.contains("spacekey: !space TEST"));
+        assert!(markdown.contains("contributor: !user confluence-user://user?userkey=user-123"));
+        assert!(markdown.contains("query: docs"));
+    }
+
+    #[test]
     fn task_report_macros_export_to_blocks() {
         let storage = r#"<ac:structured-macro ac:name="tasks-report-macro"><ac:parameter ac:name="spaceAndPage">TEST</ac:parameter><ac:parameter ac:name="labels">e2e-macro-target</ac:parameter><ac:parameter ac:name="status">incomplete</ac:parameter><ac:parameter ac:name="pageSize">20</ac:parameter><ac:parameter ac:name="columns">description,assignee,location</ac:parameter><ac:parameter ac:name="sortBy">page title</ac:parameter><ac:parameter ac:name="reverseSort">false</ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
@@ -3586,9 +3668,9 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
 
     #[test]
     fn unsupported_resource_parameter_macros_export_to_generic_blocks() {
-        let storage = r#"<ac:structured-macro ac:name="search"><ac:parameter ac:name="spacekey"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="contributor"><ri:user ri:userkey="user-123" /></ac:parameter><ac:parameter ac:name="query">docs</ac:parameter></ac:structured-macro>"#;
+        let storage = r#"<ac:structured-macro ac:name="custom-resource"><ac:parameter ac:name="spacekey"><ri:space ri:space-key="TEST" /></ac:parameter><ac:parameter ac:name="contributor"><ri:user ri:userkey="user-123" /></ac:parameter><ac:parameter ac:name="query">docs</ac:parameter></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
-        assert!(markdown.contains(":::confluence-macro search"));
+        assert!(markdown.contains(":::confluence-macro custom-resource"));
         assert!(markdown.contains("spacekey: !space TEST"));
         assert!(markdown.contains("contributor: !user confluence-user://user?userkey=user-123"));
         assert!(markdown.contains("query: docs"));
@@ -3621,6 +3703,9 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
     fn whitespace_between_supported_blocks_does_not_force_fallback_export() {
         let storage = concat!(
             "<h1>Macro Source</h1>\n",
+            "<ac:structured-macro ac:name=\"anchor\">",
+            "<ac:parameter ac:name=\"\">intro</ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"excerpt-include\">",
             "<ac:parameter ac:name=\"default-parameter\">TEST:Docs Home</ac:parameter>",
             "</ac:structured-macro>\n",
@@ -3642,6 +3727,11 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
             "<ac:structured-macro ac:name=\"content-report-table\">",
             "<ac:parameter ac:name=\"labels\">e2e-macro-target</ac:parameter>",
             "<ac:parameter ac:name=\"spaces\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"search\">",
+            "<ac:parameter ac:name=\"spacekey\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
+            "<ac:parameter ac:name=\"contributor\"><ri:user ri:userkey=\"user-123\" /></ac:parameter>",
+            "<ac:parameter ac:name=\"query\">docs</ac:parameter>",
             "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"tasks-report-macro\">",
             "<ac:parameter ac:name=\"spaceAndPage\">TEST</ac:parameter>",
@@ -3731,6 +3821,7 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
         );
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("# Macro Source"));
+        assert!(markdown.contains(":::confluence-anchor"));
         assert!(markdown.contains(":::confluence-excerpt-include"));
         assert!(markdown.contains(":::confluence-include-page"));
         assert!(markdown.contains(":::confluence-page-tree"));
@@ -3738,6 +3829,7 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
         assert!(markdown.contains(":::confluence-content-by-label"));
         assert!(markdown.contains(":::confluence-content-by-user"));
         assert!(markdown.contains(":::confluence-content-report-table"));
+        assert!(markdown.contains(":::confluence-search"));
         assert!(markdown.contains(":::confluence-task-report"));
         assert!(markdown.contains(":::confluence-recently-updated"));
         assert!(markdown.contains(":::confluence-livesearch"));
@@ -3920,6 +4012,22 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="sortBy">name</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn anchor_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-anchor\nname: intro\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("anchor block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="anchor">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="">intro</ac:parameter>"#)
         );
     }
 
@@ -4543,6 +4651,34 @@ line 2]]></ac:plain-text-body></ac:structured-macro>"#;
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="maxResults">5</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn search_blocks_round_trip_back_to_structured_macros() {
+        let user = build_user_placeholder_url(&UserMentionPlaceholder {
+            user_key: Some("user-123".to_string()),
+            ..UserMentionPlaceholder::default()
+        });
+        let markdown = format!(
+            ":::confluence-search\nspacekey: !space TEST,@personal\ncontributor: !user {user}\nquery: docs\n:::"
+        );
+        let rendered = markdown_to_storage(&markdown, false).expect("search block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="search">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="spacekey"><ri:space ri:space-key="TEST" /><ri:space ri:space-key="@personal" /></ac:parameter>"#
+        ));
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="contributor"><ri:user ri:userkey="user-123" /></ac:parameter>"#
+        ));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="query">docs</ac:parameter>"#)
         );
     }
 
