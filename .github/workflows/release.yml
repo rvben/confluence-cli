@@ -201,7 +201,7 @@ jobs:
           FORMULA
 
           sed -i 's/^          //' Formula/confluence-cli.rb
-          sed -i "s/VERSION_PLACEHOLDER/${version}/" Formula/confluence-cli.rb
+          sed -i "s/VERSION_PLACEHOLDER/${version}/g" Formula/confluence-cli.rb
           sed -i "s/SHA_MACOS_ARM64_PLACEHOLDER/${SHA_MACOS_ARM64}/" Formula/confluence-cli.rb
           sed -i "s/SHA_MACOS_X86_PLACEHOLDER/${SHA_MACOS_X86}/" Formula/confluence-cli.rb
           sed -i "s/SHA_LINUX_X86_PLACEHOLDER/${SHA_LINUX_X86}/" Formula/confluence-cli.rb
