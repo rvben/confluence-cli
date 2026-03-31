@@ -5,8 +5,12 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use directories::ProjectDirs;
+use reqwest::Client;
 use serde_json::Value;
 use tempfile::TempDir;
+use tokio::runtime::Runtime;
+use url::Url;
 use walkdir::WalkDir;
 
 #[derive(Clone, Debug)]
@@ -175,6 +179,135 @@ fn e2e_config() -> Option<E2eConfig> {
         envs,
         space,
     })
+}
+
+#[derive(Clone, Debug)]
+enum TestAuth {
+    Basic { username: String, token: String },
+    Bearer { token: String },
+}
+
+#[derive(Clone, Debug)]
+struct TestHttpConfig {
+    base_url: String,
+    api_path: String,
+    auth: TestAuth,
+}
+
+fn http_config(cfg: &E2eConfig) -> TestHttpConfig {
+    if let Some(profile_name) = &cfg.profile {
+        let dirs = ProjectDirs::from("dev", "ruben", "confluence-cli")
+            .expect("config directory available");
+        let config_path = dirs.config_dir().join("config.json");
+        let config_raw = fs::read_to_string(&config_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", config_path.display()));
+        let config: Value = serde_json::from_str(&config_raw)
+            .unwrap_or_else(|err| panic!("failed to parse {}: {err}", config_path.display()));
+        let profile = config
+            .get("profiles")
+            .and_then(|profiles| profiles.get(profile_name))
+            .unwrap_or_else(|| panic!("profile `{profile_name}` not found in {}", config_path.display()));
+        let auth = match profile
+            .get("auth")
+            .and_then(|auth| auth.get("type"))
+            .and_then(Value::as_str)
+            .expect("auth type")
+        {
+            "basic" => TestAuth::Basic {
+                username: string_field(profile.get("auth").expect("auth"), "username").to_string(),
+                token: string_field(profile.get("auth").expect("auth"), "token").to_string(),
+            },
+            "bearer" => TestAuth::Bearer {
+                token: string_field(profile.get("auth").expect("auth"), "token").to_string(),
+            },
+            other => panic!("unsupported auth type in profile: {other}"),
+        };
+        return TestHttpConfig {
+            base_url: string_field(profile, "base_url").to_string(),
+            api_path: string_field(profile, "api_path").to_string(),
+            auth,
+        };
+    }
+
+    let env_value = |key: &str| {
+        cfg.envs
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    };
+    let auth = if let Some(token) = env_value("CONFLUENCE_BEARER_TOKEN") {
+        TestAuth::Bearer { token }
+    } else {
+        TestAuth::Basic {
+            username: env_value("CONFLUENCE_USERNAME").expect("env username"),
+            token: env_value("CONFLUENCE_API_TOKEN").expect("env token"),
+        }
+    };
+    TestHttpConfig {
+        base_url: env_value("CONFLUENCE_DOMAIN").expect("env base url"),
+        api_path: env_value("CONFLUENCE_API_PATH").expect("env api path"),
+        auth,
+    }
+}
+
+fn current_user_placeholder(cfg: &E2eConfig) -> String {
+    let http = http_config(cfg);
+    let url = format!(
+        "{}{}{}",
+        http.base_url.trim_end_matches('/'),
+        http.api_path.trim_end_matches('/'),
+        "/user/current"
+    );
+    let runtime = Runtime::new().expect("tokio runtime");
+    let current_user = runtime.block_on(async move {
+        let client = Client::new();
+        let request = match http.auth {
+            TestAuth::Basic { username, token } => client.get(&url).basic_auth(username, Some(token)),
+            TestAuth::Bearer { token } => client.get(&url).bearer_auth(token),
+        };
+        let response = request.send().await.expect("current user request");
+        let response = response
+            .error_for_status()
+            .unwrap_or_else(|err| panic!("current user request failed for {url}: {err}"));
+        response
+            .json::<Value>()
+            .await
+            .expect("current user json response")
+    });
+
+    let mut placeholder = Url::parse("confluence-user://user").expect("valid user placeholder");
+    {
+        let mut pairs = placeholder.query_pairs_mut();
+        if let Some(account_id) = current_user.get("accountId").and_then(Value::as_str) {
+            pairs.append_pair("account-id", account_id);
+        }
+        if let Some(user_key) = current_user.get("userKey").and_then(Value::as_str) {
+            pairs.append_pair("userkey", user_key);
+        }
+        if let Some(username) = current_user.get("username").and_then(Value::as_str) {
+            pairs.append_pair("username", username);
+        }
+    }
+    placeholder.to_string()
+}
+
+fn expected_user_resource_fragment(user_placeholder: &str) -> String {
+    let placeholder = Url::parse(user_placeholder).expect("valid user placeholder url");
+    for (key, value) in placeholder.query_pairs() {
+        match key.as_ref() {
+            "account-id" => {
+                return format!(r#"ri:account-id="{}""#, value);
+            }
+            "userkey" => {
+                return format!(r#"ri:userkey="{}""#, value);
+            }
+            "username" => {
+                return format!(r#"ri:username="{}""#, value);
+            }
+            _ => {}
+        }
+    }
+    panic!("expected at least one user identifier in {user_placeholder}");
 }
 
 fn find_binary_path() -> PathBuf {
@@ -634,6 +767,8 @@ fn e2e_cli_lifecycle() {
     let macro_source_dir = macro_root_dir.join("source");
     let macro_target_dir = macro_root_dir.join("target");
     let macro_child_dir = macro_source_dir.join("child");
+    let macro_user = current_user_placeholder(&cfg);
+    let macro_user_fragment = expected_user_resource_fragment(&macro_user);
     fs::create_dir_all(&macro_root_dir).expect("create macro root dir");
     fs::create_dir_all(&macro_source_dir).expect("create macro source dir");
     fs::create_dir_all(&macro_target_dir).expect("create macro target dir");
@@ -648,8 +783,9 @@ fn e2e_cli_lifecycle() {
     fs::write(
         macro_source_dir.join("index.md"),
         format!(
-            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-contributors\nspaces: {space},@personal\nlabels: e2e-macro-target\nmode: list\n:::\n\n:::confluence-contributors-summary\nspaces: {space}\ncolumns: edits,comments,labels\nlimit: 10\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nspaces: {space}\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-recently-used-labels\nscope: space\nstyle: cloud\n:::\n\n:::confluence-gallery\nsortBy: name\ncolumns: 2\n:::\n\n:::confluence-favorite-pages\n:::\n\n:::confluence-change-history\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
-            space = cfg.space
+            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-contributors\nspaces: {space},@personal\nlabels: e2e-macro-target\nmode: list\n:::\n\n:::confluence-contributors-summary\nspaces: {space}\ncolumns: edits,comments,labels\nlimit: 10\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nspaces: {space}\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-recently-used-labels\nscope: space\nstyle: cloud\n:::\n\n:::confluence-gallery\nsortBy: name\ncolumns: 2\n:::\n\n:::confluence-favorite-pages\n:::\n\n:::confluence-change-history\n:::\n\n:::confluence-profile\nuser: {macro_user}\n:::\n\n:::confluence-status-list\nusername: {macro_user}\n:::\n\n:::confluence-network\nmode: followers\nusername: {macro_user}\nmax: 10\ntheme: full\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
+            space = cfg.space,
+            macro_user = macro_user
         ),
     )
     .expect("write macro source markdown");
@@ -1012,6 +1148,34 @@ fn e2e_cli_lifecycle() {
         macro_source_body.contains(r#"ac:name="change-history""#),
         "expected change-history macro in source body: {macro_source_body}"
     );
+    assert!(
+        macro_source_body.contains(r#"ac:name="profile""#),
+        "expected profile macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(&macro_user_fragment),
+        "expected profile user resource to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="status-list""#),
+        "expected status-list macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(&macro_user_fragment)
+            || macro_source_body.contains(r#"<ac:parameter ac:name="username">"#),
+        "expected status-list user parameter to survive storage rendering as either a user resource or a plain username: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="network""#),
+        "expected network macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="">followers</ac:parameter>"#)
+            && macro_source_body.contains(&macro_user_fragment)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="max">10</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="theme">full</ac:parameter>"#),
+        "expected network parameters to survive storage rendering: {macro_source_body}"
+    );
 
     let macro_target_get = cfg.run_json(&["page", "get", &macro_target_id, "--show-body"]);
     let macro_target_body = string_field(
@@ -1236,6 +1400,33 @@ fn e2e_cli_lifecycle() {
     assert!(
         pulled_macro_source_markdown.contains(":::confluence-change-history"),
         "expected pulled macro source to preserve change-history block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-profile"),
+        "expected pulled macro source to preserve profile block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("user: confluence-user://user?"),
+        "expected pulled profile user parameter to survive export as a user placeholder: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-status-list"),
+        "expected pulled macro source to preserve status-list block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("username: "),
+        "expected pulled status-list user parameter to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-network"),
+        "expected pulled macro source to preserve network block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("mode: followers")
+            && pulled_macro_source_markdown.contains("username: confluence-user://user?")
+            && pulled_macro_source_markdown.contains("max: 10")
+            && pulled_macro_source_markdown.contains("theme: full"),
+        "expected pulled network parameters to survive export: {pulled_macro_source_markdown}"
     );
 
     let pulled_macro_target = find_index_md_by_title(&macro_pull_dir, &macro_target_title);

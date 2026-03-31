@@ -663,6 +663,15 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if matches!(name, "change-history" | "changehistory") {
         return Some(":::confluence-change-history\n:::".to_string());
     }
+    if name == "profile" {
+        return render_parameter_only_macro_block("profile", node);
+    }
+    if name == "status-list" {
+        return render_parameter_only_macro_block("status-list", node);
+    }
+    if name == "network" {
+        return render_default_parameter_macro_block("network", "mode", node);
+    }
     if name == "toc" {
         return render_parameter_only_macro_block("toc", node);
     }
@@ -868,6 +877,21 @@ fn render_expand_macro_block(node: Node<'_, '_>, source: &str) -> Option<String>
 
 fn render_parameter_only_macro_block(name: &str, node: Node<'_, '_>) -> Option<String> {
     let parameters = collect_macro_parameters(node);
+    Some(render_parameter_only_macro_block_with_parameters(
+        name,
+        &parameters,
+    ))
+}
+
+fn render_default_parameter_macro_block(
+    name: &str,
+    default_parameter_name: &str,
+    node: Node<'_, '_>,
+) -> Option<String> {
+    let mut parameters = collect_macro_parameters(node);
+    if let Some(value) = parameters.remove("") {
+        parameters.insert(default_parameter_name.to_string(), value);
+    }
     Some(render_parameter_only_macro_block_with_parameters(
         name,
         &parameters,
@@ -1613,6 +1637,9 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-gallery" => Some("gallery"),
             ":::confluence-favorite-pages" => Some("favorite-pages"),
             ":::confluence-change-history" => Some("change-history"),
+            ":::confluence-profile" => Some("profile"),
+            ":::confluence-status-list" => Some("status-list"),
+            ":::confluence-network" => Some("network"),
             _ => None,
         };
 
@@ -1784,6 +1811,19 @@ fn replace_parameterized_colon_macro_blocks(
                 } else {
                     build_parameter_only_macro_storage("change-history", &parameters)
                 }
+            }
+            "profile" => {
+                let parameters = parse_macro_parameter_lines(&body, "confluence profile macro")?;
+                build_user_parameter_macro_storage("profile", "user", &parameters)
+            }
+            "status-list" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence status-list macro")?;
+                build_user_parameter_macro_storage("status-list", "username", &parameters)
+            }
+            "network" => {
+                let parameters = parse_macro_parameter_lines(&body, "confluence network macro")?;
+                build_network_macro_storage(&parameters)
             }
             _ => unreachable!(),
         };
@@ -2190,6 +2230,37 @@ fn build_space_key_macro_storage(name: &str, parameters: &BTreeMap<String, Strin
     )
 }
 
+fn build_user_parameter_macro_storage(
+    name: &str,
+    user_parameter_name: &str,
+    parameters: &BTreeMap<String, String>,
+) -> String {
+    let mut parameters = parameters.clone();
+    let user_xml = parameters
+        .remove(user_parameter_name)
+        .map(|user| build_user_parameter_xml(user_parameter_name, &user))
+        .unwrap_or_default();
+    let parameters_xml = build_macro_parameters_xml(&parameters);
+    format!(
+        r#"<ac:structured-macro ac:name="{name}">{parameters_xml}{user_xml}</ac:structured-macro>"#
+    )
+}
+
+fn build_network_macro_storage(parameters: &BTreeMap<String, String>) -> String {
+    let mut parameters = parameters.clone();
+    if let Some(mode) = parameters.remove("mode") {
+        parameters.insert(String::new(), mode);
+    }
+    let username_xml = parameters
+        .remove("username")
+        .map(|user| build_user_parameter_xml("username", &user))
+        .unwrap_or_default();
+    let parameters_xml = build_macro_parameters_xml(&parameters);
+    format!(
+        r#"<ac:structured-macro ac:name="network">{parameters_xml}{username_xml}</ac:structured-macro>"#
+    )
+}
+
 fn build_space_parameter_xml(name: &str, spaces: &str) -> Option<String> {
     let trimmed = spaces.trim();
     if trimmed.is_empty() {
@@ -2216,6 +2287,36 @@ fn build_space_parameter_xml(name: &str, spaces: &str) -> Option<String> {
     Some(format!(
         r#"<ac:parameter ac:name="{name}">{resources}</ac:parameter>"#
     ))
+}
+
+fn build_user_parameter_xml(name: &str, user: &str) -> String {
+    if let Some(placeholder) = parse_user_placeholder_url(user) {
+        if let Some(resource_xml) = build_user_resource_xml(&placeholder) {
+            return format!(r#"<ac:parameter ac:name="{name}">{resource_xml}</ac:parameter>"#);
+        }
+    }
+    format!(
+        r#"<ac:parameter ac:name="{name}">{}</ac:parameter>"#,
+        escape_xml(user)
+    )
+}
+
+fn build_user_resource_xml(user: &UserMentionPlaceholder) -> Option<String> {
+    if let Some(account_id) = user.account_id.as_deref() {
+        return Some(format!(
+            r#"<ri:user ri:account-id="{}" />"#,
+            escape_xml(account_id)
+        ));
+    }
+    if let Some(user_key) = user.user_key.as_deref() {
+        return Some(format!(
+            r#"<ri:user ri:userkey="{}" />"#,
+            escape_xml(user_key)
+        ));
+    }
+    user.username
+        .as_deref()
+        .map(|username| format!(r#"<ri:user ri:username="{}" />"#, escape_xml(username)))
 }
 
 fn parse_default_parameter_page_target(target: &str) -> PageLinkPlaceholder {
@@ -2645,6 +2746,33 @@ mod tests {
     }
 
     #[test]
+    fn profile_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="profile"><ac:parameter ac:name="user"><ri:user ri:account-id="abc123" /></ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-profile"));
+        assert!(markdown.contains("user: confluence-user://user?account-id=abc123"));
+    }
+
+    #[test]
+    fn status_list_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="status-list"><ac:parameter ac:name="username"><ri:user ri:userkey="user-123" /></ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-status-list"));
+        assert!(markdown.contains("username: confluence-user://user?userkey=user-123"));
+    }
+
+    #[test]
+    fn network_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="network"><ac:parameter ac:name="">followers</ac:parameter><ac:parameter ac:name="username"><ri:user ri:userkey="user-123" /></ac:parameter><ac:parameter ac:name="max">10</ac:parameter><ac:parameter ac:name="theme">full</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-network"));
+        assert!(markdown.contains("mode: followers"));
+        assert!(markdown.contains("username: confluence-user://user?userkey=user-123"));
+        assert!(markdown.contains("max: 10"));
+        assert!(markdown.contains("theme: full"));
+    }
+
+    #[test]
     fn toc_zone_macros_export_to_blocks() {
         let storage = r#"<ac:structured-macro ac:name="toc-zone"><ac:parameter ac:name="location">top</ac:parameter><ac:parameter ac:name="maxLevel">3</ac:parameter><ac:rich-text-body><h2>Scoped Heading</h2><p>Only this section counts.</p></ac:rich-text-body></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
@@ -2826,6 +2954,16 @@ mod tests {
             "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"favpages\"/>\n",
             "<ac:structured-macro ac:name=\"change-history\"/>\n",
+            "<ac:structured-macro ac:name=\"profile\">",
+            "<ac:parameter ac:name=\"user\"><ri:user ri:account-id=\"abc123\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"status-list\">",
+            "<ac:parameter ac:name=\"username\"><ri:user ri:userkey=\"user-123\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"network\">",
+            "<ac:parameter ac:name=\"\">followers</ac:parameter>",
+            "<ac:parameter ac:name=\"username\"><ri:user ri:userkey=\"user-123\" /></ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"listlabels\">",
             "<ac:parameter ac:name=\"spaceKey\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
             "</ac:structured-macro>\n",
@@ -2859,6 +2997,9 @@ mod tests {
         assert!(markdown.contains(":::confluence-gallery"));
         assert!(markdown.contains(":::confluence-favorite-pages"));
         assert!(markdown.contains(":::confluence-change-history"));
+        assert!(markdown.contains(":::confluence-profile"));
+        assert!(markdown.contains(":::confluence-status-list"));
+        assert!(markdown.contains(":::confluence-network"));
         assert!(markdown.contains(":::confluence-labels-list"));
         assert!(markdown.contains(":::confluence-popular-labels"));
         assert!(markdown.contains(":::confluence-related-labels"));
@@ -3182,6 +3323,64 @@ mod tests {
                 || rendered
                     .storage
                     .contains(r#"<ac:structured-macro ac:name="change-history">"#)
+        );
+    }
+
+    #[test]
+    fn profile_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-profile\nuser: confluence-user://user?account-id=abc123\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("profile block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="profile">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="user"><ri:user ri:account-id="abc123" /></ac:parameter>"#
+        ));
+    }
+
+    #[test]
+    fn status_list_blocks_round_trip_back_to_structured_macros() {
+        let markdown =
+            ":::confluence-status-list\nusername: confluence-user://user?userkey=user-123\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("status-list block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="status-list">"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="username"><ri:user ri:userkey="user-123" /></ac:parameter>"#
+        ));
+    }
+
+    #[test]
+    fn network_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-network\nmode: followers\nusername: confluence-user://user?userkey=user-123\nmax: 10\ntheme: full\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("network block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="network">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="">followers</ac:parameter>"#)
+        );
+        assert!(rendered.storage.contains(
+            r#"<ac:parameter ac:name="username"><ri:user ri:userkey="user-123" /></ac:parameter>"#
+        ));
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="max">10</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="theme">full</ac:parameter>"#)
         );
     }
 
