@@ -600,6 +600,18 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if matches!(name, "detailssummary" | "content-properties-report") {
         return render_parameter_only_macro_block("content-properties-report", node);
     }
+    if name == "attachments" {
+        return render_parameter_only_macro_block("attachments", node);
+    }
+    if matches!(name, "blog-posts" | "blogposts") {
+        return render_parameter_only_macro_block("blog-posts", node);
+    }
+    if matches!(
+        name,
+        "recently-updated-dashboard" | "recentlyupdated-dashboard"
+    ) {
+        return render_parameter_only_macro_block("recently-updated-dashboard", node);
+    }
     if name == "excerpt-include" {
         return render_page_reference_macro_block("excerpt-include", node);
     }
@@ -1507,6 +1519,9 @@ fn replace_parameterized_colon_macro_blocks(
             ":::confluence-excerpt" => Some("excerpt"),
             ":::confluence-content-properties" => Some("content-properties"),
             ":::confluence-content-properties-report" => Some("content-properties-report"),
+            ":::confluence-attachments" => Some("attachments"),
+            ":::confluence-blog-posts" => Some("blog-posts"),
+            ":::confluence-recently-updated-dashboard" => Some("recently-updated-dashboard"),
             ":::confluence-toc-zone" => Some("toc-zone"),
             ":::confluence-toc" => Some("toc"),
             ":::confluence-children" => Some("children"),
@@ -1562,6 +1577,22 @@ fn replace_parameterized_colon_macro_blocks(
                     "confluence content-properties-report macro",
                 )?;
                 build_legacy_parameter_only_macro_storage("detailssummary", &parameters)
+            }
+            "attachments" => {
+                let parameters =
+                    parse_macro_parameter_lines(&body, "confluence attachments macro")?;
+                build_parameter_only_macro_storage("attachments", &parameters)
+            }
+            "blog-posts" => {
+                let parameters = parse_macro_parameter_lines(&body, "confluence blog-posts macro")?;
+                build_parameter_only_macro_storage("blog-posts", &parameters)
+            }
+            "recently-updated-dashboard" => {
+                let parameters = parse_macro_parameter_lines(
+                    &body,
+                    "confluence recently-updated-dashboard macro",
+                )?;
+                build_parameter_only_macro_storage("recently-updated-dashboard", &parameters)
             }
             "toc-zone" => {
                 let (parameters, body_storage) =
@@ -2386,6 +2417,33 @@ mod tests {
     }
 
     #[test]
+    fn attachments_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="attachments"><ac:parameter ac:name="patterns">*.pdf</ac:parameter><ac:parameter ac:name="sortBy">name</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-attachments"));
+        assert!(markdown.contains("patterns: *.pdf"));
+        assert!(markdown.contains("sortBy: name"));
+    }
+
+    #[test]
+    fn blog_posts_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="blog-posts"><ac:parameter ac:name="max">5</ac:parameter><ac:parameter ac:name="time">7</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-blog-posts"));
+        assert!(markdown.contains("max: 5"));
+        assert!(markdown.contains("time: 7"));
+    }
+
+    #[test]
+    fn recently_updated_dashboard_macros_export_to_blocks() {
+        let storage = r#"<ac:structured-macro ac:name="recently-updated-dashboard"><ac:parameter ac:name="limit">10</ac:parameter><ac:parameter ac:name="theme">concise</ac:parameter></ac:structured-macro>"#;
+        let markdown = storage_to_markdown(storage);
+        assert!(markdown.contains(":::confluence-recently-updated-dashboard"));
+        assert!(markdown.contains("limit: 10"));
+        assert!(markdown.contains("theme: concise"));
+    }
+
+    #[test]
     fn toc_zone_macros_export_to_blocks() {
         let storage = r#"<ac:structured-macro ac:name="toc-zone"><ac:parameter ac:name="location">top</ac:parameter><ac:parameter ac:name="maxLevel">3</ac:parameter><ac:rich-text-body><h2>Scoped Heading</h2><p>Only this section counts.</p></ac:rich-text-body></ac:structured-macro>"#;
         let markdown = storage_to_markdown(storage);
@@ -2544,6 +2602,15 @@ mod tests {
             "<ac:parameter ac:name=\"spaceKey\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
             "</ac:structured-macro>\n",
             "<ac:macro ac:name=\"page-index\" />\n",
+            "<ac:structured-macro ac:name=\"attachments\">",
+            "<ac:parameter ac:name=\"patterns\">*.pdf</ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"blog-posts\">",
+            "<ac:parameter ac:name=\"max\">5</ac:parameter>",
+            "</ac:structured-macro>\n",
+            "<ac:structured-macro ac:name=\"recently-updated-dashboard\">",
+            "<ac:parameter ac:name=\"limit\">10</ac:parameter>",
+            "</ac:structured-macro>\n",
             "<ac:structured-macro ac:name=\"listlabels\">",
             "<ac:parameter ac:name=\"spaceKey\"><ri:space ri:space-key=\"TEST\" /></ac:parameter>",
             "</ac:structured-macro>\n",
@@ -2568,6 +2635,9 @@ mod tests {
         assert!(markdown.contains(":::confluence-recently-updated"));
         assert!(markdown.contains(":::confluence-livesearch"));
         assert!(markdown.contains(":::confluence-page-index"));
+        assert!(markdown.contains(":::confluence-attachments"));
+        assert!(markdown.contains(":::confluence-blog-posts"));
+        assert!(markdown.contains(":::confluence-recently-updated-dashboard"));
         assert!(markdown.contains(":::confluence-labels-list"));
         assert!(markdown.contains(":::confluence-popular-labels"));
         assert!(markdown.contains(":::confluence-related-labels"));
@@ -2704,6 +2774,70 @@ mod tests {
             rendered
                 .storage
                 .contains(r#"<ac:parameter ac:name="id">decision</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn attachments_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("attachments block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="attachments">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="patterns">*.pdf</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="sortBy">name</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn blog_posts_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-blog-posts\nmax: 5\ntime: 7\n:::";
+        let rendered = markdown_to_storage(markdown, false).expect("blog-posts block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="blog-posts">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="max">5</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="time">7</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn recently_updated_dashboard_blocks_round_trip_back_to_structured_macros() {
+        let markdown = ":::confluence-recently-updated-dashboard\nlimit: 10\ntheme: concise\n:::";
+        let rendered = markdown_to_storage(markdown, false)
+            .expect("recently-updated-dashboard block converts");
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:structured-macro ac:name="recently-updated-dashboard">"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="limit">10</ac:parameter>"#)
+        );
+        assert!(
+            rendered
+                .storage
+                .contains(r#"<ac:parameter ac:name="theme">concise</ac:parameter>"#)
         );
     }
 

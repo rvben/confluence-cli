@@ -648,7 +648,7 @@ fn e2e_cli_lifecycle() {
     fs::write(
         macro_source_dir.join("index.md"),
         format!(
-            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
+            "---\ntitle: {macro_source_title}\ntype: page\nlabels: []\nstatus: current\nparent: null\nproperties: {{}}\n---\n\n# Macro Source\n\n:::confluence-excerpt-include\nnopanel: true\npage: ../target/index.md\n:::\n\n:::confluence-include-page\npage: ../target/index.md\n:::\n\n:::confluence-page-tree\nroot: index.md\nsearchBox: true\n:::\n\n:::confluence-page-tree-search\nroot: ../target/index.md\nspaceKey: {space}\n:::\n\n:::confluence-content-by-label\ncql: label = \"e2e-macro-target\"\nmaxResults: 5\n:::\n\n:::confluence-content-properties-report\nlabel: e2e-content-properties\nid: decision\n:::\n\n:::confluence-attachments\npatterns: *.pdf\nsortBy: name\n:::\n\n:::confluence-blog-posts\nmax: 5\ntime: 7\n:::\n\n:::confluence-recently-updated\nspaces: {space}\nmax: 10\n:::\n\n:::confluence-recently-updated-dashboard\nlimit: 10\ntheme: concise\n:::\n\n:::confluence-livesearch\nspaceKey: {space}\nlabels: e2e-macro-target\nsize: large\n:::\n\n:::confluence-page-index\n:::\n\n:::confluence-toc-zone\nlocation: top\nmaxLevel: 3\n---\n## Zoned Heading\n\nOnly this section counts.\n:::\n\n:::confluence-labels-list\nspaceKey: {space}\nexcludedLabels: drafts,test\n:::\n\n:::confluence-popular-labels\nspaceKey: {space}\ncount: 25\nstyle: heatmap\n:::\n\n:::confluence-related-labels\nlabels: e2e-macro-target\n:::\n\n:::confluence-children\nall: true\nsort: creation\n:::\n",
             space = cfg.space
         ),
     )
@@ -824,6 +824,24 @@ fn e2e_cli_lifecycle() {
         "expected content-properties-report parameters to survive storage rendering: {macro_source_body}"
     );
     assert!(
+        macro_source_body.contains(r#"ac:name="attachments""#),
+        "expected attachments macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="patterns">*.pdf</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="sortBy">name</ac:parameter>"#),
+        "expected attachments parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="blog-posts""#),
+        "expected blog-posts macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="max">5</ac:parameter>"#)
+            && macro_source_body.contains(r#"<ac:parameter ac:name="time">7</ac:parameter>"#),
+        "expected blog-posts parameters to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
         macro_source_body.contains(r#"ac:name="recently-updated""#),
         "expected recently-updated macro in source body: {macro_source_body}"
     );
@@ -833,6 +851,16 @@ fn e2e_cli_lifecycle() {
             cfg.space
         )),
         "expected recently-updated spaces parameter to survive storage rendering: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"ac:name="recently-updated-dashboard""#),
+        "expected recently-updated-dashboard macro in source body: {macro_source_body}"
+    );
+    assert!(
+        macro_source_body.contains(r#"<ac:parameter ac:name="limit">10</ac:parameter>"#)
+            && macro_source_body
+                .contains(r#"<ac:parameter ac:name="theme">concise</ac:parameter>"#),
+        "expected recently-updated-dashboard parameters to survive storage rendering: {macro_source_body}"
     );
     assert!(
         macro_source_body.contains(r#"ac:name="livesearch""#),
@@ -1006,12 +1034,39 @@ fn e2e_cli_lifecycle() {
         "expected pulled content-properties-report parameters to survive export: {pulled_macro_source_markdown}"
     );
     assert!(
+        pulled_macro_source_markdown.contains(":::confluence-attachments"),
+        "expected pulled macro source to preserve attachments block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("patterns: *.pdf")
+            && pulled_macro_source_markdown.contains("sortBy: name"),
+        "expected pulled attachments parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-blog-posts"),
+        "expected pulled macro source to preserve blog-posts block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("max: 5")
+            && pulled_macro_source_markdown.contains("time: 7"),
+        "expected pulled blog-posts parameters to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
         pulled_macro_source_markdown.contains(":::confluence-recently-updated"),
         "expected pulled macro source to preserve recently-updated block: {pulled_macro_source_markdown}"
     );
     assert!(
         pulled_macro_source_markdown.contains(&format!("spaces: {}", cfg.space)),
         "expected pulled recently-updated spaces to survive export: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains(":::confluence-recently-updated-dashboard"),
+        "expected pulled macro source to preserve recently-updated-dashboard block: {pulled_macro_source_markdown}"
+    );
+    assert!(
+        pulled_macro_source_markdown.contains("limit: 10")
+            && pulled_macro_source_markdown.contains("theme: concise"),
+        "expected pulled recently-updated-dashboard parameters to survive export: {pulled_macro_source_markdown}"
     );
     assert!(
         pulled_macro_source_markdown.contains(":::confluence-livesearch"),
