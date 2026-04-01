@@ -737,7 +737,13 @@ pub fn ensure_writable(profile: &ResolvedProfile) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+
+    // ── Fixtures ──────────────────────────────────────────────────────────────
 
     fn search_content(content_type: &str) -> V1Content {
         V1Content {
@@ -762,6 +768,85 @@ mod tests {
         }
     }
 
+    fn test_profile(base_url: &str) -> ResolvedProfile {
+        ResolvedProfile {
+            name: "test".to_string(),
+            provider: crate::model::ProviderKind::DataCenter,
+            base_url: base_url.to_string(),
+            api_path: "/rest/api".to_string(),
+            auth: crate::config::AuthConfig::Bearer {
+                token: "test-token".to_string(),
+            },
+            read_only: false,
+        }
+    }
+
+    fn space_result(key: &str, name: &str, id: &str) -> serde_json::Value {
+        json!({ "key": key, "name": name, "id": id, "_links": {} })
+    }
+
+    fn paginated_response(
+        results: serde_json::Value,
+        limit: usize,
+        start: usize,
+    ) -> serde_json::Value {
+        json!({
+            "results": results,
+            "limit": limit,
+            "size": results.as_array().map(|a| a.len()).unwrap_or(0),
+            "start": start,
+            "_links": {}
+        })
+    }
+
+    // ── build_search_cql ──────────────────────────────────────────────────────
+
+    #[test]
+    fn search_cql_plain_text_wraps_in_text_match() {
+        let cql = build_search_cql("hello world", false);
+        assert_eq!(cql, r#"text ~ "hello world" order by lastmodified desc"#);
+    }
+
+    #[test]
+    fn search_cql_plain_text_escapes_quotes() {
+        let cql = build_search_cql(r#"say "hi""#, false);
+        assert_eq!(cql, r#"text ~ "say \"hi\"" order by lastmodified desc"#);
+    }
+
+    #[test]
+    fn search_cql_passthrough_when_cql_flag_set() {
+        let query = r#"space = "PROJ" AND type = page"#;
+        assert_eq!(build_search_cql(query, true), query);
+    }
+
+    // ── extract_error_message ─────────────────────────────────────────────────
+
+    #[test]
+    fn extract_error_message_pulls_message_field() {
+        assert_eq!(
+            extract_error_message(r#"{"message":"Not authorized","statusCode":401}"#),
+            "Not authorized"
+        );
+    }
+
+    #[test]
+    fn extract_error_message_falls_back_to_raw_on_missing_field() {
+        assert_eq!(
+            extract_error_message(r#"{"error":"oops"}"#),
+            r#"{"error":"oops"}"#
+        );
+    }
+
+    #[test]
+    fn extract_error_message_falls_back_to_raw_on_invalid_json() {
+        assert_eq!(
+            extract_error_message("plain text error"),
+            "plain text error"
+        );
+    }
+
+    // ── v1_search_result ──────────────────────────────────────────────────────
+
     #[test]
     fn search_filters_out_attachment_hits() {
         assert!(
@@ -774,5 +859,172 @@ mod tests {
         let page = v1_search_result("https://example.atlassian.net", search_content("page"))
             .expect("page result should be preserved");
         assert_eq!(page.kind, ContentKind::Page);
+    }
+
+    #[test]
+    fn search_preserves_blogpost_hits() {
+        let post = v1_search_result("https://example.atlassian.net", search_content("blogpost"))
+            .expect("blogpost result should be preserved");
+        assert_eq!(post.kind, ContentKind::BlogPost);
+    }
+
+    // ── property_payload ──────────────────────────────────────────────────────
+
+    #[test]
+    fn property_payload_without_version_omits_version_field() {
+        let payload = property_payload("my-key", json!("value"), None);
+        assert_eq!(payload["key"], "my-key");
+        assert_eq!(payload["value"], "value");
+        assert!(payload.get("version").is_none());
+    }
+
+    #[test]
+    fn property_payload_with_version_increments_by_one() {
+        let payload = property_payload("k", json!(42), Some(3));
+        assert_eq!(payload["version"]["number"], 4);
+    }
+
+    // ── ensure_writable ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ensure_writable_allows_non_readonly_profile() {
+        let profile = test_profile("https://example.com");
+        assert!(ensure_writable(&profile).is_ok());
+    }
+
+    #[test]
+    fn ensure_writable_rejects_readonly_profile() {
+        let mut profile = test_profile("https://example.com");
+        profile.read_only = true;
+        let err = ensure_writable(&profile).unwrap_err();
+        assert!(err.to_string().contains("read-only"));
+    }
+
+    // ── fetch_all_v1 ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fetch_all_v1_single_page_returns_all_results() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(paginated_response(
+                json!([
+                    space_result("A", "Alpha", "1"),
+                    space_result("B", "Beta", "2")
+                ]),
+                50,
+                0,
+            )))
+            .mount(&server)
+            .await;
+
+        let client = HttpClient::new(test_profile(&server.uri())).unwrap();
+        let spaces: Vec<V1Space> = fetch_all_v1(&client, "/space?limit=50&expand=homepage")
+            .await
+            .unwrap();
+        assert_eq!(spaces.len(), 2);
+        assert_eq!(spaces[0].key, "A");
+        assert_eq!(spaces[1].key, "B");
+    }
+
+    #[tokio::test]
+    async fn fetch_all_v1_follows_pagination_across_multiple_pages() {
+        let server = MockServer::start().await;
+
+        // Page 1: full page of 2 — signals more results exist
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(paginated_response(
+                json!([
+                    space_result("A", "Alpha", "1"),
+                    space_result("B", "Beta", "2")
+                ]),
+                2,
+                0,
+            )))
+            .mount(&server)
+            .await;
+
+        // Page 2: partial page — signals end of results
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(query_param("start", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(paginated_response(
+                json!([space_result("C", "Gamma", "3")]),
+                2,
+                2,
+            )))
+            .mount(&server)
+            .await;
+
+        let client = HttpClient::new(test_profile(&server.uri())).unwrap();
+        let spaces: Vec<V1Space> = fetch_all_v1(&client, "/space?limit=2&expand=homepage")
+            .await
+            .unwrap();
+        assert_eq!(spaces.len(), 3);
+        assert_eq!(spaces[2].key, "C");
+    }
+
+    #[tokio::test]
+    async fn fetch_all_v1_stops_on_empty_page() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "results": [], "limit": 50, "size": 0, "start": 0, "_links": {} }),
+            ))
+            .mount(&server)
+            .await;
+
+        let client = HttpClient::new(test_profile(&server.uri())).unwrap();
+        let spaces: Vec<V1Space> = fetch_all_v1(&client, "/space?limit=50&expand=homepage")
+            .await
+            .unwrap();
+        assert!(spaces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_all_v1_three_full_pages_then_empty_collects_all() {
+        let server = MockServer::start().await;
+
+        for page in 0..3usize {
+            Mock::given(method("GET"))
+                .and(path("/rest/api/space"))
+                .and(query_param("start", page * 2))
+                .respond_with(ResponseTemplate::new(200).set_body_json(paginated_response(
+                    json!([
+                        space_result(&format!("K{}", page * 2), "Space", &format!("{}", page * 2)),
+                        space_result(
+                            &format!("K{}", page * 2 + 1),
+                            "Space",
+                            &format!("{}", page * 2 + 1)
+                        )
+                    ]),
+                    2,
+                    page * 2,
+                )))
+                .mount(&server)
+                .await;
+        }
+
+        // Final page: empty
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(query_param("start", "6"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "results": [], "limit": 2, "size": 0, "start": 6, "_links": {} }),
+            ))
+            .mount(&server)
+            .await;
+
+        let client = HttpClient::new(test_profile(&server.uri())).unwrap();
+        let spaces: Vec<V1Space> = fetch_all_v1(&client, "/space?limit=2&expand=homepage")
+            .await
+            .unwrap();
+        assert_eq!(spaces.len(), 6);
     }
 }

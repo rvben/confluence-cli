@@ -958,3 +958,371 @@ fn auth_type_name(profile: &ProfileConfig) -> String {
         AuthConfig::Bearer { .. } => "bearer".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    // ── normalize_base_url ────────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_strips_trailing_slash() {
+        assert_eq!(
+            normalize_base_url("https://example.atlassian.net/"),
+            "https://example.atlassian.net"
+        );
+    }
+
+    #[test]
+    fn normalize_strips_multiple_trailing_slashes() {
+        assert_eq!(
+            normalize_base_url("https://example.com///"),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_prepends_https_when_scheme_missing() {
+        assert_eq!(
+            normalize_base_url("example.atlassian.net"),
+            "https://example.atlassian.net"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_http_scheme() {
+        assert_eq!(
+            normalize_base_url("http://localhost:8090"),
+            "http://localhost:8090"
+        );
+    }
+
+    #[test]
+    fn normalize_trims_surrounding_whitespace() {
+        assert_eq!(
+            normalize_base_url("  https://example.com  "),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_path_segment() {
+        assert_eq!(
+            normalize_base_url("https://example.com/confluence"),
+            "https://example.com/confluence"
+        );
+    }
+
+    // ── detect_provider ───────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_provider_atlassian_net_is_cloud() {
+        assert_eq!(
+            detect_provider("https://mycompany.atlassian.net"),
+            ProviderKind::Cloud
+        );
+    }
+
+    #[test]
+    fn detect_provider_api_atlassian_com_is_cloud() {
+        assert_eq!(
+            detect_provider("https://api.atlassian.com"),
+            ProviderKind::Cloud
+        );
+    }
+
+    #[test]
+    fn detect_provider_self_hosted_is_datacenter() {
+        assert_eq!(
+            detect_provider("https://confluence.mycompany.com"),
+            ProviderKind::DataCenter
+        );
+    }
+
+    #[test]
+    fn detect_provider_localhost_is_datacenter() {
+        assert_eq!(
+            detect_provider("http://localhost:8090"),
+            ProviderKind::DataCenter
+        );
+    }
+
+    #[test]
+    fn detect_provider_http_atlassian_net_is_cloud() {
+        assert_eq!(
+            detect_provider("http://mycompany.atlassian.net"),
+            ProviderKind::Cloud
+        );
+    }
+
+    // ── default_api_path ──────────────────────────────────────────────────────
+
+    #[test]
+    fn default_api_path_cloud() {
+        assert_eq!(default_api_path(ProviderKind::Cloud), "/wiki/rest/api");
+    }
+
+    #[test]
+    fn default_api_path_datacenter() {
+        assert_eq!(default_api_path(ProviderKind::DataCenter), "/rest/api");
+    }
+
+    // ── build_auth ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_auth_basic_succeeds_with_username() {
+        let auth = build_auth(
+            "basic",
+            Some("user@example.com".to_string()),
+            "tok".to_string(),
+        )
+        .unwrap();
+        match auth {
+            AuthConfig::Basic { username, token } => {
+                assert_eq!(username, "user@example.com");
+                assert_eq!(token, "tok");
+            }
+            _ => panic!("expected Basic auth"),
+        }
+    }
+
+    #[test]
+    fn build_auth_basic_fails_without_username() {
+        let err = build_auth("basic", None, "tok".to_string()).unwrap_err();
+        assert!(err.to_string().contains("username"));
+    }
+
+    #[test]
+    fn build_auth_bearer_ignores_username() {
+        let auth = build_auth("bearer", None, "my-pat".to_string()).unwrap();
+        match auth {
+            AuthConfig::Bearer { token } => assert_eq!(token, "my-pat"),
+            _ => panic!("expected Bearer auth"),
+        }
+    }
+
+    #[test]
+    fn build_auth_unknown_type_returns_error() {
+        let err = build_auth("oauth2", None, "tok".to_string()).unwrap_err();
+        assert!(err.to_string().contains("oauth2"));
+    }
+
+    // ── AppConfig save/load roundtrip ─────────────────────────────────────────
+
+    #[test]
+    fn appconfig_save_and_load_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        // Build config manually and write it
+        let mut config = AppConfig::default();
+        config.upsert_profile(
+            "default".to_string(),
+            ProfileConfig {
+                provider: ProviderKind::DataCenter,
+                base_url: "https://confluence.example.com".to_string(),
+                api_path: "/rest/api".to_string(),
+                auth: AuthConfig::Basic {
+                    username: "alice".to_string(),
+                    token: "secret".to_string(),
+                },
+                read_only: false,
+            },
+        );
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let loaded: AppConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(loaded.active_profile.as_deref(), Some("default"));
+        let profile = loaded.profiles.get("default").unwrap();
+        assert_eq!(profile.base_url, "https://confluence.example.com");
+        match &profile.auth {
+            AuthConfig::Basic { username, token } => {
+                assert_eq!(username, "alice");
+                assert_eq!(token, "secret");
+            }
+            _ => panic!("expected Basic auth"),
+        }
+    }
+
+    #[test]
+    fn appconfig_upsert_sets_active_profile() {
+        let mut config = AppConfig::default();
+        assert!(config.active_profile.is_none());
+        config.upsert_profile(
+            "work".to_string(),
+            ProfileConfig {
+                provider: ProviderKind::Cloud,
+                base_url: "https://work.atlassian.net".to_string(),
+                api_path: "/wiki/rest/api".to_string(),
+                auth: AuthConfig::Bearer {
+                    token: "tok".to_string(),
+                },
+                read_only: false,
+            },
+        );
+        assert_eq!(config.active_profile.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn appconfig_remove_profile_clears_active_when_last() {
+        let mut config = AppConfig::default();
+        config.upsert_profile(
+            "solo".to_string(),
+            ProfileConfig {
+                provider: ProviderKind::Cloud,
+                base_url: "https://example.atlassian.net".to_string(),
+                api_path: "/wiki/rest/api".to_string(),
+                auth: AuthConfig::Bearer {
+                    token: "t".to_string(),
+                },
+                read_only: false,
+            },
+        );
+        config.remove_profile("solo").unwrap();
+        assert!(config.active_profile.is_none());
+        assert!(config.profiles.is_empty());
+    }
+
+    #[test]
+    fn appconfig_remove_profile_nonexistent_returns_error() {
+        let mut config = AppConfig::default();
+        assert!(config.remove_profile("ghost").is_err());
+    }
+
+    // ── EnvOverride ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn env_override_none_when_no_vars_set() {
+        // Clear all relevant env vars before testing
+        for var in &[
+            "CONFLUENCE_DOMAIN",
+            "CONFLUENCE_API_PATH",
+            "CONFLUENCE_AUTH_TYPE",
+            "CONFLUENCE_EMAIL",
+            "CONFLUENCE_USERNAME",
+            "CONFLUENCE_API_TOKEN",
+            "CONFLUENCE_PASSWORD",
+            "CONFLUENCE_TOKEN",
+            "CONFLUENCE_BEARER_TOKEN",
+            "CONFLUENCE_PROVIDER",
+            "CONFLUENCE_READ_ONLY",
+        ] {
+            env::remove_var(var);
+        }
+        assert!(EnvOverride::from_env().unwrap().is_none());
+    }
+
+    #[test]
+    fn env_override_read_only_accepts_truthy_values() {
+        for val in &["1", "true", "TRUE", "yes", "on"] {
+            env::set_var("CONFLUENCE_DOMAIN", "https://example.atlassian.net");
+            env::set_var("CONFLUENCE_READ_ONLY", val);
+            let ov = EnvOverride::from_env().unwrap().unwrap();
+            assert!(
+                ov.read_only == Some(true),
+                "CONFLUENCE_READ_ONLY={val} should be true"
+            );
+        }
+        env::remove_var("CONFLUENCE_DOMAIN");
+        env::remove_var("CONFLUENCE_READ_ONLY");
+    }
+
+    #[test]
+    fn env_override_read_only_false_for_unrecognised_value() {
+        env::set_var("CONFLUENCE_DOMAIN", "https://example.atlassian.net");
+        env::set_var("CONFLUENCE_READ_ONLY", "false");
+        let ov = EnvOverride::from_env().unwrap().unwrap();
+        assert_eq!(ov.read_only, Some(false));
+        env::remove_var("CONFLUENCE_DOMAIN");
+        env::remove_var("CONFLUENCE_READ_ONLY");
+    }
+
+    #[test]
+    fn env_override_provider_cloud_variants() {
+        for val in &["cloud"] {
+            env::set_var("CONFLUENCE_DOMAIN", "https://example.atlassian.net");
+            env::set_var("CONFLUENCE_PROVIDER", val);
+            let ov = EnvOverride::from_env().unwrap().unwrap();
+            assert_eq!(ov.provider, Some(ProviderKind::Cloud));
+        }
+        env::remove_var("CONFLUENCE_DOMAIN");
+        env::remove_var("CONFLUENCE_PROVIDER");
+    }
+
+    #[test]
+    fn env_override_provider_datacenter_variants() {
+        for val in &["dc", "datacenter", "data_center", "data-center", "server"] {
+            env::set_var("CONFLUENCE_DOMAIN", "https://confluence.example.com");
+            env::set_var("CONFLUENCE_PROVIDER", val);
+            let ov = EnvOverride::from_env().unwrap().unwrap();
+            assert_eq!(ov.provider, Some(ProviderKind::DataCenter), "val={val}");
+        }
+        env::remove_var("CONFLUENCE_DOMAIN");
+        env::remove_var("CONFLUENCE_PROVIDER");
+    }
+
+    #[test]
+    fn env_override_normalizes_base_url() {
+        env::set_var("CONFLUENCE_DOMAIN", "mycompany.atlassian.net/");
+        let ov = EnvOverride::from_env().unwrap().unwrap();
+        assert_eq!(
+            ov.base_url.as_deref(),
+            Some("https://mycompany.atlassian.net")
+        );
+        env::remove_var("CONFLUENCE_DOMAIN");
+    }
+
+    // ── resolved_profile env priority ─────────────────────────────────────────
+
+    #[test]
+    fn resolved_profile_env_vars_override_stored_profile() {
+        // Clear conflicting vars
+        for var in &[
+            "CONFLUENCE_API_PATH",
+            "CONFLUENCE_AUTH_TYPE",
+            "CONFLUENCE_EMAIL",
+            "CONFLUENCE_USERNAME",
+            "CONFLUENCE_PASSWORD",
+            "CONFLUENCE_TOKEN",
+            "CONFLUENCE_BEARER_TOKEN",
+            "CONFLUENCE_PROVIDER",
+            "CONFLUENCE_READ_ONLY",
+            "CONFLUENCE_PROFILE",
+        ] {
+            env::remove_var(var);
+        }
+
+        env::set_var("CONFLUENCE_DOMAIN", "https://override.atlassian.net");
+        env::set_var("CONFLUENCE_API_TOKEN", "env-token");
+
+        let mut config = AppConfig::default();
+        config.upsert_profile(
+            "default".to_string(),
+            ProfileConfig {
+                provider: ProviderKind::DataCenter,
+                base_url: "https://stored.example.com".to_string(),
+                api_path: "/rest/api".to_string(),
+                auth: AuthConfig::Bearer {
+                    token: "stored-token".to_string(),
+                },
+                read_only: false,
+            },
+        );
+
+        let resolved = config.resolved_profile(None).unwrap();
+        assert_eq!(resolved.base_url, "https://override.atlassian.net");
+        match &resolved.auth {
+            AuthConfig::Bearer { token } => assert_eq!(token, "env-token"),
+            _ => panic!("expected Bearer auth from env"),
+        }
+
+        env::remove_var("CONFLUENCE_DOMAIN");
+        env::remove_var("CONFLUENCE_API_TOKEN");
+    }
+}

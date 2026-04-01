@@ -729,3 +729,236 @@ impl ConfluenceProvider for DataCenterProvider {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::config::AuthConfig;
+    use crate::model::ProviderKind;
+
+    fn dc_provider(base_url: &str) -> DataCenterProvider {
+        DataCenterProvider::new(ResolvedProfile {
+            name: "test".to_string(),
+            provider: ProviderKind::DataCenter,
+            base_url: base_url.to_string(),
+            api_path: "/rest/api".to_string(),
+            auth: AuthConfig::Bearer {
+                token: "test-token".to_string(),
+            },
+            read_only: false,
+        })
+    }
+
+    fn space_page(keys: &[&str], limit: usize, start: usize) -> serde_json::Value {
+        let results: Vec<_> = keys
+            .iter()
+            .map(|k| json!({ "key": k, "name": k, "id": k, "_links": {} }))
+            .collect();
+        json!({
+            "results": results,
+            "limit": limit,
+            "size": results.len(),
+            "start": start,
+            "_links": {}
+        })
+    }
+
+    // ── list_spaces ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_spaces_returns_all_spaces_across_pages() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(space_page(&["A", "B"], 2, 0)))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(query_param("start", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(space_page(&["C"], 2, 2)))
+            .mount(&server)
+            .await;
+
+        let provider = dc_provider(&server.uri());
+        let spaces = provider.list_spaces(usize::MAX).await.unwrap();
+        assert_eq!(spaces.len(), 3);
+        assert_eq!(spaces[0].key, "A");
+        assert_eq!(spaces[2].key, "C");
+    }
+
+    #[tokio::test]
+    async fn list_spaces_truncates_to_requested_limit() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(space_page(
+                &["A", "B", "C", "D", "E"],
+                200,
+                0,
+            )))
+            .mount(&server)
+            .await;
+
+        let provider = dc_provider(&server.uri());
+        let spaces = provider.list_spaces(3).await.unwrap();
+        assert_eq!(spaces.len(), 3);
+        assert_eq!(spaces[0].key, "A");
+        assert_eq!(spaces[2].key, "C");
+    }
+
+    #[tokio::test]
+    async fn list_spaces_returns_empty_when_no_spaces_exist() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "results": [], "limit": 200, "size": 0, "start": 0, "_links": {} }),
+            ))
+            .mount(&server)
+            .await;
+
+        let provider = dc_provider(&server.uri());
+        let spaces = provider.list_spaces(usize::MAX).await.unwrap();
+        assert!(spaces.is_empty());
+    }
+
+    // ── authentication headers ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bearer_auth_sends_authorization_header() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "results": [], "limit": 200, "size": 0, "start": 0, "_links": {} }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = dc_provider(&server.uri());
+        provider.list_spaces(10).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn basic_auth_sends_authorization_header() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            // base64("user:pass") = "dXNlcjpwYXNz"
+            .and(header("Authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "results": [], "limit": 200, "size": 0, "start": 0, "_links": {} }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = DataCenterProvider::new(ResolvedProfile {
+            name: "test".to_string(),
+            provider: ProviderKind::DataCenter,
+            base_url: server.uri(),
+            api_path: "/rest/api".to_string(),
+            auth: AuthConfig::Basic {
+                username: "user".to_string(),
+                token: "pass".to_string(),
+            },
+            read_only: false,
+        });
+        provider.list_spaces(10).await.unwrap();
+    }
+
+    // ── HTTP error handling ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn http_401_returns_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_json(json!({ "message": "Full authentication is required" })),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = dc_provider(&server.uri());
+        let err = provider.list_spaces(10).await.unwrap_err();
+        assert!(
+            err.to_string().contains("401") || err.to_string().contains("Full authentication"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_403_returns_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(json!({ "message": "Forbidden" })),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = dc_provider(&server.uri());
+        let err = provider.list_spaces(10).await.unwrap_err();
+        assert!(
+            err.to_string().contains("403") || err.to_string().contains("Forbidden"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── read-only guard ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_content_blocked_when_read_only() {
+        let server = MockServer::start().await;
+        let mut provider = dc_provider(&server.uri());
+        provider.http.profile.read_only = true;
+
+        let err = provider
+            .create_content(&crate::model::CreateContentRequest {
+                kind: crate::model::ContentKind::Page,
+                title: "Test".to_string(),
+                space: "TS".to_string(),
+                parent_id: None,
+                body_storage: String::new(),
+                status: "current".to_string(),
+                labels: Vec::new(),
+                properties: Default::default(),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn delete_content_blocked_when_read_only() {
+        let server = MockServer::start().await;
+        let mut provider = dc_provider(&server.uri());
+        provider.http.profile.read_only = true;
+
+        let err = provider
+            .delete_content(crate::model::ContentKind::Page, "123")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("read-only"));
+    }
+}
