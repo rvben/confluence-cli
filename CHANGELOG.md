@@ -7,6 +7,13 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+## [0.1.6](https://github.com/rvben/confluence-cli/compare/v0.1.5...v0.1.6) - 2026-04-01
+
+### Added
+
+- install binary as `confluence` instead of `confluence-cli` ([2f98eba](https://github.com/rvben/confluence-cli/commit/2f98eba4f1880e287d95b81852522f5fa54ccdd8))
+
 ## [0.1.5](https://github.com/rvben/confluence-cli/compare/v0.1.4...v0.1.5) - 2026-04-01
 
 ### Added
