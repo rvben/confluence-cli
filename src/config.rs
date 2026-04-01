@@ -122,7 +122,7 @@ impl AppConfig {
                     .merge_with(selected_name.unwrap_or_else(|| "env".to_string()), None))
             }
             (None, None) => bail!(
-                "no active profile configured. Run `confluence-cli auth login` or set CONFLUENCE_* environment variables"
+                "no active profile configured. Run `confluence auth login` or set CONFLUENCE_* environment variables"
             ),
         }
     }
@@ -483,8 +483,8 @@ pub async fn init(output: OutputFormat) -> Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         eprintln!(
-            "Run `confluence-cli init` in an interactive terminal, \
-             or use `confluence-cli init --json` for machine-readable setup instructions."
+            "Run `confluence init` in an interactive terminal, \
+             or use `confluence init --json` for machine-readable setup instructions."
         );
         return Ok(());
     }
@@ -842,15 +842,15 @@ async fn init_interactive() -> Result<()> {
     eprintln!("  What's next:");
     eprintln!(
         "    {}",
-        sym_dim("confluence-cli space list            # browse spaces")
+        sym_dim("confluence space list            # browse spaces")
     );
     eprintln!(
         "    {}",
-        sym_dim("confluence-cli page list --space KEY # list pages")
+        sym_dim("confluence page list --space KEY # list pages")
     );
     eprintln!(
         "    {}",
-        sym_dim("confluence-cli doctor                # verify setup")
+        sym_dim("confluence doctor                # verify setup")
     );
     eprintln!("{sep}");
     Ok(())

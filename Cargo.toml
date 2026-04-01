@@ -21,6 +21,10 @@ include = [
     "tests/**",
 ]
 
+[[bin]]
+name = "confluence"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.100"
 async-trait = "0.1.89"

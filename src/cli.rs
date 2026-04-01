@@ -507,7 +507,7 @@ pub async fn run() -> Result<()> {
         }
         Commands::Completions { shell } => {
             let mut command = Cli::command();
-            generate(shell, &mut command, "confluence-cli", &mut io::stdout());
+            generate(shell, &mut command, "confluence", &mut io::stdout());
             Ok(())
         }
     }
