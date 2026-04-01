@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::config::{AppConfig, LoginInput, ResolvedProfile, logout, run_login};
+use crate::config::{self, AppConfig, LoginInput, ResolvedProfile, logout, run_login};
 use crate::markdown::markdown_to_storage;
 use crate::model::{
     AttachmentInfo, CommentInfo, ContentItem, ContentKind, ContentProperty, CreateContentRequest,
@@ -37,6 +37,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    Init,
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
@@ -446,6 +447,7 @@ pub async fn run() -> Result<()> {
     let output = OutputFormat::from_json_flag(cli.json);
 
     match cli.command {
+        Commands::Init => config::init(output).await,
         Commands::Auth { command } => handle_auth(command, cli.profile.as_deref(), output).await,
         Commands::Profile { command } => handle_profile(command, output),
         Commands::Space { command } => {

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -9,6 +10,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::model::ProviderKind;
+use crate::output::{OutputFormat, print_json};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
@@ -491,6 +493,388 @@ impl EnvOverride {
             read_only,
         }
     }
+}
+
+/// Top-level `confluence-cli init` command.
+///
+/// In JSON mode: prints machine-readable setup instructions and exits.
+/// In a non-interactive terminal: prints guidance and exits.
+/// Otherwise: runs the interactive setup wizard.
+pub async fn init(output: OutputFormat) -> Result<()> {
+    if matches!(output, OutputFormat::Json) {
+        return init_json();
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "Run `confluence-cli init` in an interactive terminal, \
+             or use `confluence-cli init --json` for machine-readable setup instructions."
+        );
+        return Ok(());
+    }
+    init_interactive().await
+}
+
+fn init_json() -> Result<()> {
+    let path = AppConfig::config_path()?;
+    print_json(&serde_json::json!({
+        "configPath": path.display().to_string(),
+        "configExists": path.exists(),
+        "cloudTokenUrl": "https://id.atlassian.com/manage-profile/security/api-tokens",
+        "dcPatDocs": "https://confluence.atlassian.com/enterprise/using-personal-access-tokens-1026032365.html",
+        "envVars": {
+            "CONFLUENCE_DOMAIN": "Base URL (e.g. https://mycompany.atlassian.net or http://confluence.internal)",
+            "CONFLUENCE_PROVIDER": "cloud or datacenter",
+            "CONFLUENCE_EMAIL": "Username or email (basic auth)",
+            "CONFLUENCE_API_TOKEN": "API token or personal access token",
+            "CONFLUENCE_AUTH_TYPE": "basic or bearer",
+            "CONFLUENCE_READ_ONLY": "1 to prevent write operations"
+        },
+        "example": {
+            "profiles": {
+                "cloud": {
+                    "provider": "cloud",
+                    "base_url": "https://mycompany.atlassian.net",
+                    "api_path": "/wiki/rest/api",
+                    "auth": { "type": "basic", "username": "me@example.com", "token": "ATATT3x..." },
+                    "read_only": false
+                },
+                "datacenter": {
+                    "provider": "data_center",
+                    "base_url": "https://confluence.mycompany.com",
+                    "api_path": "/rest/api",
+                    "auth": { "type": "bearer", "token": "your-personal-access-token" },
+                    "read_only": false
+                }
+            }
+        }
+    }))?;
+    Ok(())
+}
+
+async fn init_interactive() -> Result<()> {
+    let sep = "──────────────";
+    eprintln!("Confluence CLI Setup");
+    eprintln!("{sep}");
+    eprintln!();
+
+    let path = AppConfig::config_path()?;
+    let mut config = AppConfig::load()?;
+
+    // Determine intent: first run, update existing profile, or add new.
+    let (target_name, existing): (Option<String>, Option<ProfileConfig>) =
+        if !config.profiles.is_empty() {
+            eprintln!("  Config:   {}", path.display());
+            eprintln!();
+            eprintln!("  Profiles:");
+            for (name, profile) in &config.profiles {
+                let active = config.active_profile.as_deref() == Some(name.as_str());
+                let marker = if active { "* " } else { "  " };
+                eprintln!("    {}{} — {}", marker, name, profile.base_url);
+            }
+            eprintln!();
+
+            let action_idx = Select::new()
+                .with_prompt("What would you like to do?")
+                .items(["Update an existing profile", "Add a new profile"])
+                .default(0)
+                .interact()?;
+            eprintln!();
+
+            if action_idx == 0 {
+                let names: Vec<&str> = config.profiles.keys().map(String::as_str).collect();
+                let idx = if names.len() == 1 {
+                    0
+                } else {
+                    Select::new()
+                        .with_prompt("Profile to update")
+                        .items(&names)
+                        .default(0)
+                        .interact()?
+                };
+                let name = names[idx].to_owned();
+                let existing_profile = config.profiles.get(&name).cloned();
+                (Some(name), existing_profile)
+            } else {
+                (None, None)
+            }
+        } else {
+            // First run — no profiles yet.
+            (Some("default".to_owned()), None)
+        };
+
+    // URL
+    let default_url = existing.as_ref().map(|p| p.base_url.as_str()).unwrap_or("");
+    let raw_url: String = Input::new()
+        .with_prompt("Confluence URL")
+        .with_initial_text(default_url)
+        .interact_text()?;
+    let base_url = normalize_base_url(&raw_url);
+
+    // Auto-detect provider from URL
+    let detected_provider = detect_provider(&base_url);
+    let provider = if let Some(ref existing_cfg) = existing {
+        // Keep existing provider unless URL changed
+        if base_url == existing_cfg.base_url {
+            existing_cfg.provider
+        } else {
+            detected_provider
+        }
+    } else {
+        detected_provider
+    };
+    eprintln!(
+        "  Detected: {} ({})",
+        match provider {
+            ProviderKind::Cloud => "Confluence Cloud",
+            ProviderKind::DataCenter => "Confluence Data Center / Server",
+        },
+        match provider {
+            ProviderKind::Cloud => "atlassian.net",
+            ProviderKind::DataCenter => "self-hosted",
+        }
+    );
+    eprintln!();
+
+    // Auth
+    let (auth_type, username, token) = match provider {
+        ProviderKind::Cloud => {
+            eprintln!("  Token: https://id.atlassian.com/manage-profile/security/api-tokens");
+            let default_email = existing
+                .as_ref()
+                .and_then(|p| match &p.auth {
+                    AuthConfig::Basic { username, .. } => Some(username.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            let email: String = Input::new()
+                .with_prompt("Email")
+                .with_initial_text(default_email)
+                .interact_text()?;
+            let has_existing_token = existing
+                .as_ref()
+                .map(|p| match &p.auth {
+                    AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => {
+                        !token.is_empty()
+                    }
+                })
+                .unwrap_or(false);
+            let token_hint = if has_existing_token {
+                " (Enter to keep)"
+            } else {
+                ""
+            };
+            let raw_token: String = Password::new()
+                .with_prompt(format!("API token{token_hint}"))
+                .allow_empty_password(has_existing_token)
+                .interact()?;
+            let token = if raw_token.is_empty() && has_existing_token {
+                match &existing.as_ref().unwrap().auth {
+                    AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => token.clone(),
+                }
+            } else {
+                raw_token
+            };
+            ("basic", Some(email), token)
+        }
+        ProviderKind::DataCenter => {
+            let dc_host = base_url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or(&base_url);
+            eprintln!(
+                "  Token:  https://{dc_host}/plugins/servlet/de.resolution.apitokenauth/admin"
+            );
+            eprintln!("  Or PAT: https://{dc_host}/plugins/servlet/manage-api-tokens");
+            eprintln!();
+
+            // For DC: offer basic (username + token) or bearer (PAT only)
+            let default_auth_idx = existing
+                .as_ref()
+                .map(|p| match &p.auth {
+                    AuthConfig::Basic { .. } => 0usize,
+                    AuthConfig::Bearer { .. } => 1usize,
+                })
+                .unwrap_or(1);
+            let auth_idx = Select::new()
+                .with_prompt("Authentication type")
+                .items([
+                    "Basic (username + password/token)",
+                    "Bearer (Personal Access Token)",
+                ])
+                .default(default_auth_idx)
+                .interact()?;
+            eprintln!();
+
+            if auth_idx == 0 {
+                let default_user = existing
+                    .as_ref()
+                    .and_then(|p| match &p.auth {
+                        AuthConfig::Basic { username, .. } => Some(username.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                let username: String = Input::new()
+                    .with_prompt("Username")
+                    .with_initial_text(default_user)
+                    .interact_text()?;
+                let has_existing_token = existing
+                    .as_ref()
+                    .map(|p| match &p.auth {
+                        AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => {
+                            !token.is_empty()
+                        }
+                    })
+                    .unwrap_or(false);
+                let hint = if has_existing_token {
+                    " (Enter to keep)"
+                } else {
+                    ""
+                };
+                let raw: String = Password::new()
+                    .with_prompt(format!("Password or token{hint}"))
+                    .allow_empty_password(has_existing_token)
+                    .interact()?;
+                let token = if raw.is_empty() && has_existing_token {
+                    match &existing.as_ref().unwrap().auth {
+                        AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => {
+                            token.clone()
+                        }
+                    }
+                } else {
+                    raw
+                };
+                ("basic", Some(username), token)
+            } else {
+                let has_existing_token = existing
+                    .as_ref()
+                    .map(|p| match &p.auth {
+                        AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => {
+                            !token.is_empty()
+                        }
+                    })
+                    .unwrap_or(false);
+                let hint = if has_existing_token {
+                    " (Enter to keep)"
+                } else {
+                    ""
+                };
+                let raw: String = Password::new()
+                    .with_prompt(format!("Personal Access Token{hint}"))
+                    .allow_empty_password(has_existing_token)
+                    .interact()?;
+                let token = if raw.is_empty() && has_existing_token {
+                    match &existing.as_ref().unwrap().auth {
+                        AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => {
+                            token.clone()
+                        }
+                    }
+                } else {
+                    raw
+                };
+                ("bearer", None, token)
+            }
+        }
+    };
+
+    // Read-only
+    let default_ro = existing.as_ref().map(|p| p.read_only).unwrap_or(false);
+    let read_only = Confirm::new()
+        .with_prompt("Enable read-only mode? (prevents accidental writes)")
+        .default(default_ro)
+        .interact()?;
+    eprintln!();
+
+    // Verify credentials
+    eprint!("  Verifying credentials...");
+    std::io::stderr().flush().ok();
+
+    let api_path = existing
+        .as_ref()
+        .map(|p| p.api_path.clone())
+        .unwrap_or_else(|| default_api_path(provider).to_string());
+    let auth = build_auth(auth_type, username, token.clone())?;
+    let test_profile = crate::config::ResolvedProfile {
+        name: "init-check".to_string(),
+        provider,
+        base_url: base_url.clone(),
+        api_path: api_path.clone(),
+        auth: auth.clone(),
+        read_only: false,
+    };
+    let test_provider = crate::provider::build_provider(test_profile);
+    let verified = match test_provider.ping().await {
+        Err(e) => {
+            eprintln!(" ✗ {e}");
+            eprintln!();
+            Confirm::new()
+                .with_prompt("Save profile anyway?")
+                .default(false)
+                .interact()?
+        }
+        Ok(()) => match test_provider.list_spaces(1).await {
+            Ok(_) => {
+                eprintln!(" ✓ Connected");
+                true
+            }
+            Err(e) => {
+                eprintln!(" ✗ Authentication failed: {e}");
+                eprintln!();
+                Confirm::new()
+                    .with_prompt("Save profile anyway?")
+                    .default(false)
+                    .interact()?
+            }
+        },
+    };
+
+    if !verified {
+        eprintln!();
+        eprintln!("{sep}");
+        return Ok(());
+    }
+
+    // Profile name — ask only when adding a new named profile
+    let profile_name = match target_name {
+        Some(name) => name,
+        None => {
+            eprintln!();
+            let raw: String = Input::new()
+                .with_prompt("Profile name")
+                .default("default".to_owned())
+                .interact_text()?;
+            let trimmed = raw.trim().to_owned();
+            if trimmed.is_empty() {
+                "default".to_owned()
+            } else {
+                trimmed
+            }
+        }
+    };
+
+    // Save
+    let stored = ProfileConfig {
+        provider,
+        base_url,
+        api_path,
+        auth,
+        read_only,
+    };
+    config.upsert_profile(profile_name.clone(), stored);
+    config.save()?;
+
+    eprintln!();
+    eprintln!("  Saved profile `{profile_name}` → {}", path.display());
+    eprintln!();
+    eprintln!("  What's next:");
+    eprintln!("    confluence-cli space list            # browse spaces");
+    eprintln!("    confluence-cli page list --space KEY # list pages");
+    eprintln!("    confluence-cli doctor                # verify setup");
+    eprintln!();
+    eprintln!("{sep}");
+    Ok(())
 }
 
 fn auth_type_name(profile: &ProfileConfig) -> String {
