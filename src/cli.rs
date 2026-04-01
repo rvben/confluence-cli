@@ -107,6 +107,9 @@ enum SpaceCommand {
     List {
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Fetch all spaces, ignoring --limit
+        #[arg(long)]
+        all: bool,
     },
     Get {
         space: String,
@@ -140,6 +143,9 @@ enum PageCommand {
         space: String,
         #[arg(long, default_value_t = 200)]
         limit: usize,
+        /// Fetch all pages, ignoring --limit
+        #[arg(long)]
+        all: bool,
     },
     Get {
         reference: String,
@@ -170,6 +176,9 @@ enum BlogCommand {
         space: String,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Fetch all blog posts, ignoring --limit
+        #[arg(long)]
+        all: bool,
     },
     Get {
         id: String,
@@ -851,9 +860,13 @@ async fn handle_space(
     output: OutputFormat,
 ) -> Result<()> {
     match command {
-        SpaceCommand::List { limit } => {
-            let spaces = provider.list_spaces(limit).await?;
+        SpaceCommand::List { limit, all } => {
+            let fetch_limit = if all { 10_000 } else { limit };
+            let spaces = provider.list_spaces(fetch_limit).await?;
             render_spaces(&spaces, output)?;
+            if !all && !matches!(output, OutputFormat::Json) && spaces.len() >= limit {
+                eprintln!("Showing first {limit} spaces — use --all to fetch all");
+            }
         }
         SpaceCommand::Get { space } => {
             let item = provider.get_space(&space).await?;
@@ -905,12 +918,18 @@ async fn handle_page(
     output: OutputFormat,
 ) -> Result<()> {
     match command {
-        PageCommand::List { space, limit } => {
+        PageCommand::List { space, limit, all } => {
             let mut pages = provider
                 .list_space_content(ContentKind::Page, &space, false)
                 .await?;
-            pages.truncate(limit);
+            let total = pages.len();
+            if !all {
+                pages.truncate(limit);
+            }
             render_content_items(&pages, output, false)?;
+            if !all && !matches!(output, OutputFormat::Json) && total > limit {
+                eprintln!("Showing first {limit} of {total} pages — use --all to fetch all");
+            }
         }
         PageCommand::Get {
             reference,
@@ -1040,12 +1059,18 @@ async fn handle_blog(
     output: OutputFormat,
 ) -> Result<()> {
     match command {
-        BlogCommand::List { space, limit } => {
+        BlogCommand::List { space, limit, all } => {
             let mut posts = provider
                 .list_space_content(ContentKind::BlogPost, &space, false)
                 .await?;
-            posts.truncate(limit);
+            let total = posts.len();
+            if !all {
+                posts.truncate(limit);
+            }
             render_content_items(&posts, output, false)?;
+            if !all && !matches!(output, OutputFormat::Json) && total > limit {
+                eprintln!("Showing first {limit} of {total} blog posts — use --all to fetch all");
+            }
         }
         BlogCommand::Get { id, show_body } => {
             let item = provider
