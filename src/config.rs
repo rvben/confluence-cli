@@ -273,9 +273,7 @@ pub fn run_login(input: LoginInput) -> Result<ResolvedProfile> {
             username = Some(prompt_required("Username or email", "")?);
         }
         if token.is_none() {
-            let raw = rpassword::prompt_password(format!("{} API token or password: ", sym_q()))
-                .map_err(|e| anyhow!("{e}"))?;
-            token = Some(raw);
+            token = Some(prompt_required("API token or password", "")?);
         }
         if read_only.is_none() {
             read_only = Some(prompt_bool("Enable read-only mode?", false)?);
@@ -655,9 +653,15 @@ async fn init_interactive() -> Result<()> {
             } else {
                 ""
             };
-            let raw_token =
-                rpassword::prompt_password(format!("{} Token  {}: ", sym_q(), sym_dim(token_hint)))
-                    .map_err(|e| anyhow!("{e}"))?;
+            let raw_token = prompt(
+                "Token",
+                if token_hint.is_empty() {
+                    ""
+                } else {
+                    token_hint
+                },
+                None,
+            )?;
             let token = if raw_token.is_empty() && has_token {
                 existing_token.unwrap()
             } else {
@@ -717,12 +721,15 @@ async fn init_interactive() -> Result<()> {
                 } else {
                     ""
                 };
-                let raw = rpassword::prompt_password(format!(
-                    "{} Token  {}: ",
-                    sym_q(),
-                    sym_dim(token_hint)
-                ))
-                .map_err(|e| anyhow!("{e}"))?;
+                let raw = prompt(
+                    "Token",
+                    if token_hint.is_empty() {
+                        ""
+                    } else {
+                        token_hint
+                    },
+                    None,
+                )?;
                 let token = if raw.is_empty() && has_token {
                     existing_token.unwrap()
                 } else {
@@ -735,12 +742,15 @@ async fn init_interactive() -> Result<()> {
                 } else {
                     ""
                 };
-                let raw = rpassword::prompt_password(format!(
-                    "{} Personal Access Token  {}: ",
-                    sym_q(),
-                    sym_dim(token_hint)
-                ))
-                .map_err(|e| anyhow!("{e}"))?;
+                let raw = prompt(
+                    "Personal Access Token",
+                    if token_hint.is_empty() {
+                        ""
+                    } else {
+                        token_hint
+                    },
+                    None,
+                )?;
                 let token = if raw.is_empty() && has_token {
                     existing_token.unwrap()
                 } else {
