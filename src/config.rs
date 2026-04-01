@@ -5,12 +5,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use dialoguer::{Confirm, Input, Password, Select};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use owo_colors::OwoColorize;
+
 use crate::model::ProviderKind;
-use crate::output::{OutputFormat, print_json};
+use crate::output::{OutputFormat, print_json, use_color};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
@@ -248,59 +249,36 @@ pub fn run_login(input: LoginInput) -> Result<ResolvedProfile> {
 
     if !input.non_interactive {
         if profile_name.is_empty() {
-            profile_name = Input::new()
-                .with_prompt("Profile name")
-                .default("default".to_string())
-                .interact_text()?;
+            profile_name = prompt("Profile name", "", Some("default"))?;
+            if profile_name.is_empty() {
+                profile_name = "default".to_string();
+            }
         }
         if domain.is_none() {
-            domain = Some(normalize_base_url(
-                &Input::<String>::new()
-                    .with_prompt("Confluence domain or base URL")
-                    .interact_text()?,
-            ));
+            let raw = prompt_required("Confluence URL", "e.g. https://mycompany.atlassian.net")?;
+            domain = Some(normalize_base_url(&raw));
         }
         if provider.is_none() {
             provider = Some(detect_provider(domain.as_deref().unwrap_or_default()));
         }
         if api_path.is_none() {
-            api_path = Some(
-                Input::new()
-                    .with_prompt("REST API path")
-                    .default(default_api_path(provider.unwrap()).to_string())
-                    .interact_text()?,
-            );
+            let default_path = default_api_path(provider.unwrap()).to_string();
+            api_path = Some(prompt("REST API path", "", Some(&default_path))?);
         }
         if auth_type.is_none() {
-            let idx = Select::new()
-                .with_prompt("Authentication type")
-                .items(["basic", "bearer"])
-                .default(0)
-                .interact()?;
+            let idx = prompt_select("Auth type", &["basic", "bearer"], 0)?;
             auth_type = Some(if idx == 0 { "basic" } else { "bearer" }.to_string());
         }
         if auth_type.as_deref() == Some("basic") && username.is_none() {
-            username = Some(
-                Input::new()
-                    .with_prompt("Username or email")
-                    .interact_text()?,
-            );
+            username = Some(prompt_required("Username or email", "")?);
         }
         if token.is_none() {
-            token = Some(
-                Password::new()
-                    .with_prompt("API token or password")
-                    .with_confirmation("Confirm token", "Tokens did not match")
-                    .interact()?,
-            );
+            let raw = rpassword::prompt_password(format!("{} API token or password: ", sym_q()))
+                .map_err(|e| anyhow!("{e}"))?;
+            token = Some(raw);
         }
         if read_only.is_none() {
-            read_only = Some(
-                Confirm::new()
-                    .with_prompt("Enable read-only mode?")
-                    .default(false)
-                    .interact()?,
-            );
+            read_only = Some(prompt_bool("Enable read-only mode?", false)?);
         }
     }
 
@@ -553,8 +531,8 @@ fn init_json() -> Result<()> {
 }
 
 async fn init_interactive() -> Result<()> {
-    let sep = "──────────────";
-    eprintln!("Confluence CLI Setup");
+    let sep = sym_dim("──────────────────");
+    eprintln!("Confluence CLI");
     eprintln!("{sep}");
     eprintln!();
 
@@ -564,21 +542,20 @@ async fn init_interactive() -> Result<()> {
     // Determine intent: first run, update existing profile, or add new.
     let (target_name, existing): (Option<String>, Option<ProfileConfig>) =
         if !config.profiles.is_empty() {
-            eprintln!("  Config:   {}", path.display());
+            eprintln!("  {}", sym_dim(&format!("Config: {}", path.display())));
             eprintln!();
             eprintln!("  Profiles:");
             for (name, profile) in &config.profiles {
                 let active = config.active_profile.as_deref() == Some(name.as_str());
                 let marker = if active { "* " } else { "  " };
-                eprintln!("    {}{} — {}", marker, name, profile.base_url);
+                eprintln!(
+                    "    {}",
+                    sym_dim(&format!("{marker}{name} — {}", profile.base_url))
+                );
             }
             eprintln!();
 
-            let action_idx = Select::new()
-                .with_prompt("What would you like to do?")
-                .items(["Update an existing profile", "Add a new profile"])
-                .default(0)
-                .interact()?;
+            let action_idx = prompt_select("Action", &["update", "add"], 0)?;
             eprintln!();
 
             if action_idx == 0 {
@@ -586,11 +563,7 @@ async fn init_interactive() -> Result<()> {
                 let idx = if names.len() == 1 {
                     0
                 } else {
-                    Select::new()
-                        .with_prompt("Profile to update")
-                        .items(&names)
-                        .default(0)
-                        .interact()?
+                    prompt_select("Profile to update", &names, 0)?
                 };
                 let name = names[idx].to_owned();
                 let existing_profile = config.profiles.get(&name).cloned();
@@ -599,22 +572,34 @@ async fn init_interactive() -> Result<()> {
                 (None, None)
             }
         } else {
-            // First run — no profiles yet.
+            // First run — no profiles yet, use "default" silently.
             (Some("default".to_owned()), None)
         };
 
     // URL
     let default_url = existing.as_ref().map(|p| p.base_url.as_str()).unwrap_or("");
-    let raw_url: String = Input::new()
-        .with_prompt("Confluence URL")
-        .with_initial_text(default_url)
-        .interact_text()?;
+    let raw_url = prompt(
+        "URL",
+        "e.g. https://mycompany.atlassian.net",
+        if default_url.is_empty() {
+            None
+        } else {
+            Some(default_url)
+        },
+    )?;
+    let raw_url = if raw_url.is_empty() && !default_url.is_empty() {
+        default_url.to_owned()
+    } else {
+        raw_url
+    };
+    if raw_url.is_empty() {
+        bail!("Confluence URL is required");
+    }
     let base_url = normalize_base_url(&raw_url);
 
     // Auto-detect provider from URL
     let detected_provider = detect_provider(&base_url);
     let provider = if let Some(ref existing_cfg) = existing {
-        // Keep existing provider unless URL changed
         if base_url == existing_cfg.base_url {
             existing_cfg.provider
         } else {
@@ -623,23 +608,27 @@ async fn init_interactive() -> Result<()> {
     } else {
         detected_provider
     };
-    eprintln!(
-        "  Detected: {} ({})",
-        match provider {
-            ProviderKind::Cloud => "Confluence Cloud",
-            ProviderKind::DataCenter => "Confluence Data Center / Server",
-        },
-        match provider {
-            ProviderKind::Cloud => "atlassian.net",
-            ProviderKind::DataCenter => "self-hosted",
-        }
-    );
+    let provider_label = match provider {
+        ProviderKind::Cloud => "Confluence Cloud",
+        ProviderKind::DataCenter => "Confluence Data Center",
+    };
+    eprintln!("  {} Detected: {provider_label}", sym_ok());
     eprintln!();
 
     // Auth
+    let existing_token = existing.as_ref().map(|p| match &p.auth {
+        AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => token.clone(),
+    });
+    let has_token = existing_token
+        .as_ref()
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+
     let (auth_type, username, token) = match provider {
         ProviderKind::Cloud => {
-            eprintln!("  Token: https://id.atlassian.com/manage-profile/security/api-tokens");
+            let token_url = "https://id.atlassian.com/manage-profile/security/api-tokens";
+            eprintln!("  {}", sym_dim(token_url));
+            eprintln!();
             let default_email = existing
                 .as_ref()
                 .and_then(|p| match &p.auth {
@@ -647,31 +636,30 @@ async fn init_interactive() -> Result<()> {
                     _ => None,
                 })
                 .unwrap_or("");
-            let email: String = Input::new()
-                .with_prompt("Email")
-                .with_initial_text(default_email)
-                .interact_text()?;
-            let has_existing_token = existing
-                .as_ref()
-                .map(|p| match &p.auth {
-                    AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => {
-                        !token.is_empty()
-                    }
-                })
-                .unwrap_or(false);
-            let token_hint = if has_existing_token {
-                " (Enter to keep)"
+            let email = prompt(
+                "Email",
+                "",
+                if default_email.is_empty() {
+                    None
+                } else {
+                    Some(default_email)
+                },
+            )?;
+            let email = if email.is_empty() {
+                default_email.to_owned()
+            } else {
+                email
+            };
+            let token_hint = if has_token {
+                "Enter to keep existing"
             } else {
                 ""
             };
-            let raw_token: String = Password::new()
-                .with_prompt(format!("API token{token_hint}"))
-                .allow_empty_password(has_existing_token)
-                .interact()?;
-            let token = if raw_token.is_empty() && has_existing_token {
-                match &existing.as_ref().unwrap().auth {
-                    AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => token.clone(),
-                }
+            let raw_token =
+                rpassword::prompt_password(format!("{} Token  {}: ", sym_q(), sym_dim(token_hint)))
+                    .map_err(|e| anyhow!("{e}"))?;
+            let token = if raw_token.is_empty() && has_token {
+                existing_token.unwrap()
             } else {
                 raw_token
             };
@@ -685,12 +673,13 @@ async fn init_interactive() -> Result<()> {
                 .next()
                 .unwrap_or(&base_url);
             eprintln!(
-                "  Token:  https://{dc_host}/plugins/servlet/de.resolution.apitokenauth/admin"
+                "  {}",
+                sym_dim(&format!(
+                    "Tokens: https://{dc_host}/plugins/servlet/manage-api-tokens"
+                ))
             );
-            eprintln!("  Or PAT: https://{dc_host}/plugins/servlet/manage-api-tokens");
             eprintln!();
 
-            // For DC: offer basic (username + token) or bearer (PAT only)
             let default_auth_idx = existing
                 .as_ref()
                 .map(|p| match &p.auth {
@@ -698,14 +687,7 @@ async fn init_interactive() -> Result<()> {
                     AuthConfig::Bearer { .. } => 1usize,
                 })
                 .unwrap_or(1);
-            let auth_idx = Select::new()
-                .with_prompt("Authentication type")
-                .items([
-                    "Basic (username + password/token)",
-                    "Bearer (Personal Access Token)",
-                ])
-                .default(default_auth_idx)
-                .interact()?;
+            let auth_idx = prompt_select("Auth", &["basic", "bearer"], default_auth_idx)?;
             eprintln!();
 
             if auth_idx == 0 {
@@ -716,61 +698,51 @@ async fn init_interactive() -> Result<()> {
                         _ => None,
                     })
                     .unwrap_or("");
-                let username: String = Input::new()
-                    .with_prompt("Username")
-                    .with_initial_text(default_user)
-                    .interact_text()?;
-                let has_existing_token = existing
-                    .as_ref()
-                    .map(|p| match &p.auth {
-                        AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => {
-                            !token.is_empty()
-                        }
-                    })
-                    .unwrap_or(false);
-                let hint = if has_existing_token {
-                    " (Enter to keep)"
+                let username = prompt(
+                    "Username",
+                    "",
+                    if default_user.is_empty() {
+                        None
+                    } else {
+                        Some(default_user)
+                    },
+                )?;
+                let username = if username.is_empty() {
+                    default_user.to_owned()
+                } else {
+                    username
+                };
+                let token_hint = if has_token {
+                    "Enter to keep existing"
                 } else {
                     ""
                 };
-                let raw: String = Password::new()
-                    .with_prompt(format!("Password or token{hint}"))
-                    .allow_empty_password(has_existing_token)
-                    .interact()?;
-                let token = if raw.is_empty() && has_existing_token {
-                    match &existing.as_ref().unwrap().auth {
-                        AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => {
-                            token.clone()
-                        }
-                    }
+                let raw = rpassword::prompt_password(format!(
+                    "{} Token  {}: ",
+                    sym_q(),
+                    sym_dim(token_hint)
+                ))
+                .map_err(|e| anyhow!("{e}"))?;
+                let token = if raw.is_empty() && has_token {
+                    existing_token.unwrap()
                 } else {
                     raw
                 };
                 ("basic", Some(username), token)
             } else {
-                let has_existing_token = existing
-                    .as_ref()
-                    .map(|p| match &p.auth {
-                        AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => {
-                            !token.is_empty()
-                        }
-                    })
-                    .unwrap_or(false);
-                let hint = if has_existing_token {
-                    " (Enter to keep)"
+                let token_hint = if has_token {
+                    "Enter to keep existing"
                 } else {
                     ""
                 };
-                let raw: String = Password::new()
-                    .with_prompt(format!("Personal Access Token{hint}"))
-                    .allow_empty_password(has_existing_token)
-                    .interact()?;
-                let token = if raw.is_empty() && has_existing_token {
-                    match &existing.as_ref().unwrap().auth {
-                        AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => {
-                            token.clone()
-                        }
-                    }
+                let raw = rpassword::prompt_password(format!(
+                    "{} Personal Access Token  {}: ",
+                    sym_q(),
+                    sym_dim(token_hint)
+                ))
+                .map_err(|e| anyhow!("{e}"))?;
+                let token = if raw.is_empty() && has_token {
+                    existing_token.unwrap()
                 } else {
                     raw
                 };
@@ -781,10 +753,7 @@ async fn init_interactive() -> Result<()> {
 
     // Read-only
     let default_ro = existing.as_ref().map(|p| p.read_only).unwrap_or(false);
-    let read_only = Confirm::new()
-        .with_prompt("Enable read-only mode? (prevents accidental writes)")
-        .default(default_ro)
-        .interact()?;
+    let read_only = prompt_bool("Read-only mode?", default_ro)?;
     eprintln!();
 
     // Verify credentials
@@ -807,25 +776,19 @@ async fn init_interactive() -> Result<()> {
     let test_provider = crate::provider::build_provider(test_profile);
     let verified = match test_provider.ping().await {
         Err(e) => {
-            eprintln!(" ✗ {e}");
+            eprintln!(" {} {e}", sym_fail());
             eprintln!();
-            Confirm::new()
-                .with_prompt("Save profile anyway?")
-                .default(false)
-                .interact()?
+            prompt_bool("Save profile anyway?", false)?
         }
         Ok(()) => match test_provider.list_spaces(1).await {
             Ok(_) => {
-                eprintln!(" ✓ Connected");
+                eprintln!(" {} Connected", sym_ok());
                 true
             }
             Err(e) => {
-                eprintln!(" ✗ Authentication failed: {e}");
+                eprintln!(" {} Authentication failed: {e}", sym_fail());
                 eprintln!();
-                Confirm::new()
-                    .with_prompt("Save profile anyway?")
-                    .default(false)
-                    .interact()?
+                prompt_bool("Save profile anyway?", false)?
             }
         },
     };
@@ -841,15 +804,11 @@ async fn init_interactive() -> Result<()> {
         Some(name) => name,
         None => {
             eprintln!();
-            let raw: String = Input::new()
-                .with_prompt("Profile name")
-                .default("default".to_owned())
-                .interact_text()?;
-            let trimmed = raw.trim().to_owned();
-            if trimmed.is_empty() {
+            let name = prompt("Profile name", "", Some("default"))?;
+            if name.is_empty() {
                 "default".to_owned()
             } else {
-                trimmed
+                name
             }
         }
     };
@@ -866,16 +825,122 @@ async fn init_interactive() -> Result<()> {
     config.save()?;
 
     eprintln!();
-    eprintln!("  Saved profile `{profile_name}` → {}", path.display());
+    eprintln!("  {} Saved profile `{profile_name}`", sym_ok());
+    eprintln!("  {}", sym_dim(&format!("Config: {}", path.display())));
     eprintln!();
+    eprintln!("{sep}");
     eprintln!("  What's next:");
-    eprintln!("    confluence-cli space list            # browse spaces");
-    eprintln!("    confluence-cli page list --space KEY # list pages");
-    eprintln!("    confluence-cli doctor                # verify setup");
-    eprintln!();
+    eprintln!(
+        "    {}",
+        sym_dim("confluence-cli space list            # browse spaces")
+    );
+    eprintln!(
+        "    {}",
+        sym_dim("confluence-cli page list --space KEY # list pages")
+    );
+    eprintln!(
+        "    {}",
+        sym_dim("confluence-cli doctor                # verify setup")
+    );
     eprintln!("{sep}");
     Ok(())
 }
+
+// ── Interactive prompt helpers ────────────────────────────────────────────────
+
+fn sym_q() -> String {
+    if use_color() {
+        "?".green().bold().to_string()
+    } else {
+        "?".to_owned()
+    }
+}
+
+fn sym_ok() -> String {
+    if use_color() {
+        "✔".green().to_string()
+    } else {
+        "✔".to_owned()
+    }
+}
+
+fn sym_fail() -> String {
+    if use_color() {
+        "✖".red().to_string()
+    } else {
+        "✖".to_owned()
+    }
+}
+
+fn sym_dim(s: &str) -> String {
+    if use_color() {
+        s.dimmed().to_string()
+    } else {
+        s.to_owned()
+    }
+}
+
+/// Print `? Label  hint [default]: ` to stderr and read a line from stdin.
+/// Returns the trimmed input, or `default` if the user pressed Enter with no input.
+fn prompt(label: &str, hint: &str, default: Option<&str>) -> Result<String> {
+    let hint_part = if hint.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", sym_dim(hint))
+    };
+    let default_part = match default {
+        Some(d) if !d.is_empty() => format!(" {}", sym_dim(&format!("[{d}]"))),
+        _ => String::new(),
+    };
+    eprint!("{} {label}{hint_part}{default_part}: ", sym_q());
+    std::io::stderr().flush().ok();
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    let trimmed = buf.trim().to_owned();
+    if trimmed.is_empty() {
+        Ok(default.unwrap_or("").to_owned())
+    } else {
+        Ok(trimmed)
+    }
+}
+
+/// Like `prompt`, but loops until the user enters a non-empty value.
+fn prompt_required(label: &str, hint: &str) -> Result<String> {
+    loop {
+        let val = prompt(label, hint, None)?;
+        if !val.is_empty() {
+            return Ok(val);
+        }
+        eprintln!("{} {label} is required", sym_fail());
+    }
+}
+
+/// Print a selection prompt with slash-separated options. Accepts any unambiguous prefix.
+/// Falls back to `default_idx` on unrecognised input.
+fn prompt_select(label: &str, options: &[&str], default_idx: usize) -> Result<usize> {
+    let opts_str = options.join("/");
+    let default_opt = options.get(default_idx).copied().unwrap_or("");
+    let raw = prompt(label, &format!("[{opts_str}]"), Some(default_opt))?;
+    for (i, opt) in options.iter().enumerate() {
+        if raw.eq_ignore_ascii_case(opt) || opt.starts_with(&raw.to_ascii_lowercase()) {
+            return Ok(i);
+        }
+    }
+    Ok(default_idx)
+}
+
+/// Print a yes/no prompt. Accepts y/yes/n/no (case-insensitive). Falls back to `default`.
+fn prompt_bool(label: &str, default: bool) -> Result<bool> {
+    let default_str = if default { "y" } else { "n" };
+    let raw = prompt(label, "[y/n]", Some(default_str))?;
+    Ok(match raw.to_ascii_lowercase().as_str() {
+        "y" | "yes" | "true" | "1" => true,
+        "n" | "no" | "false" | "0" => false,
+        _ => default,
+    })
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn auth_type_name(profile: &ProfileConfig) -> String {
     match profile.auth {

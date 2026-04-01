@@ -29,8 +29,9 @@ chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.49", features = ["derive", "env"] }
 clap_complete = "4.5.61"
 comfy-table = "7.2.1"
-dialoguer = "0.12.0"
 directories = "6.0.0"
+owo-colors = "4"
+rpassword = "7"
 html2md = "0.2.15"
 mime_guess = "2.0.5"
 pathdiff = "0.2.3"

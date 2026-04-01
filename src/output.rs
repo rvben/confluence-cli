@@ -1,8 +1,13 @@
 use std::fmt::Display;
+use std::io::IsTerminal;
 
 use anyhow::Result;
 use comfy_table::{Cell, Table, presets::UTF8_FULL};
 use serde::Serialize;
+
+pub fn use_color() -> bool {
+    std::io::stderr().is_terminal() && std::env::var("NO_COLOR").is_err()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
