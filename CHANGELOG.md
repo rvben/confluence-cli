@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+## [0.1.4](https://github.com/rvben/confluence-cli/compare/v0.1.3...v0.1.4) - 2026-04-01
+
+### Added
+
+- **init**: rewrite interactive setup wizard with custom prompt helpers ([5b85c44](https://github.com/rvben/confluence-cli/commit/5b85c4484e2b70b408a17c58b65416aad0136da3))
+
 ## [0.1.3](https://github.com/rvben/confluence-cli/compare/v0.1.2...v0.1.3) - 2026-04-01
 
 ### Added
