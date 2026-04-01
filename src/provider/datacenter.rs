@@ -195,20 +195,14 @@ impl ConfluenceProvider for DataCenterProvider {
     }
 
     async fn list_spaces(&self, limit: usize) -> Result<Vec<SpaceSummary>> {
-        let response: Results<V1Space> = self
-            .http
-            .json(
-                Method::GET,
-                self.http
-                    .v1_url(&format!("/space?limit={limit}&expand=homepage")),
-                None,
-            )
-            .await?;
-        Ok(response
-            .results
-            .into_iter()
-            .map(|space| self.map_space(space))
-            .collect())
+        let mut spaces: Vec<SpaceSummary> =
+            fetch_all_v1::<V1Space>(&self.http, "/space?limit=200&expand=homepage")
+                .await?
+                .into_iter()
+                .map(|space| self.map_space(space))
+                .collect();
+        spaces.truncate(limit);
+        Ok(spaces)
     }
 
     async fn get_space(&self, key_or_id: &str) -> Result<SpaceSummary> {
