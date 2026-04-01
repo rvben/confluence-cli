@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+## [0.1.3](https://github.com/rvben/confluence-cli/compare/v0.1.2...v0.1.3) - 2026-04-01
+
+### Added
+
+- add interactive init wizard ([b13bfb4](https://github.com/rvben/confluence-cli/commit/b13bfb46f6268cc7ea4d361f7f82a76ad4c4c3bf))
+
 ## [0.1.2](https://github.com/rvben/confluence-cli/compare/v0.1.1...v0.1.2) - 2026-03-31
 
 ### Added
