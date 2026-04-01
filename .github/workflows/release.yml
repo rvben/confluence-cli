@@ -86,7 +86,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           package="confluence-cli-v${version}-${{ matrix.target }}"
           mkdir -p "dist/${package}"
-          cp "target/${{ matrix.target }}/release/confluence-cli" "dist/${package}/"
+          cp "target/${{ matrix.target }}/release/confluence" "dist/${package}/"
           cp README.md CHANGELOG.md LICENSE "dist/${package}/"
           tar -C dist -czf "dist/${package}.tar.gz" "${package}"
           shasum -a 256 "dist/${package}.tar.gz" > "dist/${package}.tar.gz.sha256"
@@ -191,11 +191,11 @@ jobs:
             end
 
             def install
-              bin.install "confluence-cli"
+              bin.install "confluence"
             end
 
             test do
-              assert_match "confluence-cli #{version}", shell_output("#{bin}/confluence-cli --version")
+              assert_match version, shell_output("#{bin}/confluence --version")
             end
           end
           FORMULA
