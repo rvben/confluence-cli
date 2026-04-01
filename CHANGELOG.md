@@ -10,6 +10,13 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+## [0.1.9](https://github.com/rvben/confluence-cli/compare/v0.1.8...v0.1.9) - 2026-04-01
+
+### Fixed
+
+- **space list**: paginate through all spaces when --all is passed ([369189e](https://github.com/rvben/confluence-cli/commit/369189eed49e871db5ad52d63a4dab27769b2282))
+
 ## [0.1.8](https://github.com/rvben/confluence-cli/compare/v0.1.7...v0.1.8) - 2026-04-01
 
 ### Added
