@@ -9,6 +9,13 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+## [0.1.8](https://github.com/rvben/confluence-cli/compare/v0.1.7...v0.1.8) - 2026-04-01
+
+### Added
+
+- add --all flag and pagination hint to space/page/blog list ([c7574e1](https://github.com/rvben/confluence-cli/commit/c7574e1b0cf4413564d5bdbb00e993ec770de107))
+
 ## [0.1.7](https://github.com/rvben/confluence-cli/compare/v0.1.6...v0.1.7) - 2026-04-01
 
 ## [0.1.6](https://github.com/rvben/confluence-cli/compare/v0.1.5...v0.1.6) - 2026-04-01
