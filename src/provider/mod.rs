@@ -992,20 +992,21 @@ mod tests {
         let server = MockServer::start().await;
 
         for page in 0..3usize {
+            let start = page * 2;
             Mock::given(method("GET"))
                 .and(path("/rest/api/space"))
-                .and(query_param("start", page * 2))
+                .and(query_param("start", start.to_string()))
                 .respond_with(ResponseTemplate::new(200).set_body_json(paginated_response(
                     json!([
-                        space_result(&format!("K{}", page * 2), "Space", &format!("{}", page * 2)),
+                        space_result(&format!("K{start}"), "Space", &format!("{start}")),
                         space_result(
-                            &format!("K{}", page * 2 + 1),
+                            &format!("K{}", start + 1),
                             "Space",
-                            &format!("{}", page * 2 + 1)
+                            &format!("{}", start + 1)
                         )
                     ]),
                     2,
-                    page * 2,
+                    start,
                 )))
                 .mount(&server)
                 .await;

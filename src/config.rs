@@ -963,6 +963,7 @@ fn auth_type_name(profile: &ProfileConfig) -> String {
 mod tests {
     use std::env;
 
+    use serial_test::serial;
     use tempfile::tempdir;
 
     use super::*;
@@ -1197,109 +1198,139 @@ mod tests {
 
     // ── EnvOverride ───────────────────────────────────────────────────────────
 
+    // Env var tests mutate process-global state. #[serial] ensures they run one at a time
+    // so parallel test threads don't see each other's env mutations. The unsafe blocks are
+    // required by Rust 2024.
+
     #[test]
+    #[serial]
     fn env_override_none_when_no_vars_set() {
-        // Clear all relevant env vars before testing
-        for var in &[
-            "CONFLUENCE_DOMAIN",
-            "CONFLUENCE_API_PATH",
-            "CONFLUENCE_AUTH_TYPE",
-            "CONFLUENCE_EMAIL",
-            "CONFLUENCE_USERNAME",
-            "CONFLUENCE_API_TOKEN",
-            "CONFLUENCE_PASSWORD",
-            "CONFLUENCE_TOKEN",
-            "CONFLUENCE_BEARER_TOKEN",
-            "CONFLUENCE_PROVIDER",
-            "CONFLUENCE_READ_ONLY",
-        ] {
-            env::remove_var(var);
+        unsafe {
+            for var in &[
+                "CONFLUENCE_DOMAIN",
+                "CONFLUENCE_API_PATH",
+                "CONFLUENCE_AUTH_TYPE",
+                "CONFLUENCE_EMAIL",
+                "CONFLUENCE_USERNAME",
+                "CONFLUENCE_API_TOKEN",
+                "CONFLUENCE_PASSWORD",
+                "CONFLUENCE_TOKEN",
+                "CONFLUENCE_BEARER_TOKEN",
+                "CONFLUENCE_PROVIDER",
+                "CONFLUENCE_READ_ONLY",
+            ] {
+                env::remove_var(var);
+            }
         }
         assert!(EnvOverride::from_env().unwrap().is_none());
     }
 
     #[test]
+    #[serial]
     fn env_override_read_only_accepts_truthy_values() {
         for val in &["1", "true", "TRUE", "yes", "on"] {
-            env::set_var("CONFLUENCE_DOMAIN", "https://example.atlassian.net");
-            env::set_var("CONFLUENCE_READ_ONLY", val);
+            unsafe {
+                env::set_var("CONFLUENCE_DOMAIN", "https://example.atlassian.net");
+                env::set_var("CONFLUENCE_READ_ONLY", val);
+            }
             let ov = EnvOverride::from_env().unwrap().unwrap();
             assert!(
                 ov.read_only == Some(true),
                 "CONFLUENCE_READ_ONLY={val} should be true"
             );
         }
-        env::remove_var("CONFLUENCE_DOMAIN");
-        env::remove_var("CONFLUENCE_READ_ONLY");
+        unsafe {
+            env::remove_var("CONFLUENCE_DOMAIN");
+            env::remove_var("CONFLUENCE_READ_ONLY");
+        }
     }
 
     #[test]
+    #[serial]
     fn env_override_read_only_false_for_unrecognised_value() {
-        env::set_var("CONFLUENCE_DOMAIN", "https://example.atlassian.net");
-        env::set_var("CONFLUENCE_READ_ONLY", "false");
+        unsafe {
+            env::set_var("CONFLUENCE_DOMAIN", "https://example.atlassian.net");
+            env::set_var("CONFLUENCE_READ_ONLY", "false");
+        }
         let ov = EnvOverride::from_env().unwrap().unwrap();
         assert_eq!(ov.read_only, Some(false));
-        env::remove_var("CONFLUENCE_DOMAIN");
-        env::remove_var("CONFLUENCE_READ_ONLY");
-    }
-
-    #[test]
-    fn env_override_provider_cloud_variants() {
-        for val in &["cloud"] {
-            env::set_var("CONFLUENCE_DOMAIN", "https://example.atlassian.net");
-            env::set_var("CONFLUENCE_PROVIDER", val);
-            let ov = EnvOverride::from_env().unwrap().unwrap();
-            assert_eq!(ov.provider, Some(ProviderKind::Cloud));
+        unsafe {
+            env::remove_var("CONFLUENCE_DOMAIN");
+            env::remove_var("CONFLUENCE_READ_ONLY");
         }
-        env::remove_var("CONFLUENCE_DOMAIN");
-        env::remove_var("CONFLUENCE_PROVIDER");
     }
 
     #[test]
+    #[serial]
+    fn env_override_provider_cloud_variants() {
+        unsafe {
+            env::set_var("CONFLUENCE_DOMAIN", "https://example.atlassian.net");
+            env::set_var("CONFLUENCE_PROVIDER", "cloud");
+        }
+        let ov = EnvOverride::from_env().unwrap().unwrap();
+        assert_eq!(ov.provider, Some(ProviderKind::Cloud));
+        unsafe {
+            env::remove_var("CONFLUENCE_DOMAIN");
+            env::remove_var("CONFLUENCE_PROVIDER");
+        }
+    }
+
+    #[test]
+    #[serial]
     fn env_override_provider_datacenter_variants() {
         for val in &["dc", "datacenter", "data_center", "data-center", "server"] {
-            env::set_var("CONFLUENCE_DOMAIN", "https://confluence.example.com");
-            env::set_var("CONFLUENCE_PROVIDER", val);
+            unsafe {
+                env::set_var("CONFLUENCE_DOMAIN", "https://confluence.example.com");
+                env::set_var("CONFLUENCE_PROVIDER", val);
+            }
             let ov = EnvOverride::from_env().unwrap().unwrap();
             assert_eq!(ov.provider, Some(ProviderKind::DataCenter), "val={val}");
         }
-        env::remove_var("CONFLUENCE_DOMAIN");
-        env::remove_var("CONFLUENCE_PROVIDER");
+        unsafe {
+            env::remove_var("CONFLUENCE_DOMAIN");
+            env::remove_var("CONFLUENCE_PROVIDER");
+        }
     }
 
     #[test]
+    #[serial]
     fn env_override_normalizes_base_url() {
-        env::set_var("CONFLUENCE_DOMAIN", "mycompany.atlassian.net/");
+        unsafe {
+            env::set_var("CONFLUENCE_DOMAIN", "mycompany.atlassian.net/");
+        }
         let ov = EnvOverride::from_env().unwrap().unwrap();
         assert_eq!(
             ov.base_url.as_deref(),
             Some("https://mycompany.atlassian.net")
         );
-        env::remove_var("CONFLUENCE_DOMAIN");
+        unsafe {
+            env::remove_var("CONFLUENCE_DOMAIN");
+        }
     }
 
     // ── resolved_profile env priority ─────────────────────────────────────────
 
     #[test]
+    #[serial]
     fn resolved_profile_env_vars_override_stored_profile() {
-        // Clear conflicting vars
-        for var in &[
-            "CONFLUENCE_API_PATH",
-            "CONFLUENCE_AUTH_TYPE",
-            "CONFLUENCE_EMAIL",
-            "CONFLUENCE_USERNAME",
-            "CONFLUENCE_PASSWORD",
-            "CONFLUENCE_TOKEN",
-            "CONFLUENCE_BEARER_TOKEN",
-            "CONFLUENCE_PROVIDER",
-            "CONFLUENCE_READ_ONLY",
-            "CONFLUENCE_PROFILE",
-        ] {
-            env::remove_var(var);
+        unsafe {
+            for var in &[
+                "CONFLUENCE_API_PATH",
+                "CONFLUENCE_AUTH_TYPE",
+                "CONFLUENCE_EMAIL",
+                "CONFLUENCE_USERNAME",
+                "CONFLUENCE_PASSWORD",
+                "CONFLUENCE_TOKEN",
+                "CONFLUENCE_BEARER_TOKEN",
+                "CONFLUENCE_PROVIDER",
+                "CONFLUENCE_READ_ONLY",
+                "CONFLUENCE_PROFILE",
+            ] {
+                env::remove_var(var);
+            }
+            env::set_var("CONFLUENCE_DOMAIN", "https://override.atlassian.net");
+            env::set_var("CONFLUENCE_API_TOKEN", "env-token");
         }
-
-        env::set_var("CONFLUENCE_DOMAIN", "https://override.atlassian.net");
-        env::set_var("CONFLUENCE_API_TOKEN", "env-token");
 
         let mut config = AppConfig::default();
         config.upsert_profile(
@@ -1322,7 +1353,9 @@ mod tests {
             _ => panic!("expected Bearer auth from env"),
         }
 
-        env::remove_var("CONFLUENCE_DOMAIN");
-        env::remove_var("CONFLUENCE_API_TOKEN");
+        unsafe {
+            env::remove_var("CONFLUENCE_DOMAIN");
+            env::remove_var("CONFLUENCE_API_TOKEN");
+        }
     }
 }
