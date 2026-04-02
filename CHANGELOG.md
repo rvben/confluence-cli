@@ -11,6 +11,13 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+## [0.1.10](https://github.com/rvben/confluence-cli/compare/v0.1.9...v0.1.10) - 2026-04-02
+
+### Fixed
+
+- **page tree**: paginate through all children in list_children ([362e794](https://github.com/rvben/confluence-cli/commit/362e79458ccccf0a0710cc1585d046c2bfdb2f7f))
+
 ## [0.1.9](https://github.com/rvben/confluence-cli/compare/v0.1.8...v0.1.9) - 2026-04-01
 
 ### Fixed
