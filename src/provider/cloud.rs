@@ -277,17 +277,11 @@ impl ConfluenceProvider for CloudProvider {
         let mut all_items = Vec::new();
         let mut stack = vec![parent_id.to_string()];
         while let Some(current) = stack.pop() {
-            let response: Results<V1Content> = self
-                .http
-                .json(
-                    Method::GET,
-                    self.http.v1_url(&format!(
-                        "/content/{current}/child/page?limit=200&expand=version,space,ancestors,body.storage,metadata.labels,history"
-                    )),
-                    None,
-                )
-                .await?;
-            for child in response.results {
+            let path = format!(
+                "/content/{current}/child/page?limit=200&expand=version,space,ancestors,body.storage,metadata.labels,history"
+            );
+            let children: Vec<V1Content> = fetch_all_v1(&self.http, &path).await?;
+            for child in children {
                 let child_id = child.id.clone();
                 all_items.push(v1_content_to_item(
                     &self.http.profile.base_url,
