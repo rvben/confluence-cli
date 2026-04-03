@@ -85,6 +85,8 @@ enum Commands {
     Completions {
         shell: Shell,
     },
+    /// Output JSON schema for agent integration
+    Schema,
 }
 
 #[derive(Subcommand, Debug)]
@@ -517,6 +519,10 @@ pub async fn run() -> Result<()> {
         Commands::Completions { shell } => {
             let mut command = Cli::command();
             generate(shell, &mut command, "confluence", &mut io::stdout());
+            Ok(())
+        }
+        Commands::Schema => {
+            crate::schema::print_schema();
             Ok(())
         }
     }

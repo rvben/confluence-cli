@@ -4,6 +4,18 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (skip publishing)'
+        required: false
+        default: true
+        type: boolean
+      skip_crates_io:
+        description: 'Skip crates.io publish'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -47,9 +59,20 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Publish to crates.io
+        if: ${{ inputs.dry_run != true && inputs.skip_crates_io != true }}
         run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Test crates.io publish (dry run)
+        if: ${{ inputs.dry_run == true && inputs.skip_crates_io != true }}
+        run: |
+          echo "DRY RUN: Would publish to crates.io"
+          cargo publish --dry-run --locked
+
+      - name: Skip crates.io publishing
+        if: ${{ inputs.skip_crates_io == true }}
+        run: echo "Skipping crates.io publishing as requested"
 
   build:
     needs: verify
@@ -111,6 +134,7 @@ jobs:
           path: dist
 
       - name: Publish GitHub release
+        if: ${{ inputs.dry_run != true }}
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
@@ -118,8 +142,16 @@ jobs:
             dist/**/*.tar.gz
             dist/**/*.tar.gz.sha256
 
+      - name: Dry Run Summary
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          echo "Dry run complete. Artifacts built but nothing published."
+          echo "Archives:"
+          find dist -type f | sort
+
   update-homebrew:
     needs: publish
+    if: ${{ inputs.dry_run != true }}
     runs-on: ubuntu-latest
     env:
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

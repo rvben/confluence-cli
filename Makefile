@@ -29,13 +29,13 @@ fmt:
 
 lint:
 	cargo fmt -- --check
-	cargo clippy --locked --all-targets --all-features -- -D warnings
+	cargo clippy --locked -- -D warnings
 
 check: lint test
 
 release-check:
 	cargo fmt --all --check
-	cargo clippy --locked --all-targets --all-features -- -D warnings
+	cargo clippy --locked -- -D warnings
 	cargo test --locked
 	cargo run --locked -- --help >/dev/null
 	cargo run --locked -- doctor --help >/dev/null

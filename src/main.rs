@@ -4,6 +4,7 @@ mod markdown;
 mod model;
 mod output;
 mod provider;
+mod schema;
 mod sync;
 
 #[tokio::main]

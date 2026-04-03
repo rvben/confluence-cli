@@ -2,7 +2,7 @@
 name = "confluence-cli"
 version = "0.1.10"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 description = "Markdown-sync-first Confluence CLI in Rust"
 license = "MIT"
 documentation = "https://docs.rs/confluence-cli"
