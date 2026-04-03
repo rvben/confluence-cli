@@ -12,6 +12,13 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+## [0.1.11](https://github.com/rvben/confluence-cli/compare/v0.1.10...v0.1.11) - 2026-04-03
+
+### Added
+
+- add schema command, standardize CI, and bump rust-version ([f2cb5d5](https://github.com/rvben/confluence-cli/commit/f2cb5d50a3ddd663ce72f1e224a9184a0a7b77b9))
+
 ## [0.1.10](https://github.com/rvben/confluence-cli/compare/v0.1.9...v0.1.10) - 2026-04-02
 
 ### Fixed
