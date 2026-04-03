@@ -1,5 +1,7 @@
 # confluence-cli
 
+[![codecov](https://codecov.io/gh/rvben/confluence-cli/graph/badge.svg)](https://codecov.io/gh/rvben/confluence-cli)
+
 Markdown-sync-first Confluence CLI in Rust.
 
 `confluence-cli` is built around a safe local workflow:
