@@ -1,6 +1,6 @@
 [package]
 name = "confluence-cli"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 rust-version = "1.90"
 description = "Markdown-sync-first Confluence CLI in Rust"
