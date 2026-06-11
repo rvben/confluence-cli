@@ -717,10 +717,10 @@ pub fn property_payload(key: &str, value: Value, version: Option<u64>) -> Value 
 }
 
 fn extract_error_message(raw: &str) -> String {
-    if let Ok(value) = serde_json::from_str::<Value>(raw) {
-        if let Some(msg) = value.get("message").and_then(|m| m.as_str()) {
-            return msg.to_string();
-        }
+    if let Ok(value) = serde_json::from_str::<Value>(raw)
+        && let Some(msg) = value.get("message").and_then(|m| m.as_str())
+    {
+        return msg.to_string();
     }
     raw.to_string()
 }

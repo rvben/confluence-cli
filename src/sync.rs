@@ -150,10 +150,10 @@ pub fn plan_path(
             // These fields are only present in sidecars written by versions that
             // track metadata. Skip comparison when absent so old sidecars remain
             // backward-compatible and don't generate spurious plan items.
-            if let Some(last_title) = &doc.sidecar.last_pulled_title {
-                if last_title != &doc.frontmatter.title {
-                    changes.push("title");
-                }
+            if let Some(last_title) = &doc.sidecar.last_pulled_title
+                && last_title != &doc.frontmatter.title
+            {
+                changes.push("title");
             }
             if doc.sidecar.last_pulled_title.is_some() {
                 // Labels tracking is gated on title being present (same sidecar version).
@@ -165,16 +165,16 @@ pub fn plan_path(
                     changes.push("labels");
                 }
             }
-            if let Some(last_status) = &doc.sidecar.last_pulled_status {
-                if last_status != &doc.frontmatter.status {
-                    changes.push("status");
-                }
+            if let Some(last_status) = &doc.sidecar.last_pulled_status
+                && last_status != &doc.frontmatter.status
+            {
+                changes.push("status");
             }
             let props_hash = properties_hash(&doc.frontmatter.properties);
-            if let Some(last_props_hash) = &doc.sidecar.last_pulled_properties_hash {
-                if last_props_hash != &props_hash {
-                    changes.push("properties");
-                }
+            if let Some(last_props_hash) = &doc.sidecar.last_pulled_properties_hash
+                && last_props_hash != &props_hash
+            {
+                changes.push("properties");
             }
 
             if !changes.is_empty() {
@@ -961,18 +961,18 @@ fn rewrite_local_target_url(
         resolved.clone()
     };
 
-    if let Some(link) = link_index.by_markdown_path.get(&markdown_target) {
-        if let Some(content_id) = &link.content_id {
-            let mut url = format!(
-                "{}/pages/viewpage.action?pageId={content_id}",
-                web_path_prefix.trim_end_matches('/')
-            );
-            if let Some(fragment) = fragment {
-                url.push('#');
-                url.push_str(fragment);
-            }
-            return Some(url);
+    if let Some(link) = link_index.by_markdown_path.get(&markdown_target)
+        && let Some(content_id) = &link.content_id
+    {
+        let mut url = format!(
+            "{}/pages/viewpage.action?pageId={content_id}",
+            web_path_prefix.trim_end_matches('/')
+        );
+        if let Some(fragment) = fragment {
+            url.push('#');
+            url.push_str(fragment);
         }
+        return Some(url);
     }
 
     let attachments_dir = resolved.parent()?;

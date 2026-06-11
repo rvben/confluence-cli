@@ -127,10 +127,10 @@ fn storage_to_markdown_xml(storage: &str) -> Option<String> {
     let document = Document::parse(&wrapped).ok()?;
     let mut blocks = Vec::new();
     for child in document.root_element().children() {
-        if let Some(block) = render_top_level_block(child, &wrapped) {
-            if !block.trim().is_empty() {
-                blocks.push(block.trim().to_string());
-            }
+        if let Some(block) = render_top_level_block(child, &wrapped)
+            && !block.trim().is_empty()
+        {
+            blocks.push(block.trim().to_string());
         }
     }
     Some(blocks.join("\n\n"))
@@ -847,14 +847,14 @@ fn render_page_tree_macro_block(node: Node<'_, '_>) -> Option<String> {
 
 fn render_page_tree_search_macro_block(node: Node<'_, '_>) -> Option<String> {
     let mut parameters = collect_macro_parameters(node);
-    if let Some(parameter) = find_macro_parameter(node, "spaceKey") {
-        if let Some(space) = namespaced_child(parameter, RI_NS, "space") {
-            let space_key = space
-                .attribute((RI_NS, "space-key"))
-                .or_else(|| space.attribute("ri:space-key"))
-                .or_else(|| space.attribute("space-key"))?;
-            parameters.insert("spaceKey".to_string(), space_key.to_string());
-        }
+    if let Some(parameter) = find_macro_parameter(node, "spaceKey")
+        && let Some(space) = namespaced_child(parameter, RI_NS, "space")
+    {
+        let space_key = space
+            .attribute((RI_NS, "space-key"))
+            .or_else(|| space.attribute("ri:space-key"))
+            .or_else(|| space.attribute("space-key"))?;
+        parameters.insert("spaceKey".to_string(), space_key.to_string());
     }
     if let Some(root) = parameters.get("root").cloned() {
         let trimmed = root.trim();
@@ -1649,10 +1649,10 @@ fn collect_macro_parameter_value(parameter: Node<'_, '_>) -> String {
         return build_page_placeholder_url(&page_resource_placeholder(page));
     }
 
-    if let Some(attachment) = namespaced_child(parameter, RI_NS, "attachment") {
-        if let Some(file_name) = attachment.attribute((RI_NS, "filename")) {
-            return file_name.to_string();
-        }
+    if let Some(attachment) = namespaced_child(parameter, RI_NS, "attachment")
+        && let Some(file_name) = attachment.attribute((RI_NS, "filename"))
+    {
+        return file_name.to_string();
     }
 
     let text = parameter.text().unwrap_or_default().trim().to_string();
@@ -2775,10 +2775,10 @@ fn attachment_preview_file_name(value: &str) -> Result<String> {
     }
     let path_part = trimmed.split('#').next().unwrap_or(trimmed);
     let candidate = Path::new(path_part);
-    if let Some(file_name) = candidate.file_name().and_then(|name| name.to_str()) {
-        if !file_name.is_empty() {
-            return Ok(file_name.to_string());
-        }
+    if let Some(file_name) = candidate.file_name().and_then(|name| name.to_str())
+        && !file_name.is_empty()
+    {
+        return Ok(file_name.to_string());
     }
     Ok(trimmed.to_string())
 }
@@ -2842,12 +2842,11 @@ fn build_page_tree_macro_storage(parameters: &BTreeMap<String, String>) -> Resul
 
 fn build_page_tree_search_macro_storage(parameters: &BTreeMap<String, String>) -> String {
     let mut parameters = parameters.clone();
-    if let Some(root) = parameters.get("root").cloned() {
-        if let Some(placeholder) = parse_page_placeholder_url(&root) {
-            if let Ok(root_target) = build_title_page_target(&placeholder) {
-                parameters.insert("root".to_string(), root_target);
-            }
-        }
+    if let Some(root) = parameters.get("root").cloned()
+        && let Some(placeholder) = parse_page_placeholder_url(&root)
+        && let Ok(root_target) = build_title_page_target(&placeholder)
+    {
+        parameters.insert("root".to_string(), root_target);
     }
     build_parameter_only_macro_storage("pagetreesearch", &parameters)
 }
@@ -3039,12 +3038,12 @@ fn build_optional_user_parameter_xml(name: &str, user: &str) -> Option<String> {
         return None;
     }
 
-    if let Some(placeholder) = parse_user_resource_identifier_text(trimmed) {
-        if let Some(resource_xml) = build_user_resource_xml(&placeholder) {
-            return Some(format!(
-                r#"<ac:parameter ac:name="{name}">{resource_xml}</ac:parameter>"#
-            ));
-        }
+    if let Some(placeholder) = parse_user_resource_identifier_text(trimmed)
+        && let Some(resource_xml) = build_user_resource_xml(&placeholder)
+    {
+        return Some(format!(
+            r#"<ac:parameter ac:name="{name}">{resource_xml}</ac:parameter>"#
+        ));
     }
     if !trimmed.contains(',')
         && let Some(placeholder) = parse_user_placeholder_url(trimmed)

@@ -10,7 +10,10 @@ mod sync;
 #[tokio::main]
 async fn main() {
     if let Err(error) = cli::run().await {
-        eprintln!("error: {error:#}");
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {"kind": "invalid_input", "message": format!("{error:#}")}})
+        );
         std::process::exit(1);
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -16,7 +16,9 @@ use crate::model::{
     AttachmentInfo, CommentInfo, ContentItem, ContentKind, ContentProperty, CreateContentRequest,
     PlanActionKind, ProviderKind, SearchResult, SpaceSummary, SyncPlan, UpdateContentRequest,
 };
-use crate::output::{OutputFormat, print_json, print_list, print_table};
+use crate::output::{
+    OutputArg, OutputFormat, print_items_json, print_json, print_list, print_table,
+};
 use crate::provider::{ConfluenceProvider, build_provider};
 use crate::sync;
 
@@ -27,10 +29,13 @@ use crate::sync;
     about = "Markdown-sync-first Confluence CLI in Rust"
 )]
 pub struct Cli {
-    #[arg(long, global = true)]
-    json: bool,
+    #[arg(long = "output", short = 'o', global = true, default_value = "auto")]
+    output: OutputArg,
     #[arg(long, global = true)]
     profile: Option<String>,
+    /// Skip confirmation prompts (for destructive operations)
+    #[arg(long, short = 'y', global = true)]
+    yes: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -99,9 +104,23 @@ enum AuthCommand {
 #[derive(Subcommand, Debug)]
 enum ProfileCommand {
     Add(ProfileInputArgs),
-    List,
-    Use { name: String },
-    Remove { name: String },
+    List {
+        /// Maximum number of items to return
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Number of items to skip
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Comma-separated list of fields to include in JSON output
+        #[arg(long)]
+        fields: Option<String>,
+    },
+    Use {
+        name: String,
+    },
+    Remove {
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -109,9 +128,14 @@ enum SpaceCommand {
     List {
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Fetch all spaces, ignoring --limit
         #[arg(long)]
         all: bool,
+        /// Comma-separated list of fields to include in JSON output
+        #[arg(long)]
+        fields: Option<String>,
     },
     Get {
         space: String,
@@ -137,6 +161,9 @@ struct SearchArgs {
     limit: usize,
     #[arg(long, default_value_t = 0)]
     offset: usize,
+    /// Comma-separated list of fields to include in JSON output
+    #[arg(long)]
+    fields: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -145,9 +172,14 @@ enum PageCommand {
         space: String,
         #[arg(long, default_value_t = 200)]
         limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Fetch all pages, ignoring --limit
         #[arg(long)]
         all: bool,
+        /// Comma-separated list of fields to include in JSON output
+        #[arg(long)]
+        fields: Option<String>,
     },
     Get {
         reference: String,
@@ -167,8 +199,6 @@ enum PageCommand {
     Update(UpdateContentArgs),
     Delete {
         reference: String,
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
 }
 
@@ -178,9 +208,14 @@ enum BlogCommand {
         space: String,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Fetch all blog posts, ignoring --limit
         #[arg(long)]
         all: bool,
+        /// Comma-separated list of fields to include in JSON output
+        #[arg(long)]
+        fields: Option<String>,
     },
     Get {
         id: String,
@@ -191,8 +226,6 @@ enum BlogCommand {
     Update(UpdateContentArgs),
     Delete {
         id: String,
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
 }
 
@@ -250,6 +283,9 @@ struct DoctorArgs {
 enum AttachmentCommand {
     List {
         reference: String,
+        /// Comma-separated list of fields to include in JSON output
+        #[arg(long)]
+        fields: Option<String>,
     },
     Download {
         reference: String,
@@ -270,22 +306,34 @@ enum AttachmentCommand {
     Delete {
         reference: String,
         attachment_id: String,
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum LabelCommand {
-    List { reference: String },
-    Add { reference: String, label: String },
-    Remove { reference: String, label: String },
+    List {
+        reference: String,
+        /// Comma-separated list of fields to include in JSON output
+        #[arg(long)]
+        fields: Option<String>,
+    },
+    Add {
+        reference: String,
+        label: String,
+    },
+    Remove {
+        reference: String,
+        label: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum CommentCommand {
     List {
         reference: String,
+        /// Comma-separated list of fields to include in JSON output
+        #[arg(long)]
+        fields: Option<String>,
     },
     Add {
         reference: String,
@@ -299,8 +347,6 @@ enum CommentCommand {
     },
     Delete {
         comment_id: String,
-        #[arg(long, short = 'y')]
-        yes: bool,
     },
 }
 
@@ -308,6 +354,9 @@ enum CommentCommand {
 enum PropertyCommand {
     List {
         reference: String,
+        /// Comma-separated list of fields to include in JSON output
+        #[arg(long)]
+        fields: Option<String>,
     },
     Get {
         reference: String,
@@ -454,8 +503,27 @@ struct DoctorSummary {
 }
 
 pub async fn run() -> Result<()> {
-    let cli = Cli::parse();
-    let output = OutputFormat::from_json_flag(cli.json);
+    let cli = Cli::try_parse().unwrap_or_else(|err| {
+        use clap::error::ErrorKind;
+        match err.kind() {
+            // Let clap handle help and version display normally (exit 0)
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => err.exit(),
+            // For actual errors, emit a structured error to stderr
+            _ => {
+                let msg = err.to_string();
+                // Keep only the first meaningful line (clap includes usage/hint)
+                let first_line = msg
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or(&msg)
+                    .trim()
+                    .to_string();
+                crate::output::print_error("invalid_input", &first_line, None);
+            }
+        }
+    });
+    let output = OutputFormat::from_arg(cli.output);
+    let yes = cli.yes;
 
     match cli.command {
         Commands::Init => config::init(output).await,
@@ -471,11 +539,11 @@ pub async fn run() -> Result<()> {
         }
         Commands::Page { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
-            handle_page(&*provider, command, output).await
+            handle_page(&*provider, command, output, yes).await
         }
         Commands::Blog { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
-            handle_blog(&*provider, command, output).await
+            handle_blog(&*provider, command, output, yes).await
         }
         Commands::Pull { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
@@ -502,7 +570,7 @@ pub async fn run() -> Result<()> {
         }
         Commands::Attachment { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
-            handle_attachment(&*provider, command, output).await
+            handle_attachment(&*provider, command, output, yes).await
         }
         Commands::Label { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
@@ -510,7 +578,7 @@ pub async fn run() -> Result<()> {
         }
         Commands::Comment { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
-            handle_comment(&*provider, command, output).await
+            handle_comment(&*provider, command, output, yes).await
         }
         Commands::Property { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
@@ -557,7 +625,7 @@ async fn handle_auth(
                 read_only: Some(args.read_only),
                 non_interactive: args.non_interactive,
             })?;
-            if matches!(output, OutputFormat::Json) {
+            if output.is_json() {
                 print_json(&resolved.redact())?;
             } else {
                 print_table(
@@ -576,7 +644,7 @@ async fn handle_auth(
             let profile = resolved_profile(profile_override)?;
             let provider = build_provider(profile.clone());
             provider.ping().await?;
-            if matches!(output, OutputFormat::Json) {
+            if output.is_json() {
                 print_json(&profile.redact())?;
             } else {
                 print_table(
@@ -601,10 +669,10 @@ async fn handle_auth(
         }
         AuthCommand::Logout => {
             let name = logout(profile_override)?;
-            if matches!(output, OutputFormat::Json) {
+            if output.is_json() {
                 print_json(&json!({ "profile": name, "status": "logged_out" }))?;
             } else {
-                println!("Logged out profile `{name}`");
+                eprintln!("Logged out profile `{name}`");
             }
         }
     }
@@ -806,16 +874,42 @@ fn handle_profile(command: ProfileCommand, output: OutputFormat) -> Result<()> {
                 read_only: Some(args.read_only),
                 non_interactive: args.non_interactive,
             })?;
-            if matches!(output, OutputFormat::Json) {
+            if output.is_json() {
                 print_json(&resolved.redact())?;
             } else {
-                println!("Stored profile `{}`", resolved.name);
+                eprintln!("Stored profile `{}`", resolved.name);
             }
         }
-        ProfileCommand::List => {
+        ProfileCommand::List {
+            limit,
+            offset,
+            fields,
+        } => {
             let config = AppConfig::load()?;
-            if matches!(output, OutputFormat::Json) {
-                print_json(&config)?;
+            if output.is_json() {
+                let items: Vec<Value> = config
+                    .profiles
+                    .iter()
+                    .map(|(name, profile)| {
+                        json!({
+                            "name": name,
+                            "provider": profile.provider.to_string(),
+                            "base_url": profile.base_url,
+                            "api_path": profile.api_path,
+                            "read_only": profile.read_only,
+                            "active": config.active_profile.as_deref() == Some(name.as_str()),
+                        })
+                    })
+                    .collect();
+                let total = items.len();
+                let start = offset.min(total);
+                let mut paged: Vec<Value> = items.into_iter().skip(start).collect();
+                if let Some(lim) = limit {
+                    paged.truncate(lim);
+                }
+                let shown = paged.len();
+                let filtered = filter_fields_vec(paged, fields.as_deref());
+                print_items_json(&filtered, total, limit.unwrap_or(shown), offset)?;
             } else {
                 let rows = config
                     .profiles
@@ -848,13 +942,13 @@ fn handle_profile(command: ProfileCommand, output: OutputFormat) -> Result<()> {
             let mut config = AppConfig::load()?;
             config.set_active_profile(&name)?;
             config.save()?;
-            println!("Active profile set to `{name}`");
+            eprintln!("Active profile set to `{name}`");
         }
         ProfileCommand::Remove { name } => {
             let mut config = AppConfig::load()?;
             config.remove_profile(&name)?;
             config.save()?;
-            println!("Removed profile `{name}`");
+            eprintln!("Removed profile `{name}`");
         }
     }
     Ok(())
@@ -866,12 +960,21 @@ async fn handle_space(
     output: OutputFormat,
 ) -> Result<()> {
     match command {
-        SpaceCommand::List { limit, all } => {
+        SpaceCommand::List {
+            limit,
+            offset,
+            all,
+            fields,
+        } => {
             let fetch_limit = if all { 10_000 } else { limit };
-            let spaces = provider.list_spaces(fetch_limit).await?;
-            render_spaces(&spaces, output)?;
-            if !all && !matches!(output, OutputFormat::Json) && spaces.len() >= limit {
-                eprintln!("Showing first {limit} spaces — use --all to fetch all");
+            let mut spaces = provider.list_spaces(fetch_limit).await?;
+            let total = spaces.len();
+            if !all && offset > 0 {
+                spaces = spaces.into_iter().skip(offset).collect();
+            }
+            render_spaces_list(&spaces, output, total, limit, offset, fields.as_deref())?;
+            if !all && !output.is_json() && total > limit {
+                eprintln!("Showing first {limit} spaces - use --all to fetch all");
             }
         }
         SpaceCommand::Get { space } => {
@@ -914,7 +1017,13 @@ async fn handle_search(
     let results = provider
         .search(&query, is_cql, args.limit, args.offset)
         .await?;
-    render_search_results(&results, output)?;
+    render_search_results_list(
+        &results,
+        output,
+        args.limit,
+        args.offset,
+        args.fields.as_deref(),
+    )?;
     Ok(())
 }
 
@@ -922,19 +1031,37 @@ async fn handle_page(
     provider: &dyn ConfluenceProvider,
     command: PageCommand,
     output: OutputFormat,
+    yes: bool,
 ) -> Result<()> {
     match command {
-        PageCommand::List { space, limit, all } => {
+        PageCommand::List {
+            space,
+            limit,
+            offset,
+            all,
+            fields,
+        } => {
             let mut pages = provider
                 .list_space_content(ContentKind::Page, &space, false)
                 .await?;
             let total = pages.len();
             if !all {
+                let start = offset.min(pages.len());
+                pages = pages.into_iter().skip(start).collect();
                 pages.truncate(limit);
             }
-            render_content_items(&pages, output, false)?;
-            if !all && !matches!(output, OutputFormat::Json) && total > limit {
-                eprintln!("Showing first {limit} of {total} pages — use --all to fetch all");
+            let shown = pages.len();
+            render_content_items_list(
+                &pages,
+                output,
+                false,
+                total,
+                limit,
+                offset,
+                fields.as_deref(),
+            )?;
+            if !all && !output.is_json() && total > shown + offset {
+                eprintln!("Showing first {limit} of {total} pages - use --all to fetch all");
             }
         }
         PageCommand::Get {
@@ -1049,7 +1176,7 @@ async fn handle_page(
                 .await?;
             render_content_items(&[updated], output, true)?;
         }
-        PageCommand::Delete { reference, yes } => {
+        PageCommand::Delete { reference } => {
             let id = provider.resolve_page_ref(&reference).await?;
             confirm_destructive(yes, &format!("Delete page {id}?"))?;
             provider.delete_content(ContentKind::Page, &id).await?;
@@ -1063,19 +1190,37 @@ async fn handle_blog(
     provider: &dyn ConfluenceProvider,
     command: BlogCommand,
     output: OutputFormat,
+    yes: bool,
 ) -> Result<()> {
     match command {
-        BlogCommand::List { space, limit, all } => {
+        BlogCommand::List {
+            space,
+            limit,
+            offset,
+            all,
+            fields,
+        } => {
             let mut posts = provider
                 .list_space_content(ContentKind::BlogPost, &space, false)
                 .await?;
             let total = posts.len();
             if !all {
+                let start = offset.min(posts.len());
+                posts = posts.into_iter().skip(start).collect();
                 posts.truncate(limit);
             }
-            render_content_items(&posts, output, false)?;
-            if !all && !matches!(output, OutputFormat::Json) && total > limit {
-                eprintln!("Showing first {limit} of {total} blog posts — use --all to fetch all");
+            let shown = posts.len();
+            render_content_items_list(
+                &posts,
+                output,
+                false,
+                total,
+                limit,
+                offset,
+                fields.as_deref(),
+            )?;
+            if !all && !output.is_json() && total > shown + offset {
+                eprintln!("Showing first {limit} of {total} blog posts - use --all to fetch all");
             }
         }
         BlogCommand::Get { id, show_body } => {
@@ -1145,7 +1290,7 @@ async fn handle_blog(
                 .await?;
             render_content_items(&[updated], output, true)?;
         }
-        BlogCommand::Delete { id, yes } => {
+        BlogCommand::Delete { id } => {
             confirm_destructive(yes, &format!("Delete blog post {id}?"))?;
             provider.delete_content(ContentKind::BlogPost, &id).await?;
             print_status(
@@ -1182,7 +1327,7 @@ async fn handle_pull(
             }
         }
     };
-    if matches!(output, OutputFormat::Json) {
+    if output.is_json() {
         print_json(&written)?;
     } else {
         let items = written
@@ -1198,12 +1343,13 @@ async fn handle_attachment(
     provider: &dyn ConfluenceProvider,
     command: AttachmentCommand,
     output: OutputFormat,
+    yes: bool,
 ) -> Result<()> {
     match command {
-        AttachmentCommand::List { reference } => {
+        AttachmentCommand::List { reference, fields } => {
             let id = provider.resolve_page_ref(&reference).await?;
             let attachments = provider.list_attachments(&id).await?;
-            render_attachments(&attachments, output)?;
+            render_attachments_list(&attachments, output, fields.as_deref())?;
         }
         AttachmentCommand::Download {
             reference,
@@ -1243,7 +1389,6 @@ async fn handle_attachment(
         AttachmentCommand::Delete {
             reference,
             attachment_id,
-            yes,
         } => {
             let id = provider.resolve_page_ref(&reference).await?;
             confirm_destructive(yes, &format!("Delete attachment {attachment_id}?"))?;
@@ -1264,11 +1409,13 @@ async fn handle_label(
     output: OutputFormat,
 ) -> Result<()> {
     match command {
-        LabelCommand::List { reference } => {
+        LabelCommand::List { reference, fields } => {
             let id = provider.resolve_page_ref(&reference).await?;
             let labels = provider.list_labels(&id).await?;
-            if matches!(output, OutputFormat::Json) {
-                print_json(&labels)?;
+            if output.is_json() {
+                let items: Vec<Value> = labels.iter().map(|l| json!({"label": l})).collect();
+                let filtered = filter_fields_vec(items, fields.as_deref());
+                print_items_json(&filtered, filtered.len(), filtered.len(), 0)?;
             } else {
                 print_list(&labels);
             }
@@ -1299,12 +1446,13 @@ async fn handle_comment(
     provider: &dyn ConfluenceProvider,
     command: CommentCommand,
     output: OutputFormat,
+    yes: bool,
 ) -> Result<()> {
     match command {
-        CommentCommand::List { reference } => {
+        CommentCommand::List { reference, fields } => {
             let id = provider.resolve_page_ref(&reference).await?;
             let comments = provider.list_comments(&id).await?;
-            render_comments(&comments, output)?;
+            render_comments_list(&comments, output, fields.as_deref())?;
         }
         CommentCommand::Add { reference, body } => {
             let id = provider.resolve_page_ref(&reference).await?;
@@ -1317,7 +1465,7 @@ async fn handle_comment(
             let comment = provider.update_comment(&comment_id, &storage).await?;
             render_comments(&[comment], output)?;
         }
-        CommentCommand::Delete { comment_id, yes } => {
+        CommentCommand::Delete { comment_id } => {
             confirm_destructive(yes, &format!("Delete comment {comment_id}?"))?;
             provider.delete_comment(&comment_id).await?;
             print_status(
@@ -1336,10 +1484,10 @@ async fn handle_property(
     output: OutputFormat,
 ) -> Result<()> {
     match command {
-        PropertyCommand::List { reference } => {
+        PropertyCommand::List { reference, fields } => {
             let id = provider.resolve_page_ref(&reference).await?;
             let properties = provider.list_properties(&id).await?;
-            render_properties(&properties, output)?;
+            render_properties_list(&properties, output, fields.as_deref())?;
         }
         PropertyCommand::Get { reference, key } => {
             let id = provider.resolve_page_ref(&reference).await?;
@@ -1434,7 +1582,7 @@ fn merge_properties(
 }
 
 fn render_spaces(spaces: &[SpaceSummary], output: OutputFormat) -> Result<()> {
-    if matches!(output, OutputFormat::Json) {
+    if output.is_json() {
         print_json(&spaces)
     } else {
         let rows = spaces
@@ -1454,33 +1602,12 @@ fn render_spaces(spaces: &[SpaceSummary], output: OutputFormat) -> Result<()> {
     }
 }
 
-fn render_search_results(results: &[SearchResult], output: OutputFormat) -> Result<()> {
-    if matches!(output, OutputFormat::Json) {
-        print_json(&results)
-    } else {
-        let rows = results
-            .iter()
-            .map(|result| {
-                vec![
-                    result.id.clone(),
-                    result.kind.to_string(),
-                    result.space_key.clone().unwrap_or_default(),
-                    result.title.clone(),
-                    result.web_url.clone().unwrap_or_default(),
-                ]
-            })
-            .collect::<Vec<_>>();
-        print_table(&["id", "kind", "space", "title", "url"], &rows);
-        Ok(())
-    }
-}
-
 fn render_content_items(
     items: &[ContentItem],
     output: OutputFormat,
     show_body: bool,
 ) -> Result<()> {
-    if matches!(output, OutputFormat::Json) {
+    if output.is_json() {
         print_json(&items)
     } else {
         let mut headers = vec![
@@ -1518,7 +1645,7 @@ fn render_content_items(
 }
 
 fn render_attachments(items: &[AttachmentInfo], output: OutputFormat) -> Result<()> {
-    if matches!(output, OutputFormat::Json) {
+    if output.is_json() {
         print_json(&items)
     } else {
         let rows = items
@@ -1544,7 +1671,7 @@ fn render_attachments(items: &[AttachmentInfo], output: OutputFormat) -> Result<
 }
 
 fn render_comments(items: &[CommentInfo], output: OutputFormat) -> Result<()> {
-    if matches!(output, OutputFormat::Json) {
+    if output.is_json() {
         print_json(&items)
     } else {
         let rows = items
@@ -1566,7 +1693,7 @@ fn render_comments(items: &[CommentInfo], output: OutputFormat) -> Result<()> {
 }
 
 fn render_properties(items: &[ContentProperty], output: OutputFormat) -> Result<()> {
-    if matches!(output, OutputFormat::Json) {
+    if output.is_json() {
         print_json(&items)
     } else {
         let rows = items
@@ -1587,8 +1714,171 @@ fn render_properties(items: &[ContentProperty], output: OutputFormat) -> Result<
     }
 }
 
+/// Filter a list of JSON objects to only include the requested fields.
+fn filter_fields_vec(items: Vec<Value>, fields: Option<&str>) -> Vec<Value> {
+    let Some(fields_str) = fields else {
+        return items;
+    };
+    let field_names: Vec<&str> = fields_str.split(',').map(str::trim).collect();
+    items
+        .into_iter()
+        .map(|item| {
+            if let Value::Object(map) = item {
+                let filtered: serde_json::Map<String, Value> = map
+                    .into_iter()
+                    .filter(|(k, _)| field_names.contains(&k.as_str()))
+                    .collect();
+                Value::Object(filtered)
+            } else {
+                item
+            }
+        })
+        .collect()
+}
+
+fn render_spaces_list(
+    spaces: &[SpaceSummary],
+    output: OutputFormat,
+    total: usize,
+    limit: usize,
+    offset: usize,
+    fields: Option<&str>,
+) -> Result<()> {
+    if output.is_json() {
+        let items: Vec<Value> = spaces
+            .iter()
+            .map(|s| serde_json::to_value(s).unwrap_or(Value::Null))
+            .collect();
+        let filtered = filter_fields_vec(items, fields);
+        print_items_json(&filtered, total, limit, offset)
+    } else {
+        let rows = spaces
+            .iter()
+            .map(|space| {
+                vec![
+                    space.id.clone(),
+                    space.key.clone(),
+                    space.name.clone(),
+                    space.space_type.clone().unwrap_or_default(),
+                    space.homepage_id.clone().unwrap_or_default(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(&["id", "key", "name", "type", "homepage"], &rows);
+        Ok(())
+    }
+}
+
+fn render_search_results_list(
+    results: &[SearchResult],
+    output: OutputFormat,
+    limit: usize,
+    offset: usize,
+    fields: Option<&str>,
+) -> Result<()> {
+    if output.is_json() {
+        let total = results.len();
+        let items: Vec<Value> = results
+            .iter()
+            .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
+            .collect();
+        let filtered = filter_fields_vec(items, fields);
+        print_items_json(&filtered, total, limit, offset)
+    } else {
+        let rows = results
+            .iter()
+            .map(|result| {
+                vec![
+                    result.id.clone(),
+                    result.kind.to_string(),
+                    result.space_key.clone().unwrap_or_default(),
+                    result.title.clone(),
+                    result.web_url.clone().unwrap_or_default(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(&["id", "kind", "space", "title", "url"], &rows);
+        Ok(())
+    }
+}
+
+fn render_content_items_list(
+    items: &[ContentItem],
+    output: OutputFormat,
+    show_body: bool,
+    total: usize,
+    limit: usize,
+    offset: usize,
+    fields: Option<&str>,
+) -> Result<()> {
+    if output.is_json() {
+        let json_items: Vec<Value> = items
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+            .collect();
+        let filtered = filter_fields_vec(json_items, fields);
+        print_items_json(&filtered, total, limit, offset)
+    } else {
+        render_content_items(items, output, show_body)
+    }
+}
+
+fn render_attachments_list(
+    items: &[AttachmentInfo],
+    output: OutputFormat,
+    fields: Option<&str>,
+) -> Result<()> {
+    if output.is_json() {
+        let total = items.len();
+        let json_items: Vec<Value> = items
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+            .collect();
+        let filtered = filter_fields_vec(json_items, fields);
+        print_items_json(&filtered, total, total, 0)
+    } else {
+        render_attachments(items, output)
+    }
+}
+
+fn render_comments_list(
+    items: &[CommentInfo],
+    output: OutputFormat,
+    fields: Option<&str>,
+) -> Result<()> {
+    if output.is_json() {
+        let total = items.len();
+        let json_items: Vec<Value> = items
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+            .collect();
+        let filtered = filter_fields_vec(json_items, fields);
+        print_items_json(&filtered, total, total, 0)
+    } else {
+        render_comments(items, output)
+    }
+}
+
+fn render_properties_list(
+    items: &[ContentProperty],
+    output: OutputFormat,
+    fields: Option<&str>,
+) -> Result<()> {
+    if output.is_json() {
+        let total = items.len();
+        let json_items: Vec<Value> = items
+            .iter()
+            .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+            .collect();
+        let filtered = filter_fields_vec(json_items, fields);
+        print_items_json(&filtered, total, total, 0)
+    } else {
+        render_properties(items, output)
+    }
+}
+
 fn render_plan(plan: &SyncPlan, output: OutputFormat, show_diff: bool) -> Result<()> {
-    if matches!(output, OutputFormat::Json) {
+    if output.is_json() {
         print_json(plan)
     } else {
         let summary = summarize_plan(plan);
@@ -1620,7 +1910,7 @@ fn render_plan(plan: &SyncPlan, output: OutputFormat, show_diff: bool) -> Result
 }
 
 fn render_doctor(report: &DoctorReport, output: OutputFormat) -> Result<()> {
-    if matches!(output, OutputFormat::Json) {
+    if output.is_json() {
         return print_json(report);
     }
 
@@ -1798,6 +2088,13 @@ fn confirm_destructive(yes: bool, prompt: &str) -> Result<()> {
     if yes {
         return Ok(());
     }
+    if !io::stdin().is_terminal() {
+        crate::output::print_error(
+            "confirmation_required",
+            prompt,
+            Some("Re-run with --yes to confirm."),
+        );
+    }
     eprint!("{prompt} [y/N] ");
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -1809,7 +2106,7 @@ fn confirm_destructive(yes: bool, prompt: &str) -> Result<()> {
 }
 
 fn print_status(output: OutputFormat, value: Value, text: &str) -> Result<()> {
-    if matches!(output, OutputFormat::Json) {
+    if output.is_json() {
         print_json(&value)
     } else {
         println!("{text}");
