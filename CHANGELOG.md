@@ -14,6 +14,17 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+## [0.1.13](https://github.com/rvben/confluence-cli/compare/v0.1.12...v0.1.13) - 2026-06-11
+
+### Added
+
+- **clispec**: implement v0.2 compliance, score 28% -> 100% ([1556d16](https://github.com/rvben/confluence-cli/commit/1556d16057f91efb404bb8d3293ff1f11f573026))
+
+### Fixed
+
+- restore --json as hidden alias for --output json ([717eec0](https://github.com/rvben/confluence-cli/commit/717eec02b425cbefc3de81cb0f50b48906d2a871))
+
 ## [0.1.12](https://github.com/rvben/confluence-cli/compare/v0.1.11...v0.1.12) - 2026-04-03
 
 ## [0.1.11](https://github.com/rvben/confluence-cli/compare/v0.1.10...v0.1.11) - 2026-04-03
