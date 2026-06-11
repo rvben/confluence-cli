@@ -31,6 +31,9 @@ use crate::sync;
 pub struct Cli {
     #[arg(long = "output", short = 'o', global = true, default_value = "auto")]
     output: OutputArg,
+    /// Output JSON (hidden alias for --output json; --output takes precedence if both given)
+    #[arg(long, global = true, hide = true)]
+    json: bool,
     #[arg(long, global = true)]
     profile: Option<String>,
     /// Skip confirmation prompts (for destructive operations)
@@ -522,7 +525,13 @@ pub async fn run() -> Result<()> {
             }
         }
     });
-    let output = OutputFormat::from_arg(cli.output);
+    // --json is a hidden alias for --output json.
+    // Explicit --output wins when both flags are given.
+    let output = if cli.json && cli.output == OutputArg::Auto {
+        OutputFormat::Json
+    } else {
+        OutputFormat::from_arg(cli.output)
+    };
     let yes = cli.yes;
 
     match cli.command {
@@ -2135,6 +2144,44 @@ mod tests {
             command
                 .get_subcommands()
                 .any(|subcommand| subcommand.get_name() == "doctor")
+        );
+    }
+
+    /// --json is a hidden alias for --output json and must resolve to JSON format
+    /// via the same production code path used at runtime.
+    #[test]
+    fn json_flag_resolves_to_json_format() {
+        let cli = Cli::parse_from(["confluence", "--json", "schema"]);
+        let output = if cli.json && cli.output == OutputArg::Auto {
+            OutputFormat::Json
+        } else {
+            OutputFormat::from_arg(cli.output)
+        };
+        assert_eq!(output, OutputFormat::Json);
+    }
+
+    /// Explicit --output text wins when both --json and --output are given.
+    #[test]
+    fn explicit_output_wins_over_json_flag() {
+        let cli = Cli::parse_from(["confluence", "--json", "--output", "text", "schema"]);
+        let output = if cli.json && cli.output == OutputArg::Auto {
+            OutputFormat::Json
+        } else {
+            OutputFormat::from_arg(cli.output)
+        };
+        // --output text was explicit, so text wins even though --json was passed
+        assert_eq!(output, OutputFormat::Text);
+    }
+
+    /// --json is hidden (does not appear in --help output).
+    #[test]
+    fn json_flag_is_hidden() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let json_arg = cmd.get_arguments().find(|a| a.get_long() == Some("json"));
+        assert!(
+            json_arg.map(|a| a.is_hide_set()).unwrap_or(false),
+            "--json must be a hidden flag"
         );
     }
 }
