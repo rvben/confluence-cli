@@ -132,6 +132,56 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "read_only", "type": "boolean"}),
         ],
 
+        "auth logout" => vec![
+            json!({"name": "profile", "type": "string"}),
+            json!({"name": "status", "type": "string"}),
+        ],
+
+        "init" => vec![
+            json!({"name": "configPath", "type": "string"}),
+            json!({"name": "configExists", "type": "boolean"}),
+            json!({"name": "cloudTokenUrl", "type": "string"}),
+            json!({"name": "dcPatDocs", "type": "string"}),
+            json!({"name": "envVars", "type": "string"}),
+            json!({"name": "example", "type": "string"}),
+        ],
+
+        "profile list" => vec![
+            json!({"name": "name", "type": "string"}),
+            json!({"name": "provider", "type": "string"}),
+            json!({"name": "base_url", "type": "string"}),
+            json!({"name": "api_path", "type": "string"}),
+            json!({"name": "read_only", "type": "boolean"}),
+            json!({"name": "active", "type": "boolean"}),
+        ],
+
+        // profile use and profile remove only emit eprintln! (no JSON output)
+        "pull page" | "pull tree" | "pull space" => vec![json!({"name": "path", "type": "string"})],
+
+        "doctor" => vec![
+            json!({"name": "config_path", "type": "string"}),
+            json!({"name": "config_exists", "type": "boolean"}),
+            json!({"name": "active_profile", "type": "string"}),
+            json!({"name": "stored_profiles", "type": "integer"}),
+            json!({"name": "resolved_profile", "type": "string"}),
+            json!({"name": "checks", "type": "string"}),
+            json!({"name": "summary", "type": "string"}),
+        ],
+
+        "attachment download" => vec![
+            json!({"name": "path", "type": "string"}),
+            json!({"name": "downloaded", "type": "boolean"}),
+        ],
+
+        "label list" => vec![json!({"name": "label", "type": "string"})],
+
+        "label add" => vec![
+            json!({"name": "label", "type": "string"}),
+            json!({"name": "added", "type": "boolean"}),
+        ],
+
+        // completions: outputs shell completion scripts (unstructured text, not records)
+        // schema: outputs the schema itself (not a structured record)
         "plan" | "apply" => vec![
             json!({"name": "action", "type": "string"}),
             json!({"name": "title", "type": "string"}),
