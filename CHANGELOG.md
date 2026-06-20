@@ -15,6 +15,9 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+## [0.1.14](https://github.com/rvben/confluence-cli/compare/v0.1.13...v0.1.14) - 2026-06-20
+
 ## [0.1.13](https://github.com/rvben/confluence-cli/compare/v0.1.12...v0.1.13) - 2026-06-11
 
 ### Added
