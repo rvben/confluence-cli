@@ -40,7 +40,6 @@ impl Frontmatter {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Sidecar {
     pub content_id: Option<String>,
@@ -79,11 +78,9 @@ pub struct LocalDocument {
     pub sidecar: Sidecar,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct ConversionOutput {
     pub storage: String,
-    pub lossy: Vec<String>,
 }
 
 pub fn storage_to_markdown(storage: &str) -> String {
@@ -217,7 +214,6 @@ pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<Conversi
 
     Ok(ConversionOutput {
         storage: html_output.trim().to_string(),
-        lossy,
     })
 }
 

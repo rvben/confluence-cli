@@ -293,24 +293,18 @@ fn retry_delay(attempt: usize, retry_after: Option<&HeaderValue>) -> Duration {
     Duration::from_millis((base * factor).min(5_000))
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct Results<T> {
     pub results: Vec<T>,
-    pub size: Option<usize>,
     pub limit: Option<usize>,
-    pub start: Option<usize>,
     #[serde(default)]
     pub _links: Links,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize, Default)]
 pub struct Links {
-    pub base: Option<String>,
     pub webui: Option<String>,
     pub download: Option<String>,
-    pub next: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,7 +324,6 @@ pub struct SimpleId {
     pub id: Value,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct V1Content {
     pub id: String,
@@ -344,7 +337,6 @@ pub struct V1Content {
     #[serde(default)]
     pub ancestors: Vec<V1Ancestor>,
     pub body: Option<V1Body>,
-    pub metadata: Option<V1Metadata>,
     #[serde(default)]
     pub _links: Links,
     pub history: Option<V1History>,
@@ -364,12 +356,10 @@ pub struct V1LastUpdated {
     pub when: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct V1SpaceRef {
     pub id: Option<Value>,
     pub key: String,
-    pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -392,12 +382,6 @@ pub struct V1Body {
 #[derive(Debug, Deserialize)]
 pub struct V1BodyStorage {
     pub value: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub struct V1Metadata {
-    pub labels: Option<Results<V1Label>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,7 +440,6 @@ pub struct V1AttachmentExtensions {
     pub file_size: Option<u64>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct V1Comment {
     pub id: String,
@@ -754,12 +737,10 @@ mod tests {
             space: Some(V1SpaceRef {
                 id: None,
                 key: "MFS".to_string(),
-                name: None,
             }),
             version: None,
             ancestors: Vec::new(),
             body: None,
-            metadata: None,
             _links: Links {
                 webui: Some("/spaces/MFS/pages/123/Example".to_string()),
                 ..Links::default()
