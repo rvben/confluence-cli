@@ -16,6 +16,13 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+## [0.1.15](https://github.com/rvben/confluence-cli/compare/v0.1.14...v0.1.15) - 2026-06-20
+
+### Added
+
+- **schema**: fill missing output_fields for 14 commands ([9f84a3a](https://github.com/rvben/confluence-cli/commit/9f84a3a05871705f1abb641150eb9016924ab5cb))
+
 ## [0.1.14](https://github.com/rvben/confluence-cli/compare/v0.1.13...v0.1.14) - 2026-06-20
 
 ## [0.1.13](https://github.com/rvben/confluence-cli/compare/v0.1.12...v0.1.13) - 2026-06-11
