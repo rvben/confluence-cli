@@ -1294,13 +1294,12 @@ fn placeholder_to_storage_macro(target: &str, body_html: &str) -> Option<String>
                 attrs.push(format!(r#"ri:space-key="{}""#, escape_xml_attr(space_key)));
             }
             format!(r#"<ri:page {} />"#, attrs.join(" "))
-        } else if let Some(content_id) = placeholder.content_id.as_deref() {
+        } else {
+            let content_id = placeholder.content_id.as_deref()?;
             format!(
                 r#"<ri:page ri:content-id="{}" />"#,
                 escape_xml_attr(content_id)
             )
-        } else {
-            return None;
         };
         let body = build_storage_link_body(body_html);
         return Some(format!(

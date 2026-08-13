@@ -55,7 +55,8 @@ fn make_extra_arg(name: &str, typ: &str, description: &str) -> Value {
 
 fn is_mutating(path: &str) -> bool {
     let mutating_verbs = [
-        "create", "update", "delete", "move", "add", "upload", "set", "apply", "pull",
+        "create", "update", "delete", "move", "add", "upload", "set", "apply", "pull", "remove",
+        "login", "logout", "use", "init",
     ];
     let last_word = path.rsplit_once(' ').map(|(_, w)| w).unwrap_or(path);
     mutating_verbs.contains(&last_word)
@@ -268,9 +269,22 @@ fn walk_commands(cmd: &clap::Command, prefix: &str, out: &mut Vec<Value>) {
 
             if let Some(about) = sub.get_about().map(|a| a.to_string()) {
                 entry.insert("description".into(), json!(about));
+            } else {
+                entry.insert(
+                    "description".into(),
+                    json!(format!("Run the {path} command")),
+                );
             }
 
             entry.insert("mutating".into(), json!(is_mutating(&path)));
+            entry.insert(
+                "effects".into(),
+                json!(if is_mutating(&path) {
+                    "non_idempotent"
+                } else {
+                    "read_only"
+                }),
+            );
 
             if !args.is_empty() {
                 entry.insert("args".into(), json!(args));
@@ -290,11 +304,12 @@ pub fn generate(cmd: &clap::Command) -> Value {
     let mut commands: Vec<Value> = Vec::new();
     walk_commands(cmd, "", &mut commands);
 
-    json!({
-        "clispec": "0.2",
+    let mut document = json!({
+        "clispec": "0.3",
         "name": "confluence",
         "version": env!("CARGO_PKG_VERSION"),
         "description": "Markdown-sync-first Confluence CLI in Rust",
+        "output": {"tty": "text", "piped": "json"},
         "global_args": [
             {
                 "name": "--output",
@@ -360,7 +375,56 @@ pub fn generate(cmd: &clap::Command) -> Value {
             }
         ],
         "commands": commands
-    })
+    });
+    enrich_v03(&mut document);
+    document
+}
+
+fn enrich_v03(document: &mut Value) {
+    let Some(commands) = document.get_mut("commands").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for command in commands {
+        let Some(object) = command.as_object_mut() else {
+            continue;
+        };
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if name == "completions" {
+            object.remove("output_fields");
+            object.insert("output_kind".into(), json!("opaque"));
+            object.insert("media_type".into(), json!("text/plain"));
+            continue;
+        }
+        let unbounded = LIST_COMMANDS.contains(&name.as_str());
+        object.insert(
+            "cardinality".into(),
+            json!(if unbounded { "unbounded" } else { "bounded" }),
+        );
+        if unbounded {
+            object.insert(
+                "pagination".into(),
+                json!({"style":"offset","limit_arg":"--limit","offset_arg":"--offset"}),
+            );
+            object.insert("fields_arg".into(), json!("--fields"));
+        }
+        if name == "profile list" {
+            object.insert("example".into(), json!({"args":["profile","list"]}));
+        }
+        if name == "schema" {
+            object.insert("cardinality".into(), json!("single"));
+            object.insert(
+                "stdout_schema".into(),
+                json!({"$ref":"https://clispec.dev/schema/v0.3.json"}),
+            );
+        }
+        if !object.contains_key("output_fields") && !object.contains_key("stdout_schema") {
+            object.insert("stdout_schema".into(), json!({}));
+        }
+    }
 }
 
 pub fn print_schema() {
@@ -390,7 +454,7 @@ mod tests {
         assert!(schema.get("global_args").is_some());
         assert!(schema.get("errors").is_some());
         assert!(schema.get("commands").is_some());
-        assert_eq!(schema["clispec"], "0.2");
+        assert_eq!(schema["clispec"], "0.3");
     }
 
     #[test]
