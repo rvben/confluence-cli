@@ -2,20 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.17](https://github.com/rvben/confluence-cli/compare/v0.1.16...v0.1.17) - 2026-08-22
 
+### Fixed
 
-
-
-
-
-
-
-
-
-
-
-
-
+- **cli**: resolve clap output argument collision ([c221a97](https://github.com/rvben/confluence-cli/commit/c221a97df474ddfd30fe9bf810aa36b6dea602e7))
 
 ## [0.1.15](https://github.com/rvben/confluence-cli/compare/v0.1.14...v0.1.15) - 2026-06-20
 
