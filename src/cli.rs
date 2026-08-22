@@ -29,7 +29,13 @@ use crate::sync;
     about = "Markdown-sync-first Confluence CLI in Rust"
 )]
 pub struct Cli {
-    #[arg(long = "output", short = 'o', global = true, default_value = "auto")]
+    #[arg(
+        id = "format",
+        long = "output",
+        short = 'o',
+        global = true,
+        default_value = "auto"
+    )]
     output: OutputArg,
     /// Output JSON (hidden alias for --output json; --output takes precedence if both given)
     #[arg(long, global = true, hide = true)]
@@ -2183,5 +2189,59 @@ mod tests {
             json_arg.map(|a| a.is_hide_set()).unwrap_or(false),
             "--json must be a hidden flag"
         );
+    }
+
+    /// Regression: the global `--output` (OutputArg) must not share a clap arg id
+    /// with the positional `output: PathBuf` in subcommands. If it does, clap panics
+    /// at parse time with a downcast mismatch. See `pull`/`attachment download`.
+    #[test]
+    fn pull_page_parses_positional_output_path() {
+        let cli = Cli::parse_from(["confluence", "pull", "page", "REF", "/tmp/dest"]);
+        match cli.command {
+            Commands::Pull {
+                command: PullCommand::Page { reference, output },
+            } => {
+                assert_eq!(reference, "REF");
+                assert_eq!(output, std::path::PathBuf::from("/tmp/dest"));
+            }
+            other => panic!("expected `pull page`, got {other:?}"),
+        }
+    }
+
+    /// Same collision surfaces on `attachment download` (positional `output: PathBuf`).
+    #[test]
+    fn attachment_download_parses_positional_output_path() {
+        let cli = Cli::parse_from([
+            "confluence",
+            "attachment",
+            "download",
+            "REF",
+            "ATT",
+            "/tmp/dest",
+        ]);
+        match cli.command {
+            Commands::Attachment {
+                command:
+                    AttachmentCommand::Download {
+                        reference,
+                        attachment_id,
+                        output,
+                    },
+            } => {
+                assert_eq!(reference, "REF");
+                assert_eq!(attachment_id, "ATT");
+                assert_eq!(output, std::path::PathBuf::from("/tmp/dest"));
+            }
+            other => panic!("expected `attachment download`, got {other:?}"),
+        }
+    }
+
+    /// The global format flag keeps its `--output`/`-o` surface after the id rename.
+    #[test]
+    fn global_output_flag_still_parses() {
+        let cli = Cli::parse_from(["confluence", "--output", "json", "schema"]);
+        assert_eq!(cli.output, OutputArg::Json);
+        let cli = Cli::parse_from(["confluence", "-o", "text", "schema"]);
+        assert_eq!(cli.output, OutputArg::Text);
     }
 }
