@@ -29,7 +29,13 @@ use crate::sync;
     about = "Markdown-sync-first Confluence CLI in Rust"
 )]
 pub struct Cli {
-    #[arg(id = "format", long = "output", short = 'o', global = true, default_value = "auto")]
+    #[arg(
+        id = "format",
+        long = "output",
+        short = 'o',
+        global = true,
+        default_value = "auto"
+    )]
     output: OutputArg,
     /// Output JSON (hidden alias for --output json; --output takes precedence if both given)
     #[arg(long, global = true, hide = true)]
@@ -2215,11 +2221,12 @@ mod tests {
         ]);
         match cli.command {
             Commands::Attachment {
-                command: AttachmentCommand::Download {
-                    reference,
-                    attachment_id,
-                    output,
-                },
+                command:
+                    AttachmentCommand::Download {
+                        reference,
+                        attachment_id,
+                        output,
+                    },
             } => {
                 assert_eq!(reference, "REF");
                 assert_eq!(attachment_id, "ATT");
