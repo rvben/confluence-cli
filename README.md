@@ -272,3 +272,8 @@ When a construct is unsupported or would be lossy, `confluence-cli` preserves th
 ## License
 
 MIT
+
+## Releasing
+
+Vership owns versioning, changelog generation, release commits, and tags. See
+[the release runbook](docs/releases.md) for the verified workflow and recovery policy.
