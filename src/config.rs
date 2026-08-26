@@ -285,7 +285,7 @@ pub fn run_login(input: LoginInput) -> Result<ResolvedProfile> {
             username = Some(prompt_required("Username or email", "")?);
         }
         if token.is_none() {
-            token = Some(prompt_required("API token or password", "")?);
+            token = Some(prompt_secret_required("API token or password", "")?);
         }
         if read_only.is_none() {
             read_only = Some(prompt_bool("Enable read-only mode?", false)?);
@@ -517,11 +517,9 @@ pub async fn init(output: OutputFormat) -> Result<()> {
     }
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
-        eprintln!(
-            "Run `confluence init` in an interactive terminal, \
-             or use `confluence init --json` for machine-readable setup instructions."
+        bail!(
+            "interactive setup requires a terminal; run `confluence init --json` for setup instructions, or use `confluence auth login --non-interactive` with CONFLUENCE_* environment variables"
         );
-        return Ok(());
     }
     init_interactive().await
 }
@@ -688,14 +686,13 @@ async fn init_interactive() -> Result<()> {
             } else {
                 ""
             };
-            let raw_token = prompt(
+            let raw_token = prompt_secret(
                 "Token",
                 if token_hint.is_empty() {
                     ""
                 } else {
                     token_hint
                 },
-                None,
             )?;
             let token = if raw_token.is_empty() && has_token {
                 existing_token.unwrap()
@@ -756,14 +753,13 @@ async fn init_interactive() -> Result<()> {
                 } else {
                     ""
                 };
-                let raw = prompt(
+                let raw = prompt_secret(
                     "Token",
                     if token_hint.is_empty() {
                         ""
                     } else {
                         token_hint
                     },
-                    None,
                 )?;
                 let token = if raw.is_empty() && has_token {
                     existing_token.unwrap()
@@ -777,14 +773,13 @@ async fn init_interactive() -> Result<()> {
                 } else {
                     ""
                 };
-                let raw = prompt(
+                let raw = prompt_secret(
                     "Personal Access Token",
                     if token_hint.is_empty() {
                         ""
                     } else {
                         token_hint
                     },
-                    None,
                 )?;
                 let token = if raw.is_empty() && has_token {
                     existing_token.unwrap()
@@ -872,6 +867,10 @@ async fn init_interactive() -> Result<()> {
     eprintln!();
     eprintln!("  {} Saved profile `{profile_name}`", sym_ok());
     eprintln!("  {}", sym_dim(&format!("Config: {}", path.display())));
+    eprintln!(
+        "  {}",
+        sym_dim("Credential storage: protected config file; treat it as a secret")
+    );
     eprintln!();
     eprintln!("{sep}");
     eprintln!("  What's next:");
@@ -960,6 +959,28 @@ fn prompt_required(label: &str, hint: &str) -> Result<String> {
     }
 }
 
+/// Prompt for a credential without echoing it to the terminal.
+fn prompt_secret(label: &str, hint: &str) -> Result<String> {
+    let hint_part = if hint.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", sym_dim(hint))
+    };
+    eprint!("{} {label}{hint_part}: ", sym_q());
+    std::io::stderr().flush().ok();
+    Ok(rpassword::read_password()?.trim().to_owned())
+}
+
+fn prompt_secret_required(label: &str, hint: &str) -> Result<String> {
+    loop {
+        let value = prompt_secret(label, hint)?;
+        if !value.is_empty() {
+            return Ok(value);
+        }
+        eprintln!("{} {label} is required", sym_fail());
+    }
+}
+
 /// Print a selection prompt with slash-separated options. Accepts any unambiguous prefix.
 /// Falls back to `default_idx` on unrecognised input.
 fn prompt_select(label: &str, options: &[&str], default_idx: usize) -> Result<usize> {
@@ -1002,6 +1023,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn init_text_mode_requires_a_terminal() {
+        let error = init(OutputFormat::Text).await.unwrap_err();
+        assert!(error.to_string().contains("--non-interactive"));
+    }
 
     // ── normalize_base_url ────────────────────────────────────────────────────
 

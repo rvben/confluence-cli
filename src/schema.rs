@@ -356,6 +356,12 @@ pub fn generate(cmd: &clap::Command) -> Value {
                 "description": "The command arguments or input data were invalid."
             },
             {
+                "kind": "tty_required",
+                "exit_code": 2,
+                "retryable": false,
+                "description": "Interactive setup was requested without a terminal."
+            },
+            {
                 "kind": "confirmation_required",
                 "exit_code": 2,
                 "retryable": false,

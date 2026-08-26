@@ -117,7 +117,7 @@ pub fn render_error(kind: &str, message: &str, hint: Option<&str>, machine: bool
         obj["error"]["hint"] = serde_json::Value::String(hint.to_string());
     }
     let exit_code = match kind {
-        "invalid_input" | "confirmation_required" | "read_only" => 2,
+        "invalid_input" | "confirmation_required" | "read_only" | "tty_required" => 2,
         "auth" => 3,
         "not_found" => 4,
         "api_error" | "network" => 5,
@@ -140,7 +140,15 @@ pub fn render_error(kind: &str, message: &str, hint: Option<&str>, machine: bool
 pub fn render_anyhow(error: &anyhow::Error, machine: bool) -> i32 {
     let message = format!("{error:#}");
     let lower = message.to_ascii_lowercase();
-    let (kind, hint) = if lower.contains("read-only") || lower.contains("read only") {
+    let (kind, hint) = if lower.contains("requires a terminal")
+        || lower.contains("interactive setup")
+        || lower.contains("non-interactive")
+    {
+        (
+            "tty_required",
+            Some("run the command in a terminal or use its documented non-interactive flags"),
+        )
+    } else if lower.contains("read-only") || lower.contains("read only") {
         (
             "read_only",
             Some("disable read-only mode for the active profile"),

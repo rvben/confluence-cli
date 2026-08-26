@@ -43,6 +43,12 @@ Prebuilt macOS and Linux archives are published on the [GitHub releases page](ht
 
 ## Quick Start
 
+For guided setup, run `confluence init` in a terminal. Existing profiles are
+offered as defaults, credentials are entered without terminal echo, access is
+verified before the profile is declared ready, and the wizard ends with useful
+next commands. In automation, use the explicit non-interactive login shown
+below; onboarding never consumes accidental piped input as answers.
+
 Cloud profile:
 
 ```bash
