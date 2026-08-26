@@ -209,7 +209,9 @@ const LIST_COMMANDS: &[&str] = &[
 ];
 
 fn walk_commands(cmd: &clap::Command, prefix: &str, out: &mut Vec<Value>) {
-    let global_ids = ["help", "version", "output", "profile", "yes"];
+    let global_ids = [
+        "help", "version", "output", "json", "profile", "quiet", "no_color", "yes",
+    ];
 
     for sub in cmd.get_subcommands() {
         let name = sub.get_name();
@@ -230,7 +232,7 @@ fn walk_commands(cmd: &clap::Command, prefix: &str, out: &mut Vec<Value>) {
             let mut args: Vec<Value> = Vec::new();
 
             for arg in sub.get_arguments() {
-                if global_ids.contains(&arg.get_id().as_str()) {
+                if global_ids.contains(&arg.get_id().as_str()) || arg.is_hide_set() {
                     continue;
                 }
                 args.push(arg_to_json(arg));
@@ -331,6 +333,16 @@ pub fn generate(cmd: &clap::Command) -> Value {
                 "description": "Configuration profile name"
             },
             {
+                "name": "--quiet",
+                "type": "boolean",
+                "description": "Suppress progress and informational messages"
+            },
+            {
+                "name": "--no-color",
+                "type": "boolean",
+                "description": "Disable ANSI color"
+            },
+            {
                 "name": "--yes",
                 "type": "boolean",
                 "description": "Skip confirmation prompts for destructive operations"
@@ -339,7 +351,7 @@ pub fn generate(cmd: &clap::Command) -> Value {
         "errors": [
             {
                 "kind": "invalid_input",
-                "exit_code": 1,
+                "exit_code": 2,
                 "retryable": false,
                 "description": "The command arguments or input data were invalid."
             },
@@ -362,16 +374,28 @@ pub fn generate(cmd: &clap::Command) -> Value {
                 "description": "The requested resource was not found."
             },
             {
-                "kind": "network",
+                "kind": "api_error",
                 "exit_code": 5,
+                "retryable": false,
+                "description": "Confluence returned an API error."
+            },
+            {
+                "kind": "rate_limit",
+                "exit_code": 6,
                 "retryable": true,
-                "description": "A network or connectivity error occurred."
+                "description": "Confluence rate-limited the request."
             },
             {
                 "kind": "conflict",
-                "exit_code": 6,
+                "exit_code": 7,
                 "retryable": false,
                 "description": "A conflict occurred, such as a version mismatch or duplicate resource."
+            },
+            {
+                "kind": "unexpected_error",
+                "exit_code": 1,
+                "retryable": false,
+                "description": "An unexpected local or transport error occurred."
             }
         ],
         "commands": commands
@@ -427,14 +451,30 @@ fn enrich_v03(document: &mut Value) {
     }
 }
 
-pub fn print_schema() {
+pub fn print_schema(command_filter: Option<&str>) -> bool {
     use clap::CommandFactory;
     let cmd = super::cli::Cli::command();
-    let schema = generate(&cmd);
+    let mut schema = generate(&cmd);
+    if let Some(filter) = command_filter {
+        schema["commands"] = Value::Array(
+            schema["commands"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|command| command["name"] == filter)
+                .collect(),
+        );
+    }
+    let found = command_filter.is_none()
+        || schema["commands"]
+            .as_array()
+            .is_some_and(|commands| !commands.is_empty());
     println!(
         "{}",
         serde_json::to_string_pretty(&schema).expect("serialize schema")
     );
+    found
 }
 
 #[cfg(test)]

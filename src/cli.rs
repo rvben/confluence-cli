@@ -17,16 +17,18 @@ use crate::model::{
     PlanActionKind, ProviderKind, SearchResult, SpaceSummary, SyncPlan, UpdateContentRequest,
 };
 use crate::output::{
-    OutputArg, OutputFormat, print_items_json, print_json, print_list, print_table,
+    OutputArg, OutputFormat, print_items_json, print_json, print_list, print_message, print_table,
 };
 use crate::provider::{ConfluenceProvider, build_provider};
 use crate::sync;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "confluence-cli",
+    name = "confluence",
     version,
-    about = "Markdown-sync-first Confluence CLI in Rust"
+    about = "Fast, safe Confluence workflows for humans and agents",
+    after_help = "Get started:\n  confluence init                 Configure an account\n  confluence doctor               Check configuration and access\n  confluence search 'release'     Find content\n  confluence schema --command 'page get'\n                                  Inspect one command for automation",
+    arg_required_else_help = true
 )]
 pub struct Cli {
     #[arg(
@@ -42,6 +44,12 @@ pub struct Cli {
     json: bool,
     #[arg(long, global = true)]
     profile: Option<String>,
+    /// Suppress progress and informational messages
+    #[arg(long, global = true)]
+    quiet: bool,
+    /// Disable ANSI color even on a terminal
+    #[arg(long, global = true)]
+    no_color: bool,
     /// Skip confirmation prompts (for destructive operations)
     #[arg(long, short = 'y', global = true)]
     yes: bool,
@@ -100,7 +108,11 @@ enum Commands {
         shell: Shell,
     },
     /// Output JSON schema for agent integration
-    Schema,
+    Schema {
+        /// Return only one complete command path
+        #[arg(long)]
+        command: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -449,8 +461,12 @@ struct ProfileInputArgs {
     auth_type: Option<String>,
     #[arg(long)]
     username: Option<String>,
-    #[arg(long)]
+    /// Deprecated: use CONFLUENCE_API_TOKEN or --token-stdin to avoid process-list exposure
+    #[arg(long, hide = true, conflicts_with = "token_stdin")]
     token: Option<String>,
+    /// Read the API token or PAT from stdin
+    #[arg(long)]
+    token_stdin: bool,
     #[arg(long)]
     read_only: bool,
     #[arg(long)]
@@ -512,6 +528,7 @@ struct DoctorSummary {
 }
 
 pub async fn run() -> Result<()> {
+    let raw_args = std::env::args().collect::<Vec<_>>();
     let cli = Cli::try_parse().unwrap_or_else(|err| {
         use clap::error::ErrorKind;
         match err.kind() {
@@ -527,7 +544,12 @@ pub async fn run() -> Result<()> {
                     .unwrap_or(&msg)
                     .trim()
                     .to_string();
-                crate::output::print_error("invalid_input", &first_line, None);
+                let machine = crate::output::machine_readable_errors(
+                    raw_args.iter().skip(1),
+                    std::io::stdout().is_terminal(),
+                );
+                let exit = crate::output::render_error("invalid_input", &first_line, None, machine);
+                std::process::exit(exit);
             }
         }
     });
@@ -538,6 +560,7 @@ pub async fn run() -> Result<()> {
     } else {
         OutputFormat::from_arg(cli.output)
     };
+    crate::output::configure(cli.quiet, cli.no_color, output.is_json());
     let yes = cli.yes;
 
     match cli.command {
@@ -604,9 +627,12 @@ pub async fn run() -> Result<()> {
             generate(shell, &mut command, "confluence", &mut io::stdout());
             Ok(())
         }
-        Commands::Schema => {
-            crate::schema::print_schema();
-            Ok(())
+        Commands::Schema { command } => {
+            if crate::schema::print_schema(command.as_deref()) {
+                Ok(())
+            } else {
+                bail!("command `{}` is not declared", command.unwrap_or_default())
+            }
         }
     }
 }
@@ -629,17 +655,7 @@ async fn handle_auth(
 ) -> Result<()> {
     match command {
         AuthCommand::Login(args) => {
-            let resolved = run_login(LoginInput {
-                profile: args.name,
-                provider: args.provider.map(ProviderArg::into_model),
-                domain: args.domain,
-                api_path: args.api_path,
-                auth_type: args.auth_type,
-                username: args.username,
-                token: args.token,
-                read_only: Some(args.read_only),
-                non_interactive: args.non_interactive,
-            })?;
+            let resolved = run_login(login_input(args)?)?;
             if output.is_json() {
                 print_json(&resolved.redact())?;
             } else {
@@ -687,7 +703,7 @@ async fn handle_auth(
             if output.is_json() {
                 print_json(&json!({ "profile": name, "status": "logged_out" }))?;
             } else {
-                eprintln!("Logged out profile `{name}`");
+                print_message(&format!("Logged out profile `{name}`"));
             }
         }
     }
@@ -878,21 +894,11 @@ async fn handle_doctor(
 fn handle_profile(command: ProfileCommand, output: OutputFormat) -> Result<()> {
     match command {
         ProfileCommand::Add(args) => {
-            let resolved = run_login(LoginInput {
-                profile: args.name,
-                provider: args.provider.map(ProviderArg::into_model),
-                domain: args.domain,
-                api_path: args.api_path,
-                auth_type: args.auth_type,
-                username: args.username,
-                token: args.token,
-                read_only: Some(args.read_only),
-                non_interactive: args.non_interactive,
-            })?;
+            let resolved = run_login(login_input(args)?)?;
             if output.is_json() {
                 print_json(&resolved.redact())?;
             } else {
-                eprintln!("Stored profile `{}`", resolved.name);
+                print_message(&format!("Stored profile `{}`", resolved.name));
             }
         }
         ProfileCommand::List {
@@ -957,16 +963,43 @@ fn handle_profile(command: ProfileCommand, output: OutputFormat) -> Result<()> {
             let mut config = AppConfig::load()?;
             config.set_active_profile(&name)?;
             config.save()?;
-            eprintln!("Active profile set to `{name}`");
+            print_message(&format!("Active profile set to `{name}`"));
         }
         ProfileCommand::Remove { name } => {
             let mut config = AppConfig::load()?;
             config.remove_profile(&name)?;
             config.save()?;
-            eprintln!("Removed profile `{name}`");
+            print_message(&format!("Removed profile `{name}`"));
         }
     }
     Ok(())
+}
+
+fn login_input(args: ProfileInputArgs) -> Result<LoginInput> {
+    let token = if args.token_stdin {
+        let mut value = String::new();
+        io::stdin()
+            .read_to_string(&mut value)
+            .context("failed to read token from stdin")?;
+        let value = value.trim_end_matches(['\r', '\n']).to_string();
+        if value.is_empty() {
+            bail!("token read from stdin is empty");
+        }
+        Some(value)
+    } else {
+        args.token
+    };
+    Ok(LoginInput {
+        profile: args.name,
+        provider: args.provider.map(ProviderArg::into_model),
+        domain: args.domain,
+        api_path: args.api_path,
+        auth_type: args.auth_type,
+        username: args.username,
+        token,
+        read_only: Some(args.read_only),
+        non_interactive: args.non_interactive,
+    })
 }
 
 async fn handle_space(
@@ -989,7 +1022,9 @@ async fn handle_space(
             }
             render_spaces_list(&spaces, output, total, limit, offset, fields.as_deref())?;
             if !all && !output.is_json() && total > limit {
-                eprintln!("Showing first {limit} spaces - use --all to fetch all");
+                print_message(&format!(
+                    "Showing first {limit} spaces - use --all to fetch all"
+                ));
             }
         }
         SpaceCommand::Get { space } => {
@@ -1076,7 +1111,9 @@ async fn handle_page(
                 fields.as_deref(),
             )?;
             if !all && !output.is_json() && total > shown + offset {
-                eprintln!("Showing first {limit} of {total} pages - use --all to fetch all");
+                print_message(&format!(
+                    "Showing first {limit} of {total} pages - use --all to fetch all"
+                ));
             }
         }
         PageCommand::Get {
@@ -1235,7 +1272,9 @@ async fn handle_blog(
                 fields.as_deref(),
             )?;
             if !all && !output.is_json() && total > shown + offset {
-                eprintln!("Showing first {limit} of {total} blog posts - use --all to fetch all");
+                print_message(&format!(
+                    "Showing first {limit} of {total} blog posts - use --all to fetch all"
+                ));
             }
         }
         BlogCommand::Get { id, show_body } => {

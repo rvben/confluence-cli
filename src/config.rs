@@ -88,8 +88,20 @@ impl AppConfig {
         fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create config directory {}", dir.display()))?;
         let path = Self::config_path()?;
-        let raw = serde_json::to_string_pretty(self)?;
-        fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+        let raw = serde_json::to_vec_pretty(self)?;
+        let mut temp = tempfile::Builder::new()
+            .prefix(".config-")
+            .suffix(".json.tmp")
+            .tempfile_in(&dir)
+            .with_context(|| format!("failed to create temporary config in {}", dir.display()))?;
+        temp.write_all(&raw)
+            .with_context(|| format!("failed to write temporary config for {}", path.display()))?;
+        temp.flush()
+            .with_context(|| format!("failed to flush temporary config for {}", path.display()))?;
+        set_private_permissions(temp.path())?;
+        temp.persist(&path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
         Ok(())
     }
 
@@ -244,7 +256,7 @@ pub fn run_login(input: LoginInput) -> Result<ResolvedProfile> {
     let mut api_path = input.api_path;
     let mut auth_type = input.auth_type;
     let mut username = input.username;
-    let mut token = input.token;
+    let mut token = input.token.or_else(token_from_env);
     let mut read_only = input.read_only;
 
     if !input.non_interactive {
@@ -306,6 +318,29 @@ pub fn run_login(input: LoginInput) -> Result<ResolvedProfile> {
     config.save()?;
 
     Ok(ResolvedProfile::from_stored(profile_name, stored))
+}
+
+fn token_from_env() -> Option<String> {
+    [
+        "CONFLUENCE_API_TOKEN",
+        "CONFLUENCE_TOKEN",
+        "CONFLUENCE_PASSWORD",
+        "CONFLUENCE_BEARER_TOKEN",
+    ]
+    .into_iter()
+    .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()))
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to chmod 0600 {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 pub fn logout(profile_override: Option<&str>) -> Result<String> {

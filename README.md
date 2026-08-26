@@ -46,30 +46,29 @@ Prebuilt macOS and Linux archives are published on the [GitHub releases page](ht
 Cloud profile:
 
 ```bash
-confluence-cli auth login \
+CONFLUENCE_API_TOKEN="$CONFLUENCE_API_TOKEN" confluence auth login \
   --profile cloud \
   --provider cloud \
   --domain your-site.atlassian.net \
   --auth-type basic \
   --username you@example.com \
-  --token "$CONFLUENCE_API_TOKEN" \
   --non-interactive
 
-confluence-cli doctor --profile cloud --space SPACEKEY
+confluence doctor --profile cloud --space SPACEKEY
 ```
 
 Data Center profile:
 
 ```bash
-confluence-cli auth login \
+printf '%s' "$CONFLUENCE_PAT" | confluence auth login \
   --profile dc \
   --provider data-center \
   --domain http://localhost:8090 \
   --auth-type bearer \
-  --token "$CONFLUENCE_PAT" \
+  --token-stdin \
   --non-interactive
 
-confluence-cli doctor --profile dc --space TEST
+confluence doctor --profile dc --space TEST
 ```
 
 Environment-driven mode also works without a stored profile:
@@ -81,7 +80,7 @@ export CONFLUENCE_AUTH_TYPE=basic
 export CONFLUENCE_EMAIL=you@example.com
 export CONFLUENCE_TOKEN="$CONFLUENCE_API_TOKEN"
 
-confluence-cli doctor --space SPACEKEY
+confluence doctor --space SPACEKEY
 ```
 
 ## Markdown Sync Workflow
@@ -89,19 +88,19 @@ confluence-cli doctor --space SPACEKEY
 Pull a page tree:
 
 ```bash
-confluence-cli pull tree SPACE:ParentPage ./docs/parent-page
+confluence pull tree SPACE:ParentPage ./docs/parent-page
 ```
 
 Inspect the planned changes:
 
 ```bash
-confluence-cli plan ./docs/parent-page
+confluence plan ./docs/parent-page
 ```
 
 Apply the diff:
 
 ```bash
-confluence-cli apply ./docs/parent-page
+confluence apply ./docs/parent-page
 ```
 
 Local content is stored as:
@@ -117,7 +116,7 @@ The frontmatter carries editable metadata like `title`, `type`, `labels`, `statu
 Use `doctor` before a first sync, in CI, or when a profile behaves unexpectedly.
 
 ```bash
-confluence-cli doctor --profile cloud --space SPACEKEY --path ./docs/parent-page
+confluence doctor --profile cloud --space SPACEKEY --path ./docs/parent-page
 ```
 
 It checks:
@@ -150,7 +149,7 @@ Top-level command groups:
 - `doctor`
 - `completions`
 
-All major commands accept `--json`.
+Every command accepts the suite-wide `--output auto|text|json`, `--quiet`, and `--no-color` flags. Auto output is readable text on a terminal and JSON when piped; `--json` remains a hidden compatibility alias. Errors use the shared exit-code contract (input 2, auth 3, not found 4, API 5, rate limit 6, conflict 7), and `confluence schema --command 'page get'` returns one token-efficient command contract.
 
 ## Auth And Environment Overrides
 
@@ -172,9 +171,9 @@ Supported environment overrides:
 ## Shell Completions
 
 ```bash
-confluence-cli completions bash > /usr/local/etc/bash_completion.d/confluence-cli
-confluence-cli completions zsh > ~/.zsh/completions/_confluence-cli
-confluence-cli completions fish > ~/.config/fish/completions/confluence-cli.fish
+confluence completions bash > /usr/local/etc/bash_completion.d/confluence
+confluence completions zsh > ~/.zsh/completions/_confluence
+confluence completions fish > ~/.config/fish/completions/confluence.fish
 ```
 
 ## Local Data Center
