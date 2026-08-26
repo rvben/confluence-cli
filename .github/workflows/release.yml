@@ -243,22 +243,22 @@ jobs:
             license "MIT"
 
             on_macos do
-              if Hardware::CPU.arm?
+              on_arm do
                 url "https://github.com/rvben/confluence-cli/releases/download/vVERSION_PLACEHOLDER/confluence-cli-vVERSION_PLACEHOLDER-aarch64-apple-darwin.tar.gz"
                 sha256 "SHA_MACOS_ARM64_PLACEHOLDER"
-              else
+              end
+
+              on_intel do
                 url "https://github.com/rvben/confluence-cli/releases/download/vVERSION_PLACEHOLDER/confluence-cli-vVERSION_PLACEHOLDER-x86_64-apple-darwin.tar.gz"
                 sha256 "SHA_MACOS_X86_PLACEHOLDER"
               end
             end
 
             on_linux do
-              if Hardware::CPU.intel?
-                url "https://github.com/rvben/confluence-cli/releases/download/vVERSION_PLACEHOLDER/confluence-cli-vVERSION_PLACEHOLDER-x86_64-unknown-linux-gnu.tar.gz"
-                sha256 "SHA_LINUX_X86_PLACEHOLDER"
-              else
-                odie "Linux ARM is not supported by this formula."
-              end
+              depends_on arch: :x86_64
+
+              url "https://github.com/rvben/confluence-cli/releases/download/vVERSION_PLACEHOLDER/confluence-cli-vVERSION_PLACEHOLDER-x86_64-unknown-linux-gnu.tar.gz"
+              sha256 "SHA_LINUX_X86_PLACEHOLDER"
             end
 
             def install
@@ -276,6 +276,12 @@ jobs:
           sed -i "s/SHA_MACOS_ARM64_PLACEHOLDER/${SHA_MACOS_ARM64}/" Formula/confluence-cli.rb
           sed -i "s/SHA_MACOS_X86_PLACEHOLDER/${SHA_MACOS_X86}/" Formula/confluence-cli.rb
           sed -i "s/SHA_LINUX_X86_PLACEHOLDER/${SHA_LINUX_X86}/" Formula/confluence-cli.rb
+
+          ruby -c Formula/confluence-cli.rb
+          if grep -Eq '\b(odie|abort|exit)\b' Formula/confluence-cli.rb; then
+            echo "formula must not abort while Homebrew loads the shared tap" >&2
+            exit 1
+          fi
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
