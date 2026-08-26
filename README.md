@@ -52,7 +52,10 @@ explicit protected-file fallback rather than silently weakening storage.
 
 For Confluence Data Center, setup can create a dedicated PAT through the
 official API using a one-time password or existing PAT; the bootstrap secret is
-never saved. Onboarding never consumes accidental piped input as answers.
+never saved. If automatic creation is unavailable, it opens
+`https://<your-host>/plugins/personalaccesstokens/usertokens.action` (also
+available under **Avatar → Settings → Personal access tokens**). Onboarding
+never consumes accidental piped input as answers.
 
 Cloud profile:
 

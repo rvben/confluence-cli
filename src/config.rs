@@ -1017,12 +1017,9 @@ async fn init_interactive() -> Result<()> {
             )
         }
         ProviderKind::DataCenter => {
-            let pat_url = format!(
-                "{}/plugins/servlet/manage-api-tokens",
-                base_url.trim_end_matches('/')
-            );
+            let pat_url = data_center_pat_url(&base_url);
             let (auth_type, username, token, expires_at) = if has_token {
-                eprintln!("  {}", sym_dim(&format!("→ {pat_url}")));
+                print_data_center_pat_link(&pat_url);
                 let existing_basic = matches!(
                     existing.as_ref().map(|profile| &profile.auth),
                     Some(AuthConfig::Basic { .. })
@@ -1100,7 +1097,7 @@ async fn init_interactive() -> Result<()> {
                         eprintln!(" {} {error}", sym_fail());
                         eprintln!("  Falling back to browser-assisted PAT creation.");
                         let _ = open::that(&pat_url);
-                        eprintln!("  {}", sym_dim(&format!("→ {pat_url}")));
+                        print_data_center_pat_link(&pat_url);
                         (
                             "bearer",
                             None,
@@ -1111,7 +1108,7 @@ async fn init_interactive() -> Result<()> {
                 }
             } else {
                 let _ = open::that(&pat_url);
-                eprintln!("  {}", sym_dim(&format!("→ {pat_url}")));
+                print_data_center_pat_link(&pat_url);
                 (
                     "bearer",
                     None,
@@ -1281,6 +1278,18 @@ fn prompt_expiration_days(default: u64) -> Result<u64> {
             _ => eprintln!("  {} Expiry must be between 1 and 365 days.", sym_fail()),
         }
     }
+}
+
+const DATA_CENTER_PAT_PATH: &str = "/plugins/personalaccesstokens/usertokens.action";
+const DATA_CENTER_PAT_NAVIGATION: &str = "Avatar → Settings → Personal access tokens";
+
+fn data_center_pat_url(base_url: &str) -> String {
+    format!("{}{DATA_CENTER_PAT_PATH}", base_url.trim_end_matches('/'))
+}
+
+fn print_data_center_pat_link(url: &str) {
+    eprintln!("  {}", sym_dim(&format!("→ {url}")));
+    eprintln!("  {}", sym_dim(DATA_CENTER_PAT_NAVIGATION));
 }
 
 fn expiration_date(days: u64) -> String {
@@ -1553,6 +1562,14 @@ mod tests {
         assert_eq!(
             normalize_base_url("https://example.com/confluence"),
             "https://example.com/confluence"
+        );
+    }
+
+    #[test]
+    fn data_center_pat_url_opens_personal_token_page() {
+        assert_eq!(
+            data_center_pat_url("https://example.com/confluence/"),
+            "https://example.com/confluence/plugins/personalaccesstokens/usertokens.action"
         );
     }
 
