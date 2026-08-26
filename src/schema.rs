@@ -56,7 +56,7 @@ fn make_extra_arg(name: &str, typ: &str, description: &str) -> Value {
 fn is_mutating(path: &str) -> bool {
     let mutating_verbs = [
         "create", "update", "delete", "move", "add", "upload", "set", "apply", "pull", "remove",
-        "login", "logout", "use", "init",
+        "login", "logout", "migrate", "use", "init",
     ];
     let last_word = path.rsplit_once(' ').map(|(_, w)| w).unwrap_or(path);
     mutating_verbs.contains(&last_word)
@@ -125,17 +125,40 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "value", "type": "string"}),
         ],
 
-        "auth status" | "auth login" | "profile add" => vec![
+        "auth login" | "profile add" => vec![
             json!({"name": "name", "type": "string"}),
             json!({"name": "provider", "type": "string"}),
             json!({"name": "base_url", "type": "string"}),
             json!({"name": "api_path", "type": "string"}),
+            json!({"name": "credential_store", "type": "string"}),
+            json!({"name": "cloud_id", "type": "string"}),
+            json!({"name": "token_kind", "type": "string"}),
+            json!({"name": "expires_at", "type": "string"}),
+            json!({"name": "read_only", "type": "boolean"}),
+        ],
+
+        "auth status" => vec![
+            json!({"name": "name", "type": "string"}),
+            json!({"name": "provider", "type": "string"}),
+            json!({"name": "base_url", "type": "string"}),
+            json!({"name": "api_path", "type": "string"}),
+            json!({"name": "credential_store", "type": "string"}),
+            json!({"name": "cloud_id", "type": "string"}),
+            json!({"name": "token_kind", "type": "string"}),
+            json!({"name": "expires_at", "type": "string"}),
+            json!({"name": "expiration_status", "type": "string"}),
             json!({"name": "read_only", "type": "boolean"}),
         ],
 
         "auth logout" => vec![
             json!({"name": "profile", "type": "string"}),
             json!({"name": "status", "type": "string"}),
+        ],
+
+        "auth migrate" => vec![
+            json!({"name": "profile", "type": "string"}),
+            json!({"name": "migrated", "type": "boolean"}),
+            json!({"name": "credential_store", "type": "string"}),
         ],
 
         "init" => vec![
@@ -152,6 +175,9 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "provider", "type": "string"}),
             json!({"name": "base_url", "type": "string"}),
             json!({"name": "api_path", "type": "string"}),
+            json!({"name": "credential_store", "type": "string"}),
+            json!({"name": "token_kind", "type": "string"}),
+            json!({"name": "expires_at", "type": "string"}),
             json!({"name": "read_only", "type": "boolean"}),
             json!({"name": "active", "type": "boolean"}),
         ],

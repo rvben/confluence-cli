@@ -117,9 +117,11 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommand {
-    Login(ProfileInputArgs),
+    Login(Box<ProfileInputArgs>),
     Status,
     Logout,
+    /// Move an inline legacy token into the operating-system keychain
+    Migrate,
 }
 
 #[derive(Subcommand, Debug)]
@@ -471,6 +473,18 @@ struct ProfileInputArgs {
     read_only: bool,
     #[arg(long)]
     non_interactive: bool,
+    /// Store the credential in the protected config file instead of the OS keychain
+    #[arg(long)]
+    insecure_storage: bool,
+    /// Atlassian Cloud ID required by scoped API tokens
+    #[arg(long, env = "CONFLUENCE_CLOUD_ID")]
+    cloud_id: Option<String>,
+    /// Cloud token type: scoped or classic
+    #[arg(long, env = "CONFLUENCE_TOKEN_KIND")]
+    token_kind: Option<String>,
+    /// Recorded token expiry date (YYYY-MM-DD)
+    #[arg(long)]
+    expires_at: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -655,17 +669,51 @@ async fn handle_auth(
 ) -> Result<()> {
     match command {
         AuthCommand::Login(args) => {
+            let mut args = *args;
+            let guided = args.name.is_none()
+                && profile_override.is_none()
+                && args.provider.is_none()
+                && args.domain.is_none()
+                && args.api_path.is_none()
+                && args.auth_type.is_none()
+                && args.username.is_none()
+                && args.token.is_none()
+                && !args.token_stdin
+                && !args.non_interactive
+                && !args.insecure_storage
+                && args.cloud_id.is_none()
+                && args.token_kind.is_none()
+                && args.expires_at.is_none();
+            if guided {
+                return crate::config::init(output).await;
+            }
+            if args.name.is_none() {
+                args.name = profile_override.map(str::to_owned);
+            }
             let resolved = run_login(login_input(args)?)?;
             if output.is_json() {
                 print_json(&resolved.redact())?;
             } else {
                 print_table(
-                    &["profile", "provider", "base_url", "api_path", "read_only"],
+                    &[
+                        "profile",
+                        "provider",
+                        "base_url",
+                        "api_path",
+                        "credential_store",
+                        "token_kind",
+                        "expires_at",
+                        "expiration_status",
+                        "read_only",
+                    ],
                     &[vec![
                         resolved.name,
                         resolved.provider.to_string(),
                         resolved.base_url,
                         resolved.api_path,
+                        resolved.credential_store,
+                        resolved.token_kind,
+                        resolved.expires_at.unwrap_or_else(|| "-".to_string()),
                         resolved.read_only.to_string(),
                     ]],
                 );
@@ -676,7 +724,11 @@ async fn handle_auth(
             let provider = build_provider(profile.clone());
             provider.ping().await?;
             if output.is_json() {
-                print_json(&profile.redact())?;
+                let mut value = serde_json::to_value(profile.redact())?;
+                value["expiration_status"] = json!(crate::config::expiration_status(
+                    profile.expires_at.as_deref()
+                ));
+                print_json(&value)?;
             } else {
                 print_table(
                     &[
@@ -684,6 +736,9 @@ async fn handle_auth(
                         "provider",
                         "base_url",
                         "api_path",
+                        "credential_store",
+                        "token_kind",
+                        "expires_at",
                         "read_only",
                         "status",
                     ],
@@ -692,6 +747,13 @@ async fn handle_auth(
                         profile.provider.to_string(),
                         profile.base_url,
                         profile.api_path,
+                        profile.credential_store,
+                        profile.token_kind,
+                        profile
+                            .expires_at
+                            .clone()
+                            .unwrap_or_else(|| "-".to_string()),
+                        crate::config::expiration_status(profile.expires_at.as_deref()).to_string(),
                         profile.read_only.to_string(),
                         "ok".to_string(),
                     ]],
@@ -704,6 +766,22 @@ async fn handle_auth(
                 print_json(&json!({ "profile": name, "status": "logged_out" }))?;
             } else {
                 print_message(&format!("Logged out profile `{name}`"));
+            }
+        }
+        AuthCommand::Migrate => {
+            let profile = resolved_profile(profile_override)?;
+            build_provider(profile).ping().await?;
+            let name = crate::config::migrate_credential(profile_override)?;
+            if output.is_json() {
+                print_json(&json!({
+                    "profile": name,
+                    "migrated": true,
+                    "credential_store": "os-keychain"
+                }))?;
+            } else {
+                print_message(&format!(
+                    "Migrated profile `{name}` to the operating-system keychain"
+                ));
             }
         }
     }
@@ -811,6 +889,42 @@ async fn handle_doctor(
     let (auth_status, auth_details) = doctor_auth_check(&profile);
     push_doctor_check(&mut report, "auth", auth_status, auth_details);
 
+    let expiration = crate::config::expiration_status(profile.expires_at.as_deref());
+    let expiration_check = match expiration {
+        "valid" => (
+            DoctorCheckStatus::Pass,
+            format!(
+                "token expires {}",
+                profile.expires_at.as_deref().unwrap_or_default()
+            ),
+        ),
+        "expiring-soon" => (
+            DoctorCheckStatus::Warn,
+            format!(
+                "token expires soon ({})",
+                profile.expires_at.as_deref().unwrap_or_default()
+            ),
+        ),
+        "expired" => (
+            DoctorCheckStatus::Fail,
+            format!(
+                "token expired {}; run `confluence auth login`",
+                profile.expires_at.as_deref().unwrap_or_default()
+            ),
+        ),
+        _ => (
+            DoctorCheckStatus::Warn,
+            "token expiry is not recorded; renew with `confluence auth login` to enable reminders"
+                .to_string(),
+        ),
+    };
+    push_doctor_check(
+        &mut report,
+        "token_expiration",
+        expiration_check.0,
+        expiration_check.1,
+    );
+
     if args.skip_network {
         push_doctor_check(
             &mut report,
@@ -917,6 +1031,9 @@ fn handle_profile(command: ProfileCommand, output: OutputFormat) -> Result<()> {
                             "provider": profile.provider.to_string(),
                             "base_url": profile.base_url,
                             "api_path": profile.api_path,
+                            "credential_store": profile.credential_store.as_deref().unwrap_or("legacy-config"),
+                            "token_kind": profile.token_kind.as_deref().unwrap_or("classic"),
+                            "expires_at": profile.expires_at,
                             "read_only": profile.read_only,
                             "active": config.active_profile.as_deref() == Some(name.as_str()),
                         })
@@ -941,6 +1058,18 @@ fn handle_profile(command: ProfileCommand, output: OutputFormat) -> Result<()> {
                             profile.provider.to_string(),
                             profile.base_url.clone(),
                             profile.api_path.clone(),
+                            profile
+                                .credential_store
+                                .clone()
+                                .unwrap_or_else(|| "legacy-config".to_string()),
+                            profile
+                                .token_kind
+                                .clone()
+                                .unwrap_or_else(|| "classic".to_string()),
+                            profile
+                                .expires_at
+                                .clone()
+                                .unwrap_or_else(|| "-".to_string()),
                             profile.read_only.to_string(),
                             (config.active_profile.as_deref() == Some(name.as_str())).to_string(),
                         ]
@@ -952,6 +1081,9 @@ fn handle_profile(command: ProfileCommand, output: OutputFormat) -> Result<()> {
                         "provider",
                         "base_url",
                         "api_path",
+                        "credential_store",
+                        "token_kind",
+                        "expires_at",
                         "read_only",
                         "active",
                     ],
@@ -969,6 +1101,7 @@ fn handle_profile(command: ProfileCommand, output: OutputFormat) -> Result<()> {
             let mut config = AppConfig::load()?;
             config.remove_profile(&name)?;
             config.save()?;
+            let _ = crate::credentials::delete(&name);
             print_message(&format!("Removed profile `{name}`"));
         }
     }
@@ -999,6 +1132,10 @@ fn login_input(args: ProfileInputArgs) -> Result<LoginInput> {
         token,
         read_only: Some(args.read_only),
         non_interactive: args.non_interactive,
+        insecure_storage: args.insecure_storage,
+        cloud_id: args.cloud_id,
+        token_kind: args.token_kind,
+        expires_at: args.expires_at,
     })
 }
 

@@ -107,10 +107,21 @@ impl HttpClient {
         Ok(Self { profile, client })
     }
 
+    fn api_base_url(&self) -> String {
+        if self.profile.provider == ProviderKind::Cloud && self.profile.token_kind == "scoped" {
+            format!(
+                "https://api.atlassian.com/ex/confluence/{}",
+                self.profile.cloud_id.as_deref().unwrap_or_default()
+            )
+        } else {
+            self.profile.base_url.trim_end_matches('/').to_string()
+        }
+    }
+
     pub fn v1_url(&self, path: &str) -> String {
         format!(
             "{}{}{}",
-            self.profile.base_url.trim_end_matches('/'),
+            self.api_base_url(),
             self.profile.api_path.trim_end_matches('/'),
             if path.starts_with('/') {
                 path.to_string()
@@ -128,7 +139,7 @@ impl HttpClient {
         };
         format!(
             "{}{}{}",
-            self.profile.base_url.trim_end_matches('/'),
+            self.api_base_url(),
             v2_path.trim_end_matches('/'),
             if path.starts_with('/') {
                 path.to_string()
@@ -758,8 +769,42 @@ mod tests {
             auth: crate::config::AuthConfig::Bearer {
                 token: "test-token".to_string(),
             },
+            credential_store: "session".to_string(),
+            cloud_id: None,
+            token_kind: "classic".to_string(),
+            expires_at: None,
             read_only: false,
         }
+    }
+
+    #[test]
+    fn scoped_cloud_token_uses_gateway_but_keeps_site_url() {
+        let profile = ResolvedProfile {
+            name: "cloud".to_string(),
+            provider: crate::model::ProviderKind::Cloud,
+            base_url: "https://acme.atlassian.net".to_string(),
+            api_path: "/wiki/rest/api".to_string(),
+            auth: crate::config::AuthConfig::Basic {
+                username: "me@example.com".to_string(),
+                token: "token".to_string(),
+            },
+            credential_store: "session".to_string(),
+            cloud_id: Some("cloud-123".to_string()),
+            token_kind: "scoped".to_string(),
+            expires_at: None,
+            read_only: false,
+        };
+        let client = HttpClient::new(profile).unwrap();
+
+        assert_eq!(
+            client.v1_url("/space"),
+            "https://api.atlassian.com/ex/confluence/cloud-123/wiki/rest/api/space"
+        );
+        assert_eq!(
+            client.v2_url("/pages"),
+            "https://api.atlassian.com/ex/confluence/cloud-123/wiki/api/v2/pages"
+        );
+        assert_eq!(client.profile.base_url, "https://acme.atlassian.net");
     }
 
     fn space_result(key: &str, name: &str, id: &str) -> serde_json::Value {

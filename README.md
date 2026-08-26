@@ -43,11 +43,16 @@ Prebuilt macOS and Linux archives are published on the [GitHub releases page](ht
 
 ## Quick Start
 
-For guided setup, run `confluence init` in a terminal. Existing profiles are
-offered as defaults, credentials are entered without terminal echo, access is
-verified before the profile is declared ready, and the wizard ends with useful
-next commands. In automation, use the explicit non-interactive login shown
-below; onboarding never consumes accidental piped input as answers.
+For guided setup, run `confluence auth login` (or `confluence init`) in a
+terminal. The wizard opens Atlassian's token page when useful, discovers the
+Cloud ID required by scoped tokens, hides credential entry, verifies access,
+and stores the token in your operating-system keychain. Existing profiles are
+offered as defaults. If no OS credential service is available, setup offers an
+explicit protected-file fallback rather than silently weakening storage.
+
+For Confluence Data Center, setup can create a dedicated PAT through the
+official API using a one-time password or existing PAT; the bootstrap secret is
+never saved. Onboarding never consumes accidental piped input as answers.
 
 Cloud profile:
 
@@ -88,6 +93,12 @@ export CONFLUENCE_TOKEN="$CONFLUENCE_API_TOKEN"
 
 confluence doctor --space SPACEKEY
 ```
+
+Non-interactive login stores credentials in the OS keychain by default. For a
+headless machine without a credential service, prefer environment-driven mode;
+if persistent storage is necessary, explicitly accept the protected config-file
+fallback with `--insecure-storage`. Existing inline-token profiles remain
+readable and can be moved transactionally with `confluence auth migrate`.
 
 ## Markdown Sync Workflow
 
@@ -139,7 +150,7 @@ It checks:
 
 Top-level command groups:
 
-- `auth login|status|logout`
+- `auth login|status|logout|migrate`
 - `profile add|list|use|remove`
 - `space list|get`
 - `search`

@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod credentials;
 mod markdown;
 mod model;
 mod output;

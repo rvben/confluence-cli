@@ -16,8 +16,15 @@ use crate::output::{OutputFormat, print_json, use_color};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum AuthConfig {
-    Basic { username: String, token: String },
-    Bearer { token: String },
+    Basic {
+        username: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        token: String,
+    },
+    Bearer {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        token: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +33,14 @@ pub struct ProfileConfig {
     pub base_url: String,
     pub api_path: String,
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub credential_store: Option<String>,
+    #[serde(default)]
+    pub cloud_id: Option<String>,
+    #[serde(default)]
+    pub token_kind: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
     #[serde(default)]
     pub read_only: bool,
 }
@@ -44,6 +59,10 @@ pub struct ResolvedProfile {
     pub base_url: String,
     pub api_path: String,
     pub auth: AuthConfig,
+    pub credential_store: String,
+    pub cloud_id: Option<String>,
+    pub token_kind: String,
+    pub expires_at: Option<String>,
     pub read_only: bool,
 }
 
@@ -58,6 +77,10 @@ pub struct LoginInput {
     pub token: Option<String>,
     pub read_only: Option<bool>,
     pub non_interactive: bool,
+    pub insecure_storage: bool,
+    pub cloud_id: Option<String>,
+    pub token_kind: Option<String>,
+    pub expires_at: Option<String>,
 }
 
 impl AppConfig {
@@ -124,19 +147,50 @@ impl AppConfig {
 
         let env_override = EnvOverride::from_env()?;
 
-        match (stored, env_override) {
+        let resolved = match (stored, env_override) {
             (Some((name, stored)), Some(override_cfg)) => {
-                Ok(override_cfg.merge_with(name, Some(stored)))
+                let uses_env_token = override_cfg.token.is_some();
+                let credential_store = if uses_env_token {
+                    "environment".to_string()
+                } else {
+                    credential_source(&stored)
+                };
+                let stored = if uses_env_token {
+                    stored
+                } else {
+                    hydrate_stored_credential(&name, stored)?
+                };
+                let mut resolved = override_cfg.merge_with(name, Some(stored));
+                resolved.credential_store = credential_store;
+                resolved
             }
-            (Some((name, stored)), None) => Ok(ResolvedProfile::from_stored(name, stored)),
+            (Some((name, stored)), None) => ResolvedProfile::from_stored(name, stored)?,
             (None, Some(override_cfg)) => {
-                Ok(override_cfg
-                    .merge_with(selected_name.unwrap_or_else(|| "env".to_string()), None))
+                let mut resolved = override_cfg
+                    .merge_with(selected_name.unwrap_or_else(|| "env".to_string()), None);
+                resolved.credential_store = "environment".to_string();
+                resolved
             }
             (None, None) => bail!(
                 "no active profile configured. Run `confluence auth login` or set CONFLUENCE_* environment variables"
             ),
+        };
+        if !matches!(resolved.token_kind.as_str(), "classic" | "scoped") {
+            bail!(
+                "unsupported token kind `{}`; expected classic or scoped",
+                resolved.token_kind
+            );
         }
+        if resolved.token_kind == "scoped"
+            && resolved.cloud_id.as_deref().unwrap_or_default().is_empty()
+        {
+            bail!("scoped Cloud token requires a Cloud ID; run `confluence auth login`");
+        }
+        if let Some(value) = resolved.expires_at.as_deref() {
+            chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .with_context(|| format!("invalid expires_at `{value}`; expected YYYY-MM-DD"))?;
+        }
+        Ok(resolved)
     }
 
     pub fn upsert_profile(&mut self, name: String, profile: ProfileConfig) {
@@ -164,15 +218,21 @@ impl AppConfig {
 }
 
 impl ResolvedProfile {
-    fn from_stored(name: String, profile: ProfileConfig) -> Self {
-        Self {
+    fn from_stored(name: String, profile: ProfileConfig) -> Result<Self> {
+        let credential_store = credential_source(&profile);
+        let profile = hydrate_stored_credential(&name, profile)?;
+        Ok(Self {
             name,
             provider: profile.provider,
             base_url: profile.base_url,
             api_path: profile.api_path,
             auth: profile.auth,
+            credential_store,
+            cloud_id: profile.cloud_id,
+            token_kind: profile.token_kind.unwrap_or_else(|| "classic".to_string()),
+            expires_at: profile.expires_at,
             read_only: profile.read_only,
-        }
+        })
     }
 
     pub fn redact(&self) -> Self {
@@ -191,6 +251,10 @@ impl ResolvedProfile {
             base_url: self.base_url.clone(),
             api_path: self.api_path.clone(),
             auth,
+            credential_store: self.credential_store.clone(),
+            cloud_id: self.cloud_id.clone(),
+            token_kind: self.token_kind.clone(),
+            expires_at: self.expires_at.clone(),
             read_only: self.read_only,
         }
     }
@@ -204,6 +268,60 @@ impl ResolvedProfile {
         } else {
             String::new()
         }
+    }
+}
+
+fn auth_token(auth: &AuthConfig) -> &str {
+    match auth {
+        AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => token,
+    }
+}
+
+fn set_auth_token(auth: &mut AuthConfig, value: String) {
+    match auth {
+        AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => *token = value,
+    }
+}
+
+fn credential_source(profile: &ProfileConfig) -> String {
+    match profile.credential_store.as_deref() {
+        Some("keyring") => "os-keychain",
+        Some("file") => "config-file",
+        Some(other) => other,
+        None if !auth_token(&profile.auth).is_empty() => "legacy-config",
+        None => "none",
+    }
+    .to_string()
+}
+
+fn hydrate_stored_credential(name: &str, mut profile: ProfileConfig) -> Result<ProfileConfig> {
+    match profile.credential_store.as_deref() {
+        Some("keyring") => set_auth_token(&mut profile.auth, crate::credentials::load(name)?),
+        Some("file") | None => {}
+        Some(other) => bail!("unsupported credential_store `{other}` for profile `{name}`"),
+    }
+    if auth_token(&profile.auth).is_empty() {
+        bail!("credential not found for profile `{name}`; run `confluence auth login`");
+    }
+    Ok(profile)
+}
+
+pub fn expiration_status(expires_at: Option<&str>) -> &'static str {
+    let Some(expires_at) = expires_at else {
+        return "unknown";
+    };
+    let Ok(date) = chrono::NaiveDate::parse_from_str(expires_at, "%Y-%m-%d") else {
+        return "invalid";
+    };
+    let days = date
+        .signed_duration_since(chrono::Utc::now().date_naive())
+        .num_days();
+    if days < 0 {
+        "expired"
+    } else if days <= 30 {
+        "expiring-soon"
+    } else {
+        "valid"
     }
 }
 
@@ -258,6 +376,10 @@ pub fn run_login(input: LoginInput) -> Result<ResolvedProfile> {
     let mut username = input.username;
     let mut token = input.token.or_else(token_from_env);
     let mut read_only = input.read_only;
+    let insecure_storage = input.insecure_storage;
+    let cloud_id = input.cloud_id;
+    let token_kind = input.token_kind.unwrap_or_else(|| "classic".to_string());
+    let expires_at = input.expires_at;
 
     if !input.non_interactive {
         if profile_name.is_empty() {
@@ -305,19 +427,90 @@ pub fn run_login(input: LoginInput) -> Result<ResolvedProfile> {
     let token = token.ok_or_else(|| anyhow!("token is required"))?;
     let read_only = read_only.unwrap_or(false);
 
+    if !matches!(token_kind.as_str(), "classic" | "scoped") {
+        bail!("unsupported token kind `{token_kind}`; expected classic or scoped");
+    }
+    if token_kind == "scoped" && cloud_id.as_deref().unwrap_or_default().is_empty() {
+        bail!("scoped Cloud token requires a Cloud ID; run `confluence auth login`");
+    }
+
     let auth = build_auth(&auth_type, username, token)?;
+    let file_storage = if insecure_storage {
+        true
+    } else {
+        match crate::credentials::available() {
+            Ok(()) => false,
+            Err(error) if input.non_interactive => {
+                bail!("{error}; pass --insecure-storage to use the protected config file")
+            }
+            Err(error) => {
+                eprintln!("  {} {error}", sym_fail());
+                if prompt_bool("Use the protected config-file fallback instead?", false)? {
+                    true
+                } else {
+                    bail!(
+                        "credential storage cancelled; start an OS credential service or use CONFLUENCE_API_TOKEN for this session"
+                    )
+                }
+            }
+        }
+    };
+    let stored_auth = match &auth {
+        AuthConfig::Basic { username, token } => AuthConfig::Basic {
+            username: username.clone(),
+            token: if file_storage {
+                token.clone()
+            } else {
+                String::new()
+            },
+        },
+        AuthConfig::Bearer { token } => AuthConfig::Bearer {
+            token: if file_storage {
+                token.clone()
+            } else {
+                String::new()
+            },
+        },
+    };
     let stored = ProfileConfig {
         provider,
         base_url: domain,
         api_path,
-        auth,
+        auth: stored_auth,
+        credential_store: Some(if file_storage { "file" } else { "keyring" }.to_string()),
+        cloud_id,
+        token_kind: Some(token_kind),
+        expires_at,
         read_only,
     };
 
+    let previous_keyring = if file_storage {
+        None
+    } else {
+        crate::credentials::load_optional(&profile_name)?
+    };
+    if !file_storage {
+        crate::credentials::store(&profile_name, auth_token(&auth))?;
+    }
     config.upsert_profile(profile_name.clone(), stored.clone());
-    config.save()?;
+    if let Err(error) = config.save() {
+        if !file_storage {
+            match previous_keyring {
+                Some(previous) => {
+                    let _ = crate::credentials::store(&profile_name, &previous);
+                }
+                None => {
+                    let _ = crate::credentials::delete(&profile_name);
+                }
+            }
+        }
+        return Err(error);
+    }
+    if file_storage {
+        let _ = crate::credentials::delete(&profile_name);
+    }
 
-    Ok(ResolvedProfile::from_stored(profile_name, stored))
+    config.resolved_profile(Some(&profile_name))
 }
 
 fn token_from_env() -> Option<String> {
@@ -352,10 +545,58 @@ pub fn logout(profile_override: Option<&str>) -> Result<String> {
     let Some(profile) = config.profiles.get_mut(&profile_name) else {
         bail!("profile `{profile_name}` not found");
     };
-    profile.auth = AuthConfig::Bearer {
-        token: String::new(),
+    let was_keyring = profile.credential_store.as_deref() == Some("keyring");
+    let previous_keyring = if was_keyring {
+        crate::credentials::load_optional(&profile_name)?
+    } else {
+        None
     };
-    config.save()?;
+    if was_keyring {
+        crate::credentials::delete(&profile_name)?;
+    }
+    set_auth_token(&mut profile.auth, String::new());
+    profile.credential_store = None;
+    if let Err(error) = config.save() {
+        if let Some(previous) = previous_keyring {
+            let _ = crate::credentials::store(&profile_name, &previous);
+        }
+        return Err(error);
+    }
+    Ok(profile_name)
+}
+
+pub fn migrate_credential(profile_override: Option<&str>) -> Result<String> {
+    let mut config = AppConfig::load()?;
+    let profile_name = profile_override
+        .map(ToOwned::to_owned)
+        .or_else(|| config.active_profile.clone())
+        .ok_or_else(|| anyhow!("no active profile configured"))?;
+    let Some(profile) = config.profiles.get_mut(&profile_name) else {
+        bail!("profile `{profile_name}` not found");
+    };
+    if profile.credential_store.as_deref() == Some("keyring") {
+        bail!("profile `{profile_name}` already uses the operating-system keychain");
+    }
+    let token = auth_token(&profile.auth).to_string();
+    if token.is_empty() {
+        bail!("profile `{profile_name}` does not contain an inline token to migrate");
+    }
+    crate::credentials::available()?;
+    let previous = crate::credentials::load_optional(&profile_name)?;
+    crate::credentials::store(&profile_name, &token)?;
+    set_auth_token(&mut profile.auth, String::new());
+    profile.credential_store = Some("keyring".to_string());
+    if let Err(error) = config.save() {
+        match previous {
+            Some(previous) => {
+                let _ = crate::credentials::store(&profile_name, &previous);
+            }
+            None => {
+                let _ = crate::credentials::delete(&profile_name);
+            }
+        }
+        return Err(error);
+    }
     Ok(profile_name)
 }
 
@@ -375,6 +616,8 @@ struct EnvOverride {
     auth_type: Option<String>,
     username: Option<String>,
     token: Option<String>,
+    cloud_id: Option<String>,
+    token_kind: Option<String>,
     read_only: Option<bool>,
 }
 
@@ -391,6 +634,8 @@ impl EnvOverride {
             .or_else(|| env::var("CONFLUENCE_PASSWORD").ok())
             .or_else(|| env::var("CONFLUENCE_TOKEN").ok())
             .or_else(|| env::var("CONFLUENCE_BEARER_TOKEN").ok());
+        let cloud_id = env::var("CONFLUENCE_CLOUD_ID").ok();
+        let token_kind = env::var("CONFLUENCE_TOKEN_KIND").ok();
         let provider = env::var("CONFLUENCE_PROVIDER")
             .ok()
             .map(|v| match v.to_ascii_lowercase().as_str() {
@@ -410,6 +655,8 @@ impl EnvOverride {
             && auth_type.is_none()
             && email.is_none()
             && token.is_none()
+            && cloud_id.is_none()
+            && token_kind.is_none()
             && provider.is_none()
             && read_only.is_none()
         {
@@ -423,6 +670,8 @@ impl EnvOverride {
             auth_type,
             username: email,
             token,
+            cloud_id,
+            token_kind,
             read_only,
         }))
     }
@@ -495,12 +744,31 @@ impl EnvOverride {
             .or_else(|| stored.as_ref().map(|p| p.read_only))
             .unwrap_or(false);
 
+        let cloud_id = self
+            .cloud_id
+            .or_else(|| stored.as_ref().and_then(|profile| profile.cloud_id.clone()));
+        let token_kind = self
+            .token_kind
+            .or_else(|| {
+                stored
+                    .as_ref()
+                    .and_then(|profile| profile.token_kind.clone())
+            })
+            .unwrap_or_else(|| "classic".to_string());
+        let expires_at = stored
+            .as_ref()
+            .and_then(|profile| profile.expires_at.clone());
+
         ResolvedProfile {
             name,
             provider,
             base_url,
             api_path,
             auth,
+            credential_store: "none".to_string(),
+            cloud_id,
+            token_kind,
+            expires_at,
             read_only,
         }
     }
@@ -537,6 +805,8 @@ fn init_json() -> Result<()> {
             "CONFLUENCE_EMAIL": "Username or email (basic auth)",
             "CONFLUENCE_API_TOKEN": "API token or personal access token",
             "CONFLUENCE_AUTH_TYPE": "basic or bearer",
+            "CONFLUENCE_CLOUD_ID": "Atlassian Cloud ID required by a scoped token",
+            "CONFLUENCE_TOKEN_KIND": "scoped or classic",
             "CONFLUENCE_READ_ONLY": "1 to prevent write operations"
         },
         "example": {
@@ -545,14 +815,21 @@ fn init_json() -> Result<()> {
                     "provider": "cloud",
                     "base_url": "https://mycompany.atlassian.net",
                     "api_path": "/wiki/rest/api",
-                    "auth": { "type": "basic", "username": "me@example.com", "token": "ATATT3x..." },
+                    "auth": { "type": "basic", "username": "me@example.com" },
+                    "credential_store": "keyring",
+                    "cloud_id": "your-atlassian-cloud-id",
+                    "token_kind": "scoped",
+                    "expires_at": "2026-11-24",
                     "read_only": false
                 },
                 "datacenter": {
                     "provider": "data_center",
                     "base_url": "https://confluence.mycompany.com",
                     "api_path": "/rest/api",
-                    "auth": { "type": "bearer", "token": "your-personal-access-token" },
+                    "auth": { "type": "bearer" },
+                    "credential_store": "keyring",
+                    "token_kind": "classic",
+                    "expires_at": "2026-11-24",
                     "read_only": false
                 }
             }
@@ -647,147 +924,209 @@ async fn init_interactive() -> Result<()> {
     eprintln!();
 
     // Auth
-    let existing_token = existing.as_ref().map(|p| match &p.auth {
-        AuthConfig::Basic { token, .. } | AuthConfig::Bearer { token } => token.clone(),
-    });
-    let has_token = existing_token
-        .as_ref()
-        .map(|t| !t.is_empty())
-        .unwrap_or(false);
+    let existing_token = match (
+        existing
+            .as_ref()
+            .and_then(|profile| profile.credential_store.as_deref()),
+        target_name.as_deref(),
+    ) {
+        (Some("keyring"), Some(name)) => crate::credentials::load_optional(name)?,
+        _ => existing
+            .as_ref()
+            .map(|profile| auth_token(&profile.auth).to_string())
+            .filter(|token| !token.is_empty()),
+    };
+    let has_token = existing_token.is_some();
 
-    let (auth_type, username, token) = match provider {
+    let (auth_type, username, token, cloud_id, token_kind, expires_at) = match provider {
         ProviderKind::Cloud => {
-            let token_url = "https://id.atlassian.com/manage-profile/security/api-tokens";
-            eprintln!("  {}", sym_dim(token_url));
-            eprintln!();
+            const TOKEN_URL: &str = "https://id.atlassian.com/manage-profile/security/api-tokens";
             let default_email = existing
                 .as_ref()
-                .and_then(|p| match &p.auth {
+                .and_then(|profile| match &profile.auth {
                     AuthConfig::Basic { username, .. } => Some(username.as_str()),
-                    _ => None,
+                    AuthConfig::Bearer { .. } => None,
                 })
                 .unwrap_or("");
-            let email = prompt(
-                "Email",
-                "",
-                if default_email.is_empty() {
-                    None
-                } else {
-                    Some(default_email)
-                },
-            )?;
-            let email = if email.is_empty() {
-                default_email.to_owned()
+            let email = prompt("Email", "", Some(default_email))?;
+            if email.is_empty() {
+                bail!("email is required for Confluence Cloud");
+            }
+            let default_kind = existing
+                .as_ref()
+                .and_then(|profile| profile.token_kind.as_deref())
+                .unwrap_or("scoped");
+            let kind = prompt("Token type", "[scoped/classic]", Some(default_kind))?;
+            let token_kind = if kind.eq_ignore_ascii_case("classic") {
+                "classic".to_string()
             } else {
-                email
+                "scoped".to_string()
             };
-            let token_hint = if has_token {
-                "Enter to keep existing"
+            let cloud_id = if token_kind == "scoped" {
+                eprint!("  Discovering Cloud ID...");
+                std::io::stderr().flush().ok();
+                let id = discover_cloud_id(&base_url).await?;
+                eprintln!(" {}", sym_ok());
+                Some(id)
             } else {
-                ""
+                None
             };
-            let raw_token = prompt_secret(
+            if !has_token
+                && prompt_bool("Open Atlassian's token page now?", true)?
+                && let Err(error) = open::that(TOKEN_URL)
+            {
+                eprintln!("  {} Could not open browser: {error}", sym_fail());
+            }
+            eprintln!("  {}", sym_dim(&format!("→ {TOKEN_URL}")));
+            if token_kind == "scoped" {
+                eprintln!(
+                    "  {}",
+                    sym_dim("Choose Confluence scopes and the least privilege this profile needs.")
+                );
+            }
+            let raw = prompt_secret(
                 "Token",
-                if token_hint.is_empty() {
-                    ""
+                if has_token {
+                    "Enter to keep existing"
                 } else {
-                    token_hint
+                    ""
                 },
             )?;
-            let token = if raw_token.is_empty() && has_token {
-                existing_token.unwrap()
+            let kept_existing = raw.is_empty();
+            let token = if kept_existing {
+                existing_token
+                    .clone()
+                    .ok_or_else(|| anyhow!("token is required"))?
             } else {
-                raw_token
+                raw
             };
-            ("basic", Some(email), token)
+            let expires_at = if kept_existing {
+                existing
+                    .as_ref()
+                    .and_then(|profile| profile.expires_at.clone())
+            } else {
+                Some(prompt_expiration_date(90)?)
+            };
+            (
+                "basic",
+                Some(email),
+                token,
+                cloud_id,
+                token_kind,
+                expires_at,
+            )
         }
         ProviderKind::DataCenter => {
-            let dc_host = base_url
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .split('/')
-                .next()
-                .unwrap_or(&base_url);
-            eprintln!(
-                "  {}",
-                sym_dim(&format!(
-                    "Tokens: https://{dc_host}/plugins/servlet/manage-api-tokens"
-                ))
+            let pat_url = format!(
+                "{}/plugins/servlet/manage-api-tokens",
+                base_url.trim_end_matches('/')
             );
-            eprintln!();
-
-            let default_auth_idx = existing
-                .as_ref()
-                .map(|p| match &p.auth {
-                    AuthConfig::Basic { .. } => 0usize,
-                    AuthConfig::Bearer { .. } => 1usize,
-                })
-                .unwrap_or(1);
-            let auth_idx = prompt_select("Auth", &["basic", "bearer"], default_auth_idx)?;
-            eprintln!();
-
-            if auth_idx == 0 {
-                let default_user = existing
-                    .as_ref()
-                    .and_then(|p| match &p.auth {
-                        AuthConfig::Basic { username, .. } => Some(username.as_str()),
-                        _ => None,
-                    })
-                    .unwrap_or("");
-                let username = prompt(
-                    "Username",
-                    "",
-                    if default_user.is_empty() {
-                        None
-                    } else {
-                        Some(default_user)
-                    },
+            let (auth_type, username, token, expires_at) = if has_token {
+                eprintln!("  {}", sym_dim(&format!("→ {pat_url}")));
+                let existing_basic = matches!(
+                    existing.as_ref().map(|profile| &profile.auth),
+                    Some(AuthConfig::Basic { .. })
+                );
+                let auth_idx = prompt_select(
+                    "Auth",
+                    &["personal access token", "basic"],
+                    usize::from(existing_basic),
                 )?;
-                let username = if username.is_empty() {
-                    default_user.to_owned()
+                let username = if auth_idx == 1 {
+                    let default = existing
+                        .as_ref()
+                        .and_then(|profile| match &profile.auth {
+                            AuthConfig::Basic { username, .. } => Some(username.as_str()),
+                            AuthConfig::Bearer { .. } => None,
+                        })
+                        .unwrap_or("");
+                    Some(prompt("Username", "", Some(default))?)
                 } else {
-                    username
+                    None
                 };
-                let token_hint = if has_token {
-                    "Enter to keep existing"
-                } else {
-                    ""
-                };
-                let raw = prompt_secret(
-                    "Token",
-                    if token_hint.is_empty() {
-                        ""
-                    } else {
-                        token_hint
-                    },
-                )?;
-                let token = if raw.is_empty() && has_token {
-                    existing_token.unwrap()
+                let raw = prompt_secret("Token", "Enter to keep existing")?;
+                let kept_existing = raw.is_empty();
+                let token = if kept_existing {
+                    existing_token.clone().expect("checked above")
                 } else {
                     raw
                 };
-                ("basic", Some(username), token)
+                let expires_at = if kept_existing {
+                    existing
+                        .as_ref()
+                        .and_then(|profile| profile.expires_at.clone())
+                } else {
+                    Some(prompt_expiration_date(90)?)
+                };
+                (
+                    if auth_idx == 1 { "basic" } else { "bearer" },
+                    username,
+                    token,
+                    expires_at,
+                )
+            } else if prompt_bool("Create a dedicated PAT automatically?", true)? {
+                let method = prompt("Bootstrap with", "[password/pat]", Some("password"))?;
+                let use_pat = method.eq_ignore_ascii_case("pat");
+                let username = if use_pat {
+                    None
+                } else {
+                    Some(prompt_required("Bootstrap username", "")?)
+                };
+                let secret = prompt_secret(
+                    if use_pat {
+                        "Existing personal access token"
+                    } else {
+                        "Bootstrap password"
+                    },
+                    "used once and never saved",
+                )?;
+                let days = prompt_expiration_days(90)?;
+                eprint!("  Creating personal access token...");
+                std::io::stderr().flush().ok();
+                match create_data_center_pat(
+                    &base_url,
+                    username.as_deref(),
+                    &secret,
+                    target_name.as_deref().unwrap_or("confluence-cli"),
+                    days,
+                )
+                .await
+                {
+                    Ok(token) => {
+                        eprintln!(" {}", sym_ok());
+                        ("bearer", None, token, Some(expiration_date(days)))
+                    }
+                    Err(error) => {
+                        eprintln!(" {} {error}", sym_fail());
+                        eprintln!("  Falling back to browser-assisted PAT creation.");
+                        let _ = open::that(&pat_url);
+                        eprintln!("  {}", sym_dim(&format!("→ {pat_url}")));
+                        (
+                            "bearer",
+                            None,
+                            prompt_secret_required("Personal access token", "")?,
+                            Some(prompt_expiration_date(90)?),
+                        )
+                    }
+                }
             } else {
-                let token_hint = if has_token {
-                    "Enter to keep existing"
-                } else {
-                    ""
-                };
-                let raw = prompt_secret(
-                    "Personal Access Token",
-                    if token_hint.is_empty() {
-                        ""
-                    } else {
-                        token_hint
-                    },
-                )?;
-                let token = if raw.is_empty() && has_token {
-                    existing_token.unwrap()
-                } else {
-                    raw
-                };
-                ("bearer", None, token)
-            }
+                let _ = open::that(&pat_url);
+                eprintln!("  {}", sym_dim(&format!("→ {pat_url}")));
+                (
+                    "bearer",
+                    None,
+                    prompt_secret_required("Personal access token", "")?,
+                    Some(prompt_expiration_date(90)?),
+                )
+            };
+            (
+                auth_type,
+                username,
+                token,
+                None,
+                "classic".to_string(),
+                expires_at,
+            )
         }
     };
 
@@ -811,6 +1150,10 @@ async fn init_interactive() -> Result<()> {
         base_url: base_url.clone(),
         api_path: api_path.clone(),
         auth: auth.clone(),
+        credential_store: "session".to_string(),
+        cloud_id: cloud_id.clone(),
+        token_kind: token_kind.clone(),
+        expires_at: expires_at.clone(),
         read_only: false,
     };
     let test_provider = crate::provider::build_provider(test_profile);
@@ -854,22 +1197,58 @@ async fn init_interactive() -> Result<()> {
     };
 
     // Save
+    let file_storage = choose_credential_storage()?;
+    let mut stored_auth = auth;
+    if !file_storage {
+        set_auth_token(&mut stored_auth, String::new());
+    }
     let stored = ProfileConfig {
         provider,
         base_url,
         api_path,
-        auth,
+        auth: stored_auth,
+        credential_store: Some(if file_storage { "file" } else { "keyring" }.to_string()),
+        cloud_id,
+        token_kind: Some(token_kind),
+        expires_at,
         read_only,
     };
+    let previous_keyring = if file_storage {
+        None
+    } else {
+        crate::credentials::load_optional(&profile_name)?
+    };
+    if !file_storage {
+        crate::credentials::store(&profile_name, &token)?;
+    }
     config.upsert_profile(profile_name.clone(), stored);
-    config.save()?;
+    if let Err(error) = config.save() {
+        if !file_storage {
+            match previous_keyring {
+                Some(previous) => {
+                    let _ = crate::credentials::store(&profile_name, &previous);
+                }
+                None => {
+                    let _ = crate::credentials::delete(&profile_name);
+                }
+            }
+        }
+        return Err(error);
+    }
+    if file_storage {
+        let _ = crate::credentials::delete(&profile_name);
+    }
 
     eprintln!();
     eprintln!("  {} Saved profile `{profile_name}`", sym_ok());
     eprintln!("  {}", sym_dim(&format!("Config: {}", path.display())));
     eprintln!(
         "  {}",
-        sym_dim("Credential storage: protected config file; treat it as a secret")
+        sym_dim(if file_storage {
+            "Credential storage: protected config file; treat it as a secret"
+        } else {
+            "Credential storage: operating-system keychain"
+        })
     );
     eprintln!();
     eprintln!("{sep}");
@@ -888,6 +1267,103 @@ async fn init_interactive() -> Result<()> {
     );
     eprintln!("{sep}");
     Ok(())
+}
+
+fn prompt_expiration_days(default: u64) -> Result<u64> {
+    loop {
+        let value = prompt(
+            "Token expiry in days",
+            "[1-365]",
+            Some(&default.to_string()),
+        )?;
+        match value.parse::<u64>() {
+            Ok(days @ 1..=365) => return Ok(days),
+            _ => eprintln!("  {} Expiry must be between 1 and 365 days.", sym_fail()),
+        }
+    }
+}
+
+fn expiration_date(days: u64) -> String {
+    (chrono::Utc::now() + chrono::Duration::days(days as i64))
+        .date_naive()
+        .to_string()
+}
+
+fn prompt_expiration_date(default: u64) -> Result<String> {
+    Ok(expiration_date(prompt_expiration_days(default)?))
+}
+
+fn choose_credential_storage() -> Result<bool> {
+    match crate::credentials::available() {
+        Ok(()) => Ok(false),
+        Err(error) => {
+            eprintln!("  {} {error}", sym_fail());
+            if prompt_bool("Use the protected config-file fallback instead?", false)? {
+                Ok(true)
+            } else {
+                bail!(
+                    "credential storage cancelled; start an OS credential service or use CONFLUENCE_API_TOKEN for this session"
+                )
+            }
+        }
+    }
+}
+
+async fn discover_cloud_id(base_url: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TenantInfo {
+        cloud_id: String,
+    }
+
+    let info = reqwest::Client::new()
+        .get(format!(
+            "{}/_edge/tenant_info",
+            base_url.trim_end_matches('/')
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<TenantInfo>()
+        .await?;
+    if info.cloud_id.trim().is_empty() {
+        bail!("Atlassian returned an empty Cloud ID");
+    }
+    Ok(info.cloud_id)
+}
+
+async fn create_data_center_pat(
+    base_url: &str,
+    username: Option<&str>,
+    bootstrap_secret: &str,
+    profile_name: &str,
+    expiration_days: u64,
+) -> Result<String> {
+    let request = reqwest::Client::new()
+        .post(format!(
+            "{}/rest/pat/latest/tokens",
+            base_url.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({
+            "name": format!("confluence-cli / {profile_name}"),
+            "expirationDuration": expiration_days,
+        }));
+    let request = match username {
+        Some(username) => request.basic_auth(username, Some(bootstrap_secret)),
+        None => request.bearer_auth(bootstrap_secret),
+    };
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("PAT creation failed with HTTP {status}");
+    }
+    let body: serde_json::Value = response.json().await?;
+    ["rawToken", "token"]
+        .into_iter()
+        .find_map(|field| body.get(field).and_then(serde_json::Value::as_str))
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("PAT creation response did not contain the one-time token"))
 }
 
 // ── Interactive prompt helpers ────────────────────────────────────────────────
@@ -1193,6 +1669,10 @@ mod tests {
                     username: "alice".to_string(),
                     token: "secret".to_string(),
                 },
+                credential_store: None,
+                cloud_id: None,
+                token_kind: None,
+                expires_at: None,
                 read_only: false,
             },
         );
@@ -1226,6 +1706,10 @@ mod tests {
                 auth: AuthConfig::Bearer {
                     token: "tok".to_string(),
                 },
+                credential_store: None,
+                cloud_id: None,
+                token_kind: None,
+                expires_at: None,
                 read_only: false,
             },
         );
@@ -1244,6 +1728,10 @@ mod tests {
                 auth: AuthConfig::Bearer {
                     token: "t".to_string(),
                 },
+                credential_store: None,
+                cloud_id: None,
+                token_kind: None,
+                expires_at: None,
                 read_only: false,
             },
         );
@@ -1404,6 +1892,10 @@ mod tests {
                 auth: AuthConfig::Bearer {
                     token: "stored-token".to_string(),
                 },
+                credential_store: None,
+                cloud_id: None,
+                token_kind: None,
+                expires_at: None,
                 read_only: false,
             },
         );

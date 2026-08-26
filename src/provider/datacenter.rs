@@ -746,6 +746,10 @@ mod tests {
             auth: AuthConfig::Bearer {
                 token: "test-token".to_string(),
             },
+            credential_store: "session".to_string(),
+            cloud_id: None,
+            token_kind: "classic".to_string(),
+            expires_at: None,
             read_only: false,
         })
     }
@@ -874,6 +878,10 @@ mod tests {
                 username: "user".to_string(),
                 token: "pass".to_string(),
             },
+            credential_store: "session".to_string(),
+            cloud_id: None,
+            token_kind: "classic".to_string(),
+            expires_at: None,
             read_only: false,
         });
         provider.list_spaces(10).await.unwrap();
