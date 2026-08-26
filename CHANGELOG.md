@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.18](https://github.com/rvben/confluence-cli/compare/v0.1.17...v0.1.18) - 2026-08-26
+
+### Added
+
+- **auth**: unify secure onboarding ([712fa5a](https://github.com/rvben/confluence-cli/commit/712fa5ad001aab3374cc07671511c63ed955f5c4))
+- **onboarding**: protect interactive credentials ([080e865](https://github.com/rvben/confluence-cli/commit/080e86511a1d239b08f1f6990aa7d6a8c803f6f5))
+- **cli**: unify interaction and safety contract ([3acb608](https://github.com/rvben/confluence-cli/commit/3acb608db0526317d64b04023db31da64f3cfdab))
+
+### Fixed
+
+- **auth**: open personal token page ([1bf46f3](https://github.com/rvben/confluence-cli/commit/1bf46f3d3d4ed587f135ff91d4cfe06b619b9664))
+- **ci**: install pinned Rust components ([862f844](https://github.com/rvben/confluence-cli/commit/862f844f4261c49c524c64007ceac2443c873734))
+
 ## [0.1.17](https://github.com/rvben/confluence-cli/compare/v0.1.16...v0.1.17) - 2026-08-22
 
 ### Fixed
