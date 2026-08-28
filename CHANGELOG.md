@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.19](https://github.com/rvben/confluence-cli/compare/v0.1.18...v0.1.19) - 2026-08-28
+
+### Added
+
+- **packaging**: add PyPI distribution ([c99efe4](https://github.com/rvben/confluence-cli/commit/c99efe48d484d4d0ac08519301ebe561a0ec58a8))
+
+### Fixed
+
+- **release**: keep Homebrew tap loadable on ARM ([2690190](https://github.com/rvben/confluence-cli/commit/2690190275cfeac9e866e38b1889b0adc742f598))
+
 ## [0.1.18](https://github.com/rvben/confluence-cli/compare/v0.1.17...v0.1.18) - 2026-08-26
 
 ### Added
