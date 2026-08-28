@@ -26,6 +26,15 @@ Early release, but already live-verified against both Confluence Cloud and Confl
 
 ## Installation
 
+From PyPI with `uv`:
+
+```bash
+uv tool install confluence-cli-rs
+```
+
+The PyPI distribution is named `confluence-cli-rs`; it installs the
+`confluence` executable.
+
 From crates.io:
 
 ```bash
@@ -263,6 +272,7 @@ GitHub Actions is set up to:
 
 - run CI on pushes and pull requests
 - publish tagged releases to crates.io
+- publish native macOS and Linux wheels to PyPI as `confluence-cli-rs`
 - build tagged macOS and Linux release archives
 - attach release archives and checksum files to GitHub releases
 - update `rvben/tap` automatically on tagged releases when `HOMEBREW_TAP_TOKEN` is configured

@@ -4,6 +4,11 @@ Vership is the release control plane for `confluence-cli`. GitHub Actions is the
 execution plane for cross-platform builds, publication, provenance, and
 downstream packaging.
 
+Tagged releases publish the Rust crate as `confluence-cli` on crates.io and
+native wheels as `confluence-cli-rs` on PyPI. The PyPI package installs the
+same `confluence` executable and uses the `pypi` GitHub environment with PyPI
+Trusted Publishing.
+
 ## Create a release
 
 Start from a clean, up-to-date `main` branch and run:
