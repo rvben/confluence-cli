@@ -1128,13 +1128,29 @@ async fn handle_auth(
             let profile = resolved_profile(profile_override)?;
             let provider = build_provider(profile.clone());
             provider.ping().await?;
+            let current_user = provider.current_user().await.ok();
             if output.is_json() {
                 let mut value = serde_json::to_value(profile.redact())?;
                 value["expiration_status"] = json!(crate::config::expiration_status(
                     profile.expires_at.as_deref()
                 ));
+                value["current_user"] = serde_json::to_value(&current_user)?;
                 print_json(&value)?;
             } else {
+                let user = current_user
+                    .as_ref()
+                    .and_then(|user| {
+                        user.display_name
+                            .as_deref()
+                            .or(user.username.as_deref())
+                            .or(user.account_id.as_deref())
+                    })
+                    .unwrap_or("-")
+                    .to_string();
+                let account_id = current_user
+                    .as_ref()
+                    .and_then(|user| user.account_id.clone())
+                    .unwrap_or_else(|| "-".to_string());
                 print_table(
                     &[
                         "profile",
@@ -1147,6 +1163,8 @@ async fn handle_auth(
                         "expiration_status",
                         "read_only",
                         "status",
+                        "user",
+                        "account_id",
                     ],
                     &[vec![
                         profile.name,
@@ -1162,6 +1180,8 @@ async fn handle_auth(
                         crate::config::expiration_status(profile.expires_at.as_deref()).to_string(),
                         profile.read_only.to_string(),
                         "ok".to_string(),
+                        user,
+                        account_id,
                     ]],
                 );
             }

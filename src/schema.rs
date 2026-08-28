@@ -218,6 +218,7 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "expires_at", "type": "string|null"}),
             json!({"name": "expiration_status", "type": "string"}),
             json!({"name": "read_only", "type": "boolean"}),
+            json!({"name": "current_user", "type": "object|null"}),
         ],
 
         "auth logout" => vec![

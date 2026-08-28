@@ -2,14 +2,10 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use directories::ProjectDirs;
-use reqwest::Client;
 use serde_json::Value;
 use tempfile::TempDir;
-use tokio::runtime::Runtime;
 use url::Url;
 use walkdir::WalkDir;
 
@@ -182,114 +178,20 @@ fn e2e_config() -> Option<E2eConfig> {
     })
 }
 
-#[derive(Clone, Debug)]
-enum TestAuth {
-    Basic { username: String, token: String },
-    Bearer { token: String },
-}
-
-#[derive(Clone, Debug)]
-struct TestHttpConfig {
-    base_url: String,
-    api_path: String,
-    auth: TestAuth,
-}
-
-fn http_config(cfg: &E2eConfig) -> TestHttpConfig {
-    if let Some(profile_name) = &cfg.profile {
-        let dirs = ProjectDirs::from("dev", "ruben", "confluence-cli")
-            .expect("config directory available");
-        let config_path = dirs.config_dir().join("config.json");
-        let config_raw = fs::read_to_string(&config_path)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", config_path.display()));
-        let config: Value = serde_json::from_str(&config_raw)
-            .unwrap_or_else(|err| panic!("failed to parse {}: {err}", config_path.display()));
-        let profile = config
-            .get("profiles")
-            .and_then(|profiles| profiles.get(profile_name))
-            .unwrap_or_else(|| {
-                panic!(
-                    "profile `{profile_name}` not found in {}",
-                    config_path.display()
-                )
-            });
-        let auth = match profile
-            .get("auth")
-            .and_then(|auth| auth.get("type"))
-            .and_then(Value::as_str)
-            .expect("auth type")
-        {
-            "basic" => TestAuth::Basic {
-                username: string_field(profile.get("auth").expect("auth"), "username").to_string(),
-                token: string_field(profile.get("auth").expect("auth"), "token").to_string(),
-            },
-            "bearer" => TestAuth::Bearer {
-                token: string_field(profile.get("auth").expect("auth"), "token").to_string(),
-            },
-            other => panic!("unsupported auth type in profile: {other}"),
-        };
-        return TestHttpConfig {
-            base_url: string_field(profile, "base_url").to_string(),
-            api_path: string_field(profile, "api_path").to_string(),
-            auth,
-        };
-    }
-
-    let env_value = |key: &str| {
-        cfg.envs
-            .iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value.clone())
-    };
-    let auth = if let Some(token) = env_value("CONFLUENCE_BEARER_TOKEN") {
-        TestAuth::Bearer { token }
-    } else {
-        TestAuth::Basic {
-            username: env_value("CONFLUENCE_USERNAME").expect("env username"),
-            token: env_value("CONFLUENCE_API_TOKEN").expect("env token"),
-        }
-    };
-    TestHttpConfig {
-        base_url: env_value("CONFLUENCE_DOMAIN").expect("env base url"),
-        api_path: env_value("CONFLUENCE_API_PATH").expect("env api path"),
-        auth,
-    }
-}
-
 fn current_user_placeholder(cfg: &E2eConfig) -> String {
-    let http = http_config(cfg);
-    let url = format!(
-        "{}{}{}",
-        http.base_url.trim_end_matches('/'),
-        http.api_path.trim_end_matches('/'),
-        "/user/current"
-    );
-    let runtime = Runtime::new().expect("tokio runtime");
-    let current_user = runtime.block_on(async move {
-        let client = Client::new();
-        let request = match http.auth {
-            TestAuth::Basic { username, token } => {
-                client.get(&url).basic_auth(username, Some(token))
-            }
-            TestAuth::Bearer { token } => client.get(&url).bearer_auth(token),
-        };
-        let response = request.send().await.expect("current user request");
-        let response = response
-            .error_for_status()
-            .unwrap_or_else(|err| panic!("current user request failed for {url}: {err}"));
-        response
-            .json::<Value>()
-            .await
-            .expect("current user json response")
-    });
+    let status = cfg.run_json(&["auth", "status"]);
+    let current_user = status
+        .get("current_user")
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| panic!("auth status did not return the current user: {status}"));
 
     let mut placeholder = Url::parse("confluence-user://user").expect("valid user placeholder");
     {
         let mut pairs = placeholder.query_pairs_mut();
-        if let Some(account_id) = current_user.get("accountId").and_then(Value::as_str) {
+        if let Some(account_id) = current_user.get("account_id").and_then(Value::as_str) {
             pairs.append_pair("account-id", account_id);
         }
-        if let Some(user_key) = current_user.get("userKey").and_then(Value::as_str) {
+        if let Some(user_key) = current_user.get("user_key").and_then(Value::as_str) {
             pairs.append_pair("userkey", user_key);
         }
         if let Some(username) = current_user.get("username").and_then(Value::as_str) {
@@ -439,22 +341,6 @@ fn find_index_md_by_title(root: &PathBuf, title: &str) -> PathBuf {
         })
 }
 
-fn wait_until<F>(timeout: Duration, interval: Duration, mut check: F) -> bool
-where
-    F: FnMut() -> bool,
-{
-    let start = std::time::Instant::now();
-    loop {
-        if check() {
-            return true;
-        }
-        if start.elapsed() >= timeout {
-            return false;
-        }
-        thread::sleep(interval);
-    }
-}
-
 #[test]
 #[ignore = "requires a real Confluence instance"]
 fn e2e_cli_lifecycle() {
@@ -519,6 +405,19 @@ fn e2e_cli_lifecycle() {
         cfg.space
     );
 
+    // Search indexes are eventually consistent for freshly created Cloud
+    // content. Exercise search against the space's established homepage so the
+    // lifecycle remains deterministic on both Cloud and Data Center.
+    let space_cql = format!("space = \"{}\"", cfg.space.replace('"', "\\\""));
+    let search = cfg.run_json(&["search", &space_cql, "--cql", "--limit", "20"]);
+    assert!(
+        list_items(&search, "search")
+            .iter()
+            .any(|item| item.get("space_key").and_then(Value::as_str) == Some(cfg.space.as_str())),
+        "expected search to find established content in {}: {search}",
+        cfg.space
+    );
+
     let page_body_1_arg = page_body_1.to_string_lossy().into_owned();
     let page_create = cfg.run_json(&[
         "page",
@@ -536,14 +435,6 @@ fn e2e_cli_lifecycle() {
         string_field(first_item(&page_get, "page get"), "id"),
         page_id
     );
-
-    let found_search_hit = wait_until(Duration::from_secs(30), Duration::from_secs(2), || {
-        let search = cfg.run_json(&["search", &page_title, "--limit", "10"]);
-        list_items(&search, "search")
-            .iter()
-            .any(|item| item.get("id").and_then(Value::as_str) == Some(page_id.as_str()))
-    });
-    assert!(found_search_hit, "expected search to find page {page_id}");
 
     let page_body_2_arg = page_body_2.to_string_lossy().into_owned();
     let page_update = cfg.run_json(&[
@@ -1933,6 +1824,7 @@ fn e2e_cli_lifecycle() {
         string_field(first_item(&blog_update, "blog update"), "title"),
         updated_blog_title
     );
+
     cfg.run(&["--yes", "blog", "delete", &blog_id]);
     cleanup.blog_id = None;
 

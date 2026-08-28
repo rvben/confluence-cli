@@ -11,7 +11,7 @@ use tokio::fs;
 use crate::config::ResolvedProfile;
 use crate::model::{
     AttachmentInfo, CommentInfo, ContentItem, ContentKind, ContentProperty, CreateContentRequest,
-    ProviderKind, SpaceSummary, UpdateContentRequest,
+    CurrentUser, ProviderKind, SpaceSummary, UpdateContentRequest,
 };
 use crate::provider::{
     ConfluenceProvider, HttpClient, Results, V1Attachment, V1Comment, V1Content, V1Label,
@@ -196,6 +196,12 @@ impl ConfluenceProvider for DataCenterProvider {
             .json(Method::GET, self.http.v1_url("/space?limit=1"), None)
             .await?;
         Ok(())
+    }
+
+    async fn current_user(&self) -> Result<CurrentUser> {
+        self.http
+            .json(Method::GET, self.http.v1_url("/user/current"), None)
+            .await
     }
 
     async fn resolve_page_ref(&self, reference: &str) -> Result<String> {

@@ -15,7 +15,7 @@ use url::Url;
 use crate::config::{AuthConfig, ResolvedProfile};
 use crate::model::{
     AttachmentInfo, CommentInfo, ContentItem, ContentKind, ContentProperty, CreateContentRequest,
-    ProviderKind, SearchResult, SpaceSummary, UpdateContentRequest,
+    CurrentUser, ProviderKind, SearchResult, SpaceSummary, UpdateContentRequest,
 };
 
 pub mod cloud;
@@ -34,6 +34,7 @@ pub trait ConfluenceProvider: Send + Sync {
     fn web_path_prefix(&self) -> String;
 
     async fn ping(&self) -> Result<()>;
+    async fn current_user(&self) -> Result<CurrentUser>;
     async fn resolve_page_ref(&self, reference: &str) -> Result<String>;
     async fn list_spaces(&self, limit: usize) -> Result<Vec<SpaceSummary>>;
     async fn get_space(&self, key_or_id: &str) -> Result<SpaceSummary>;

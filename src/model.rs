@@ -68,6 +68,18 @@ pub struct SpaceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentUser {
+    #[serde(default, alias = "accountId")]
+    pub account_id: Option<String>,
+    #[serde(default, alias = "userKey")]
+    pub user_key: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default, alias = "displayName")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentItem {
     pub id: String,
     pub kind: ContentKind,
