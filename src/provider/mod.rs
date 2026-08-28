@@ -21,6 +21,9 @@ use crate::model::{
 pub mod cloud;
 pub mod datacenter;
 
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug)]
 pub struct SearchPage {
     pub items: Vec<SearchResult>,
@@ -104,12 +107,22 @@ pub struct HttpClient {
 
 impl HttpClient {
     pub fn new(profile: ResolvedProfile) -> Result<Self> {
+        Self::new_with_timeouts(profile, HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT)
+    }
+
+    fn new_with_timeouts(
+        profile: ResolvedProfile,
+        connect_timeout: Duration,
+        read_timeout: Duration,
+    ) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         let client = reqwest::Client::builder()
             .user_agent(format!("confluence-cli/{}", env!("CARGO_PKG_VERSION")))
             .default_headers(headers)
+            .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout)
             .build()?;
         Ok(Self { profile, client })
     }
@@ -1151,6 +1164,37 @@ mod tests {
         profile.read_only = true;
         let err = ensure_writable(&profile).unwrap_err();
         assert!(err.to_string().contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn http_client_times_out_when_the_server_stalls() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/slow"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "ok": true }))
+                    .set_delay(Duration::from_millis(250)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = HttpClient::new_with_timeouts(
+            test_profile(&server.uri()),
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+        )
+        .unwrap();
+        let error = client
+            .json::<Value>(Method::POST, client.v1_url("/slow"), None)
+            .await
+            .expect_err("slow request should time out");
+
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+        }));
     }
 
     // ── fetch_all_v1 ──────────────────────────────────────────────────────────
