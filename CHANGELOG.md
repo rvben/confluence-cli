@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.24](https://github.com/rvben/confluence-cli/compare/v0.1.23...v0.1.24) - 2026-08-28
+
+### Fixed
+
+- **auth**: support secure credentials in cloud e2e ([7c2798b](https://github.com/rvben/confluence-cli/commit/7c2798b38b713ad3e36a1241a08896c55ccab020))
+
 ## [0.1.23](https://github.com/rvben/confluence-cli/compare/v0.1.22...v0.1.23) - 2026-08-28
 
 ## [0.1.22](https://github.com/rvben/confluence-cli/compare/v0.1.21...v0.1.22) - 2026-08-28
