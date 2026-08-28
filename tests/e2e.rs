@@ -94,19 +94,20 @@ impl Drop for Cleanup {
             (self.page_id.as_deref(), self.attachment_id.as_deref())
         {
             self.cfg
-                .best_effort(&["attachment", "delete", page_id, attachment_id]);
+                .best_effort(&["--yes", "attachment", "delete", page_id, attachment_id]);
         }
         if let Some(comment_id) = self.comment_id.as_deref() {
-            self.cfg.best_effort(&["comment", "delete", comment_id]);
+            self.cfg
+                .best_effort(&["--yes", "comment", "delete", comment_id]);
         }
         if let Some(blog_id) = self.blog_id.as_deref() {
-            self.cfg.best_effort(&["blog", "delete", blog_id]);
+            self.cfg.best_effort(&["--yes", "blog", "delete", blog_id]);
         }
         if let Some(page_id) = self.page_id.as_deref() {
-            self.cfg.best_effort(&["page", "delete", page_id]);
+            self.cfg.best_effort(&["--yes", "page", "delete", page_id]);
         }
         for page_id in self.extra_page_ids.iter().rev() {
-            self.cfg.best_effort(&["page", "delete", page_id]);
+            self.cfg.best_effort(&["--yes", "page", "delete", page_id]);
         }
     }
 }
@@ -335,25 +336,39 @@ fn find_binary_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
-    if let Some(path) = env::var_os("CARGO_BIN_EXE_confluence-cli") {
+    if let Some(path) = env::var_os("CARGO_BIN_EXE_confluence") {
         return PathBuf::from(path);
     }
 
     let current_exe = env::current_exe().expect("current exe path");
     for ancestor in current_exe.ancestors() {
-        let candidate = ancestor.join("confluence-cli");
+        let candidate = ancestor.join("confluence");
         if candidate.is_file() {
             return candidate;
         }
-        let exe_candidate = ancestor.join("confluence-cli.exe");
+        let exe_candidate = ancestor.join("confluence.exe");
         if exe_candidate.is_file() {
             return exe_candidate;
         }
     }
 
     panic!(
-        "failed to locate confluence-cli binary from {}",
+        "failed to locate confluence binary from {}",
         current_exe.display()
+    );
+}
+
+#[test]
+fn binary_discovery_finds_the_declared_confluence_executable() {
+    let path = find_binary_path();
+    assert!(path.is_file(), "binary does not exist: {}", path.display());
+    assert!(
+        matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("confluence" | "confluence.exe")
+        ),
+        "unexpected binary name: {}",
+        path.display()
     );
 }
 
@@ -362,6 +377,14 @@ fn first_item<'a>(value: &'a Value, context: &str) -> &'a Value {
         .as_array()
         .and_then(|items| items.first())
         .unwrap_or_else(|| panic!("expected non-empty array for {context}: {value}"))
+}
+
+fn list_items<'a>(value: &'a Value, context: &str) -> &'a [Value] {
+    value
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| panic!("expected list envelope for {context}: {value}"))
 }
 
 fn string_field<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -489,9 +512,9 @@ fn e2e_cli_lifecycle() {
 
     let space_list = cfg.run_json(&["space", "list"]);
     assert!(
-        space_list.as_array().is_some_and(|items| items
+        list_items(&space_list, "space list")
             .iter()
-            .any(|item| string_field(item, "key") == cfg.space)),
+            .any(|item| string_field(item, "key") == cfg.space),
         "expected space list to include {}: {space_list}",
         cfg.space
     );
@@ -516,11 +539,9 @@ fn e2e_cli_lifecycle() {
 
     let found_search_hit = wait_until(Duration::from_secs(30), Duration::from_secs(2), || {
         let search = cfg.run_json(&["search", &page_title, "--limit", "10"]);
-        search.as_array().is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.get("id").and_then(Value::as_str) == Some(page_id.as_str()))
-        })
+        list_items(&search, "search")
+            .iter()
+            .any(|item| item.get("id").and_then(Value::as_str) == Some(page_id.as_str()))
     });
     assert!(found_search_hit, "expected search to find page {page_id}");
 
@@ -542,12 +563,12 @@ fn e2e_cli_lifecycle() {
     cfg.run(&["label", "add", &page_id, "e2e-auto"]);
     let labels = cfg.run_json(&["label", "list", &page_id]);
     assert!(
-        labels
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("e2e-auto"))),
+        list_items(&labels, "label list")
+            .iter()
+            .any(|item| item.get("label").and_then(Value::as_str) == Some("e2e-auto")),
         "expected label list to contain e2e-auto: {labels}"
     );
-    cfg.run(&["label", "remove", &page_id, "e2e-auto"]);
+    cfg.run(&["--yes", "label", "remove", &page_id, "e2e-auto"]);
 
     let property_set = cfg.run_json(&[
         "property",
@@ -568,7 +589,7 @@ fn e2e_cli_lifecycle() {
             .and_then(Value::as_bool),
         Some(true)
     );
-    cfg.run(&["property", "delete", &page_id, "e2e_verify"]);
+    cfg.run(&["--yes", "property", "delete", &page_id, "e2e_verify"]);
 
     let comment_body_arg = comment_body.to_string_lossy().into_owned();
     let comment_add = cfg.run_json(&["comment", "add", &page_id, "--body-file", &comment_body_arg]);
@@ -576,12 +597,12 @@ fn e2e_cli_lifecycle() {
     cleanup.comment_id = Some(comment_id.clone());
     let comments = cfg.run_json(&["comment", "list", &page_id]);
     assert!(
-        comments.as_array().is_some_and(|items| items
+        list_items(&comments, "comment list")
             .iter()
-            .any(|item| item.get("id").and_then(Value::as_str) == Some(comment_id.as_str()))),
+            .any(|item| item.get("id").and_then(Value::as_str) == Some(comment_id.as_str())),
         "expected comment list to contain {comment_id}: {comments}"
     );
-    cfg.run(&["comment", "delete", &comment_id]);
+    cfg.run(&["--yes", "comment", "delete", &comment_id]);
     cleanup.comment_id = None;
 
     let attachment_arg = attachment_file.to_string_lossy().into_owned();
@@ -599,11 +620,9 @@ fn e2e_cli_lifecycle() {
     cleanup.attachment_id = Some(attachment_id.clone());
     let attachments = cfg.run_json(&["attachment", "list", &page_id]);
     assert!(
-        attachments.as_array().is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.get("id").and_then(Value::as_str) == Some(attachment_id.as_str()))
-        }),
+        list_items(&attachments, "attachment list")
+            .iter()
+            .any(|item| item.get("id").and_then(Value::as_str) == Some(attachment_id.as_str())),
         "expected attachment list to contain {attachment_id}: {attachments}"
     );
     let download_arg = download_path.to_string_lossy().into_owned();
@@ -618,7 +637,7 @@ fn e2e_cli_lifecycle() {
         fs::read_to_string(&attachment_file).expect("read uploaded attachment"),
         fs::read_to_string(&download_path).expect("read downloaded attachment")
     );
-    cfg.run(&["attachment", "delete", &page_id, &attachment_id]);
+    cfg.run(&["--yes", "attachment", "delete", &page_id, &attachment_id]);
     cleanup.attachment_id = None;
 
     let page_before_untouched_pull = cfg.run_json(&["page", "get", &page_id, "--show-body"]);
@@ -1914,9 +1933,9 @@ fn e2e_cli_lifecycle() {
         string_field(first_item(&blog_update, "blog update"), "title"),
         updated_blog_title
     );
-    cfg.run(&["blog", "delete", &blog_id]);
+    cfg.run(&["--yes", "blog", "delete", &blog_id]);
     cleanup.blog_id = None;
 
-    cfg.run(&["page", "delete", &page_id]);
+    cfg.run(&["--yes", "page", "delete", &page_id]);
     cleanup.page_id = None;
 }

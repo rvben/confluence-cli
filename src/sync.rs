@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use pathdiff::diff_paths;
 use regex::Regex;
@@ -72,8 +72,10 @@ pub async fn pull_space_since(
     root: &Path,
     since: &str,
 ) -> Result<Vec<PathBuf>> {
+    let space = crate::provider::escape_cql_literal(space);
+    let since = crate::provider::escape_cql_literal(since);
     let cql = format!(r#"space = "{space}" AND type = page AND lastModified > "{since}""#);
-    let results = provider.search(&cql, true, 1000, 0).await?;
+    let results = provider.search(&cql, true, 1000, 0).await?.items;
     let mut written = Vec::new();
     for result in results {
         let paths = pull_page(provider, &result.id, root, false).await?;
@@ -89,6 +91,16 @@ pub fn plan_path(
     show_diff: bool,
 ) -> Result<SyncPlan> {
     let docs = load_local_documents(root)?;
+    if docs.is_empty() {
+        return Err(crate::output::typed_error_with_hint(
+            "invalid_input",
+            format!(
+                "sync path `{}` contains no index.md documents",
+                root.display()
+            ),
+            "run `confluence pull ...` first or point PATH at a pulled Markdown tree",
+        ));
+    }
     let indexes = scan_local_documents(root)?;
     let mut parent_ids = BTreeMap::new();
     for doc in &indexes {
@@ -304,14 +316,18 @@ pub async fn apply_path(
         let content = if let Some(content_id) = doc.sidecar.content_id.clone() {
             let remote = provider.get_content(kind, &content_id, false).await?;
             if !force && doc.sidecar.remote_version != remote.version {
-                bail!(
-                    "remote version drift for `{}` at {} (content {}): local sidecar version {:?}, remote {:?}. Run `confluence-cli pull ...` to refresh local metadata, or rerun `confluence-cli apply ... --force` if local content should win",
-                    title,
-                    doc.directory.display(),
-                    content_id,
-                    doc.sidecar.remote_version,
-                    remote.version
-                );
+                return Err(crate::output::typed_error_with_hint(
+                    "conflict",
+                    format!(
+                        "remote version drift for `{}` at {} (content {}): local sidecar version {:?}, remote {:?}",
+                        title,
+                        doc.directory.display(),
+                        content_id,
+                        doc.sidecar.remote_version,
+                        remote.version
+                    ),
+                    "run `confluence pull ...` to refresh local metadata, or rerun `confluence apply ... --force` if local content should win",
+                ));
             }
             let needs_update = body_changed(&doc.sidecar, &markdown_hash, &storage_hash)
                 || doc.sidecar.remote_parent_id != derived_parent_id
@@ -319,9 +335,12 @@ pub async fn apply_path(
                 || remote.labels != doc.frontmatter.labels
                 || remote.properties != doc.frontmatter.properties;
             if needs_update {
-                let version = remote
-                    .version
-                    .ok_or_else(|| anyhow!("remote content {content_id} has no version"))?;
+                let version = remote.version.ok_or_else(|| {
+                    crate::output::typed_error(
+                        "api_error",
+                        format!("remote content {content_id} has no version"),
+                    )
+                })?;
                 let updated = provider
                     .update_content(&crate::model::UpdateContentRequest {
                         id: content_id.clone(),
@@ -460,9 +479,12 @@ async fn reconcile_local_link_updates(
         let remote = provider
             .get_content(doc.frontmatter.content_kind(), &content_id, false)
             .await?;
-        let version = remote
-            .version
-            .ok_or_else(|| anyhow!("remote content {content_id} has no version"))?;
+        let version = remote.version.ok_or_else(|| {
+            crate::output::typed_error(
+                "api_error",
+                format!("remote content {content_id} has no version"),
+            )
+        })?;
         let updated = provider
             .update_content(&crate::model::UpdateContentRequest {
                 id: content_id.clone(),

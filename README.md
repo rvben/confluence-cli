@@ -7,8 +7,8 @@ Markdown-sync-first Confluence CLI in Rust.
 `confluence-cli` is built around a safe local workflow:
 
 1. `pull` Confluence content into Markdown plus sidecar metadata.
-2. `plan` exactly what would change remotely.
-3. `apply` only when the diff is correct.
+2. `plan` changes against the pulled sidecar state without contacting Confluence.
+3. `apply` only when the diff is correct; it rechecks remote versions before writing.
 
 It also exposes direct page, blog, search, attachment, label, comment, and property commands for non-sync use cases.
 
@@ -65,6 +65,10 @@ never saved. If automatic creation is unavailable, it opens
 `https://<your-host>/plugins/personalaccesstokens/usertokens.action` (also
 available under **Avatar → Settings → Personal access tokens**). Onboarding
 never consumes accidental piped input as answers.
+
+`init` is the short name for the guided `auth login` flow. Use
+`auth login --profile NAME ...` for explicit scripted login, and use
+`profile add --name NAME ...` as the explicit profile-management equivalent.
 
 Cloud profile:
 
@@ -126,6 +130,10 @@ Inspect the planned changes:
 confluence plan ./docs/parent-page
 ```
 
+`plan` validates the local tree and compares it with the sidecar state captured by
+`pull`; it does not contact Confluence. `apply` rechecks remote versions and
+refuses drift unless `--force` is explicitly supplied.
+
 Apply the diff:
 
 ```bash
@@ -166,19 +174,37 @@ Top-level command groups:
 - `profile add|list|use|remove`
 - `space list|get`
 - `search`
-- `page get|tree|create|update|delete`
-- `blog get|create|update|delete`
+- `page list|get|tree|move|create|update|delete`
+- `blog list|get|create|update|delete`
 - `pull page|tree|space`
 - `plan`
 - `apply`
 - `attachment list|download|upload|delete`
 - `label list|add|remove`
-- `comment list|add|delete`
+- `comment list|add|update|delete`
 - `property list|get|set|delete`
 - `doctor`
 - `completions`
+- `schema`
 
-Every command accepts the suite-wide `--output auto|text|json`, `--quiet`, and `--no-color` flags. Auto output is readable text on a terminal and JSON when piped; `--json` remains a hidden compatibility alias. Errors use the shared exit-code contract (input 2, auth 3, not found 4, API 5, rate limit 6, conflict 7), and `confluence schema --command 'page get'` returns one token-efficient command contract.
+All data commands accept the suite-wide `--output auto|text|json`, `--quiet`, and
+`--no-color` flags. Auto output is readable text on a terminal and JSON when
+piped; `--json` remains a hidden compatibility alias. Successful JSON-mode
+commands always emit one JSON document. `completions` intentionally emits an
+opaque shell script, while `schema` always emits JSON.
+
+List commands consistently support `--limit`, `--offset`, and JSON-only
+`--fields`. Search reports an exact `total` when Confluence supplies one and
+`null` otherwise. Errors use the shared exit-code contract (input 2, auth 3,
+not found 4, API/network 5, rate limit 6, conflict 7), and
+`confluence schema --command 'page get'` returns one token-efficient command
+contract. The response contract is versioned independently in the schema.
+
+Where a command accepts `REFERENCE`, use a numeric content ID, a Confluence URL,
+or `SPACE:Title`. Destructive operations require an interactive confirmation or
+`--yes`; conditional overwrites additionally require `--force` or `--replace`.
+For sensitive content, prefer `--body-file` or standard input over `--body`,
+because command-line arguments can be visible to other local processes.
 
 ## Auth And Environment Overrides
 

@@ -3331,8 +3331,21 @@ pub fn save_document(doc: &LocalDocument) -> Result<()> {
 }
 
 pub fn scan_local_documents(root: &Path) -> Result<Vec<LocalContentIndex>> {
+    if !root.exists() {
+        return Err(crate::output::typed_error(
+            "not_found",
+            format!("sync path `{}` does not exist", root.display()),
+        ));
+    }
+    if !root.is_dir() {
+        return Err(crate::output::typed_error(
+            "invalid_input",
+            format!("sync path `{}` is not a directory", root.display()),
+        ));
+    }
     let mut docs = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(root) {
+        let entry = entry.with_context(|| format!("failed to scan `{}`", root.display()))?;
         if !entry.file_type().is_file() || entry.file_name() != "index.md" {
             continue;
         }

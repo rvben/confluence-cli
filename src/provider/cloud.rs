@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use reqwest::Method;
@@ -12,7 +12,7 @@ use tokio::fs;
 use crate::config::ResolvedProfile;
 use crate::model::{
     AttachmentInfo, CommentInfo, ContentItem, ContentKind, ContentProperty, CreateContentRequest,
-    ProviderKind, SearchResult, SpaceSummary, UpdateContentRequest,
+    ProviderKind, SpaceSummary, UpdateContentRequest,
 };
 use crate::provider::{
     ConfluenceProvider, HttpClient, Results, V1Attachment, V1Comment, V1Content, V1Label,
@@ -37,7 +37,9 @@ impl CloudProvider {
         spaces
             .into_iter()
             .find(|space| space.key == key_or_id || space.id == key_or_id)
-            .ok_or_else(|| anyhow!("space `{key_or_id}` not found"))
+            .ok_or_else(|| {
+                crate::output::typed_error("not_found", format!("space `{key_or_id}` not found"))
+            })
     }
 
     async fn page_v2(&self, id: &str, include_body: bool) -> Result<V2Page> {
@@ -219,7 +221,7 @@ impl ConfluenceProvider for CloudProvider {
         cql: bool,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<SearchResult>> {
+    ) -> Result<crate::provider::SearchPage> {
         let cql = build_search_cql(query, cql);
         let path = format!(
             "/content/search?cql={}&limit={limit}&start={offset}&expand=space",
@@ -229,11 +231,14 @@ impl ConfluenceProvider for CloudProvider {
             .http
             .json(Method::GET, self.http.v1_url(&path), None)
             .await?;
-        Ok(response
-            .results
-            .into_iter()
-            .filter_map(|item| v1_search_result(&self.http.profile.base_url, item))
-            .collect())
+        Ok(crate::provider::SearchPage {
+            total: response.total_size,
+            items: response
+                .results
+                .into_iter()
+                .filter_map(|item| v1_search_result(&self.http.profile.base_url, item))
+                .collect(),
+        })
     }
 
     async fn get_content(
@@ -242,8 +247,8 @@ impl ConfluenceProvider for CloudProvider {
         id: &str,
         include_body: bool,
     ) -> Result<ContentItem> {
-        let labels = self.labels_for(id).await.unwrap_or_default();
-        let properties = normalize_properties(self.properties_for(id).await.unwrap_or_default());
+        let labels = self.labels_for(id).await?;
+        let properties = normalize_properties(self.properties_for(id).await?);
         match kind {
             ContentKind::Page => {
                 let page = self.page_v2(id, include_body).await?;
@@ -350,15 +355,23 @@ impl ConfluenceProvider for CloudProvider {
                     .await?;
                 let content_id = value_to_string(&created.id);
                 for label in &request.labels {
-                    let _ = self.add_label(&content_id, label).await;
+                    self.add_label(&content_id, label).await.with_context(|| {
+                        format!(
+                            "content {content_id} was created, but label `{label}` was not added"
+                        )
+                    })?;
                 }
                 for (key, value) in &request.properties {
-                    let _ = self.set_property(&content_id, key, value.clone()).await;
+                    self.set_property(&content_id, key, value.clone())
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "content {content_id} was created, but property `{key}` was not set"
+                            )
+                        })?;
                 }
-                let labels = self.labels_for(&content_id).await.unwrap_or_default();
-                let properties = normalize_properties(
-                    self.properties_for(&content_id).await.unwrap_or_default(),
-                );
+                let labels = self.labels_for(&content_id).await?;
+                let properties = normalize_properties(self.properties_for(&content_id).await?);
                 let page = self.page_v2(&content_id, true).await?;
                 let mut item = v2_page_to_item(&self.http.profile, page, labels, properties);
                 let enriched = self.content_v1(&content_id, true, &request.status).await?;
@@ -393,15 +406,23 @@ impl ConfluenceProvider for CloudProvider {
                     .await?;
                 let content_id = created.id.clone();
                 for label in &request.labels {
-                    let _ = self.add_label(&content_id, label).await;
+                    self.add_label(&content_id, label).await.with_context(|| {
+                        format!(
+                            "content {content_id} was created, but label `{label}` was not added"
+                        )
+                    })?;
                 }
                 for (key, value) in &request.properties {
-                    let _ = self.set_property(&content_id, key, value.clone()).await;
+                    self.set_property(&content_id, key, value.clone())
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "content {content_id} was created, but property `{key}` was not set"
+                            )
+                        })?;
                 }
-                let labels = self.labels_for(&content_id).await.unwrap_or_default();
-                let properties = normalize_properties(
-                    self.properties_for(&content_id).await.unwrap_or_default(),
-                );
+                let labels = self.labels_for(&content_id).await?;
+                let properties = normalize_properties(self.properties_for(&content_id).await?);
                 let item = self.content_v1(&content_id, true, &request.status).await?;
                 Ok(v1_content_to_item(
                     &self.http.profile.base_url,
@@ -470,36 +491,72 @@ impl ConfluenceProvider for CloudProvider {
             }
         }
 
-        let current_labels = self.list_labels(&request.id).await.unwrap_or_default();
+        let current_labels = self.list_labels(&request.id).await.with_context(|| {
+            format!(
+                "content {} was updated, but labels could not be read",
+                request.id
+            )
+        })?;
         for label in current_labels
             .iter()
             .filter(|label| !request.labels.contains(*label))
         {
-            let _ = self.remove_label(&request.id, label).await;
+            self.remove_label(&request.id, label)
+                .await
+                .with_context(|| {
+                    format!(
+                        "content {} was updated, but label `{label}` was not removed",
+                        request.id
+                    )
+                })?;
         }
         for label in request
             .labels
             .iter()
             .filter(|label| !current_labels.contains(*label))
         {
-            let _ = self.add_label(&request.id, label).await;
+            self.add_label(&request.id, label).await.with_context(|| {
+                format!(
+                    "content {} was updated, but label `{label}` was not added",
+                    request.id
+                )
+            })?;
         }
 
-        let current_properties = self.list_properties(&request.id).await.unwrap_or_default();
+        let current_properties = self.list_properties(&request.id).await.with_context(|| {
+            format!(
+                "content {} was updated, but properties could not be read",
+                request.id
+            )
+        })?;
         let current_map: BTreeMap<_, _> = current_properties
             .into_iter()
             .map(|property| (property.key, property.value))
             .collect();
         for (key, value) in &request.properties {
             if current_map.get(key) != Some(value) {
-                let _ = self.set_property(&request.id, key, value.clone()).await;
+                self.set_property(&request.id, key, value.clone())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "content {} was updated, but property `{key}` was not set",
+                            request.id
+                        )
+                    })?;
             }
         }
         for key in current_map
             .keys()
             .filter(|key| !request.properties.contains_key(*key))
         {
-            let _ = self.delete_property(&request.id, key).await;
+            self.delete_property(&request.id, key)
+                .await
+                .with_context(|| {
+                    format!(
+                        "content {} was updated, but property `{key}` was not deleted",
+                        request.id
+                    )
+                })?;
         }
 
         self.get_content(request.kind, &request.id, true).await
@@ -571,7 +628,12 @@ impl ConfluenceProvider for CloudProvider {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow!("attachment path must contain a file name"))?;
+            .ok_or_else(|| {
+                crate::output::typed_error(
+                    "invalid_input",
+                    "attachment path must contain a file name",
+                )
+            })?;
 
         let existing = if replace {
             self.attachment_by_name(content_id, file_name).await?
@@ -618,7 +680,10 @@ impl ConfluenceProvider for CloudProvider {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!("attachment upload failed with {status}: {body}");
+            return Err(crate::output::http_error(
+                status,
+                format!("attachment upload failed with {status}: {body}"),
+            ));
         }
         if replacing_existing {
             let attachment: V1Attachment = response.json().await?;
@@ -630,7 +695,12 @@ impl ConfluenceProvider for CloudProvider {
                 .into_iter()
                 .next()
                 .map(|attachment| self.map_attachment(attachment))
-                .ok_or_else(|| anyhow!("attachment upload returned no attachment metadata"))
+                .ok_or_else(|| {
+                    crate::output::typed_error(
+                        "api_error",
+                        "attachment upload returned no attachment metadata",
+                    )
+                })
         }
     }
 
@@ -721,11 +791,9 @@ impl ConfluenceProvider for CloudProvider {
                 None,
             )
             .await?;
-        let version = current
-            .version
-            .as_ref()
-            .map(|v| v.number)
-            .ok_or_else(|| anyhow!("comment version unavailable"))?;
+        let version = current.version.as_ref().map(|v| v.number).ok_or_else(|| {
+            crate::output::typed_error("api_error", "comment version unavailable")
+        })?;
         let updated: V1Comment = self
             .http
             .json(

@@ -11,7 +11,7 @@ build:
 	cargo build --locked
 
 test:
-	cargo test --locked
+	cargo test --locked --all-targets
 
 # Run end-to-end tests against a real Confluence instance.
 # Defaults to the local Data Center profile created during local setup.
@@ -22,7 +22,7 @@ test:
 # Set CONFLUENCE_E2E_PROFILE= to force env-driven mode instead of profile mode.
 test-e2e:
 	cargo build --locked
-	CONFLUENCE_CLI_BIN=$(CURDIR)/target/debug/confluence-cli CONFLUENCE_E2E_PROFILE=$(CONFLUENCE_E2E_PROFILE) CONFLUENCE_E2E_SPACE=$(CONFLUENCE_E2E_SPACE) cargo nextest run --test e2e --run-ignored all
+	CONFLUENCE_CLI_BIN=$(CURDIR)/target/debug/confluence CONFLUENCE_E2E_PROFILE=$(CONFLUENCE_E2E_PROFILE) CONFLUENCE_E2E_SPACE=$(CONFLUENCE_E2E_SPACE) cargo nextest run --test e2e --run-ignored all
 
 fmt:
 	cargo fmt --all
@@ -36,10 +36,13 @@ check: lint test
 release-check:
 	cargo fmt --all --check
 	cargo clippy --locked -- -D warnings
-	cargo test --locked
+	cargo test --locked --all-targets
+	cargo run --locked -- >/dev/null
 	cargo run --locked -- --help >/dev/null
-	cargo run --locked -- doctor --help >/dev/null
+	cargo run --locked -- page create --help >/dev/null
+	cargo run --locked -- schema --command 'page get' >/dev/null
 	cargo package --locked --allow-dirty
+	install_dir="$$(mktemp -d)"; trap 'rm -rf "$$install_dir"' EXIT; cargo install --locked --path . --root "$$install_dir"; "$$install_dir/bin/confluence" --version
 
 release-patch:
 	vership bump patch

@@ -3,8 +3,8 @@ use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use anyhow::{Context, Result, bail};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -31,10 +31,12 @@ use crate::sync;
     arg_required_else_help = true
 )]
 pub struct Cli {
+    /// Output format: auto uses text on a terminal and JSON when piped
     #[arg(
-        id = "format",
+        id = "output_format",
         long = "output",
         short = 'o',
+        value_name = "format",
         global = true,
         default_value = "auto"
     )]
@@ -42,7 +44,8 @@ pub struct Cli {
     /// Output JSON (hidden alias for --output json; --output takes precedence if both given)
     #[arg(long, global = true, hide = true)]
     json: bool,
-    #[arg(long, global = true)]
+    /// Configuration profile to use instead of the active profile
+    #[arg(long, global = true, env = "CONFLUENCE_PROFILE")]
     profile: Option<String>,
     /// Suppress progress and informational messages
     #[arg(long, global = true)]
@@ -59,52 +62,87 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Configure an account with the guided login wizard
     Init,
+    /// Log in, inspect authentication, log out, or migrate credentials
+    #[command(
+        after_help = "Examples:\n  confluence auth login\n  confluence auth status --profile work\n  printf '%s' \"$CONFLUENCE_PAT\" | confluence auth login --provider data-center --domain https://wiki.example.com --auth-type bearer --token-stdin --non-interactive"
+    )]
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Add, list, select, or remove configuration profiles
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
     },
+    /// List spaces or inspect one space
     Space {
         #[command(subcommand)]
         command: SpaceCommand,
     },
+    /// Search pages and blog posts with plain text or CQL
+    #[command(
+        after_help = "Examples:\n  confluence search 'release notes'\n  confluence search 'owner = currentUser()' --cql --space DOCS"
+    )]
     Search(SearchArgs),
+    /// List, inspect, create, update, move, or delete pages
+    #[command(
+        after_help = "Page references accept a numeric ID, a Confluence URL, or SPACE:Title.\n\nExamples:\n  confluence page get DOCS:Getting Started\n  confluence page create 'Release Notes' DOCS --body-file release.md\n  confluence page update DOCS:Roadmap --body-file roadmap.md"
+    )]
     Page {
         #[command(subcommand)]
         command: PageCommand,
     },
+    /// List, inspect, create, update, or delete blog posts
     Blog {
         #[command(subcommand)]
         command: BlogCommand,
     },
+    /// Export pages, trees, or spaces to the local Markdown format
+    #[command(
+        after_help = "Examples:\n  confluence pull page DOCS:Home ./docs/home\n  confluence pull tree DOCS:Home ./docs/site\n  confluence pull space DOCS ./docs"
+    )]
     Pull {
         #[command(subcommand)]
         command: PullCommand,
     },
+    /// Check configuration, credentials, connectivity, and local sync data
     Doctor(DoctorArgs),
+    /// Preview local changes without contacting or modifying Confluence
+    #[command(
+        after_help = "`plan` reads local Markdown and sidecar state only. Remote drift is checked by `apply`.\n\nExample:\n  confluence plan ./docs --diff"
+    )]
     Plan(PlanArgs),
+    /// Apply local changes with remote-version drift protection
+    #[command(
+        after_help = "Run `confluence plan PATH` first. Apply refuses remote-version drift unless --force is passed."
+    )]
     Apply(ApplyArgs),
+    /// List, download, upload, replace, or delete attachments
     Attachment {
         #[command(subcommand)]
         command: AttachmentCommand,
     },
+    /// List, add, or remove page labels
     Label {
         #[command(subcommand)]
         command: LabelCommand,
     },
+    /// List, add, update, or delete page comments
     Comment {
         #[command(subcommand)]
         command: CommentCommand,
     },
+    /// List, inspect, set, or delete page content properties
     Property {
         #[command(subcommand)]
         command: PropertyCommand,
     },
+    /// Generate a completion script for a supported shell
     Completions {
+        /// Shell whose completion syntax should be generated
         shell: Shell,
     },
     /// Output JSON schema for agent integration
@@ -117,8 +155,11 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommand {
-    Login(Box<ProfileInputArgs>),
+    /// Configure and verify a profile; starts a guided wizard without flags
+    Login(Box<AuthLoginArgs>),
+    /// Verify the selected profile and display its authentication status
     Status,
+    /// Remove the selected profile credential
     Logout,
     /// Move an inline legacy token into the operating-system keychain
     Migrate,
@@ -126,7 +167,9 @@ enum AuthCommand {
 
 #[derive(Subcommand, Debug)]
 enum ProfileCommand {
-    Add(ProfileInputArgs),
+    /// Add a profile using explicit command-line options
+    Add(ProfileAddArgs),
+    /// List stored profiles and identify the active one
     List {
         /// Maximum number of items to return
         #[arg(long)]
@@ -138,19 +181,26 @@ enum ProfileCommand {
         #[arg(long)]
         fields: Option<String>,
     },
+    /// Select the profile used when --profile is omitted
     Use {
+        /// Stored profile name
         name: String,
     },
+    /// Remove a stored profile and its credential
     Remove {
+        /// Stored profile name
         name: String,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum SpaceCommand {
+    /// List spaces visible to the selected profile
     List {
+        /// Maximum number of spaces to return
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Number of spaces to skip
         #[arg(long, default_value_t = 0)]
         offset: usize,
         /// Fetch all spaces, ignoring --limit
@@ -160,7 +210,9 @@ enum SpaceCommand {
         #[arg(long)]
         fields: Option<String>,
     },
+    /// Get one space by key or ID
     Get {
+        /// Space key or numeric ID
         space: String,
     },
 }
@@ -173,15 +225,21 @@ enum ContentTypeFilter {
 
 #[derive(Args, Debug)]
 struct SearchArgs {
+    /// Plain-text search phrase, or a full CQL expression with --cql
     query: String,
+    /// Interpret QUERY as Confluence Query Language instead of plain text
     #[arg(long)]
     cql: bool,
+    /// Restrict results to this space key
     #[arg(long)]
     space: Option<String>,
+    /// Restrict results to pages or blog posts
     #[arg(long, value_enum)]
     r#type: Option<ContentTypeFilter>,
+    /// Maximum number of results to return
     #[arg(long, default_value_t = 20)]
     limit: usize,
+    /// Number of matching results to skip
     #[arg(long, default_value_t = 0)]
     offset: usize,
     /// Comma-separated list of fields to include in JSON output
@@ -191,10 +249,14 @@ struct SearchArgs {
 
 #[derive(Subcommand, Debug)]
 enum PageCommand {
+    /// List pages in a space
     List {
+        /// Space key or numeric ID
         space: String,
+        /// Maximum number of pages to return
         #[arg(long, default_value_t = 200)]
         limit: usize,
+        /// Number of pages to skip
         #[arg(long, default_value_t = 0)]
         offset: usize,
         /// Fetch all pages, ignoring --limit
@@ -204,33 +266,50 @@ enum PageCommand {
         #[arg(long)]
         fields: Option<String>,
     },
+    /// Get one page by ID, URL, or SPACE:Title
     Get {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Include storage-format body content in the result
         #[arg(long)]
         show_body: bool,
     },
+    /// Show a page and its descendants
     Tree {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
-        #[arg(long, default_value_t = true)]
+        /// Recurse through all descendants; pass false for direct children only
+        #[arg(long, action = ArgAction::Set, default_value_t = true)]
         recursive: bool,
     },
+    /// Move a page beneath a new parent
     Move {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// New parent page ID, URL, or SPACE:Title
         parent: String,
     },
+    /// Create a page from Markdown or Confluence storage-format content
     Create(WriteContentArgs),
+    /// Update a page while preserving unspecified content and metadata
     Update(UpdateContentArgs),
+    /// Permanently delete a page after confirmation
     Delete {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum BlogCommand {
+    /// List blog posts in a space
     List {
+        /// Space key or numeric ID
         space: String,
+        /// Maximum number of blog posts to return
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Number of blog posts to skip
         #[arg(long, default_value_t = 0)]
         offset: usize,
         /// Fetch all blog posts, ignoring --limit
@@ -240,227 +319,366 @@ enum BlogCommand {
         #[arg(long)]
         fields: Option<String>,
     },
+    /// Get one blog post by content ID
     Get {
+        /// Blog post content ID
         id: String,
+        /// Include storage-format body content in the result
         #[arg(long)]
         show_body: bool,
     },
+    /// Create a blog post from Markdown or storage-format content
     Create(WriteContentArgs),
+    /// Update a blog post while preserving unspecified content and metadata
     Update(UpdateContentArgs),
+    /// Permanently delete a blog post after confirmation
     Delete {
+        /// Blog post content ID
         id: String,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum PullCommand {
+    /// Export one page to a Markdown directory
     Page {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Destination directory
         output: PathBuf,
     },
+    /// Export a page and all descendants to a Markdown tree
     Tree {
+        /// Root page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Destination directory
         output: PathBuf,
     },
+    /// Export every page in a space
     Space {
+        /// Space key or numeric ID
         space: String,
+        /// Destination directory
         output: PathBuf,
-        #[arg(long)]
+        /// Export only content updated since this RFC 3339 timestamp
+        #[arg(long, value_parser = validate_since)]
         since: Option<String>,
     },
 }
 
 #[derive(Args, Debug)]
 struct PlanArgs {
+    /// Local Markdown sync directory created by pull
     path: PathBuf,
+    /// Permit conversions that preserve unsupported storage fragments verbatim
     #[arg(long)]
     allow_lossy: bool,
+    /// Plan deletion of remote attachments removed from the local tree
     #[arg(long)]
     delete_remote: bool,
+    /// Include unified body diffs in text output
     #[arg(long)]
     diff: bool,
 }
 
 #[derive(Args, Debug)]
 struct ApplyArgs {
+    /// Local Markdown sync directory created by pull
     path: PathBuf,
+    /// Permit conversions that preserve unsupported storage fragments verbatim
     #[arg(long)]
     allow_lossy: bool,
+    /// Delete remote attachments removed from the local tree; requires confirmation
     #[arg(long)]
     delete_remote: bool,
+    /// Overwrite content despite remote-version drift
     #[arg(long)]
     force: bool,
 }
 
 #[derive(Args, Debug)]
 struct DoctorArgs {
+    /// Verify access to this space key or ID
     #[arg(long)]
     space: Option<String>,
+    /// Validate this local Markdown sync directory
     #[arg(long)]
     path: Option<PathBuf>,
+    /// Check local configuration without contacting Confluence
     #[arg(long)]
     skip_network: bool,
 }
 
 #[derive(Subcommand, Debug)]
 enum AttachmentCommand {
+    /// List attachments on a page
     List {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Maximum number of items to return
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Number of items to skip
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Comma-separated list of fields to include in JSON output
         #[arg(long)]
         fields: Option<String>,
     },
+    /// Download one attachment without overwriting by default
     Download {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Attachment content ID
         attachment_id: String,
+        /// Destination file path
         output: PathBuf,
+        /// Replace an existing output file
+        #[arg(long)]
+        force: bool,
     },
+    /// Upload one or more files to a page
     Upload {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Local file to upload; repeat for multiple files
         #[arg(long = "file", required = true)]
         files: Vec<PathBuf>,
+        /// Version comment recorded by Confluence
         #[arg(long)]
         comment: Option<String>,
+        /// Replace same-named remote attachments after confirmation
         #[arg(long)]
         replace: bool,
+        /// Mark uploaded attachment versions as minor edits
         #[arg(long)]
         minor_edit: bool,
     },
+    /// Permanently delete an attachment after confirmation
     Delete {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Attachment content ID
         attachment_id: String,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum LabelCommand {
+    /// List labels on a page
     List {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Maximum number of items to return
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Number of items to skip
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Comma-separated list of fields to include in JSON output
         #[arg(long)]
         fields: Option<String>,
     },
+    /// Add a label to a page
     Add {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Label name
         label: String,
     },
+    /// Remove a label from a page after confirmation
     Remove {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Label name
         label: String,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum CommentCommand {
+    /// List footer comments on a page
     List {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Maximum number of items to return
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Number of items to skip
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Comma-separated list of fields to include in JSON output
         #[arg(long)]
         fields: Option<String>,
     },
+    /// Add a footer comment to a page
     Add {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
         #[command(flatten)]
         body: BodyInput,
     },
+    /// Replace an existing comment body
     Update {
+        /// Comment content ID
         comment_id: String,
         #[command(flatten)]
         body: BodyInput,
     },
+    /// Permanently delete a comment after confirmation
     Delete {
+        /// Comment content ID
         comment_id: String,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum PropertyCommand {
+    /// List content properties on a page
     List {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Maximum number of items to return
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Number of items to skip
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Comma-separated list of fields to include in JSON output
         #[arg(long)]
         fields: Option<String>,
     },
+    /// Get one content property
     Get {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Property key
         key: String,
     },
+    /// Create or replace a content property
     Set {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Property key
         key: String,
+        /// JSON value by default; invalid JSON is stored as a string and may be process-visible
         value: String,
+        /// Always store VALUE as a string instead of parsing JSON
         #[arg(long)]
         raw: bool,
     },
+    /// Permanently delete a content property after confirmation
     Delete {
+        /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
+        /// Property key
         key: String,
     },
 }
 
 #[derive(Args, Debug, Clone)]
 struct BodyInput {
+    /// Body text; process-visible, so prefer --body-file for sensitive content
     #[arg(long)]
     body: Option<String>,
-    #[arg(long)]
+    /// Read body text from a file, or from stdin when PATH is -
+    #[arg(long, conflicts_with = "body")]
     body_file: Option<PathBuf>,
+    /// Input representation: Markdown is converted to Confluence storage format
     #[arg(long, value_enum, default_value_t = BodyFormat::Markdown)]
     format: BodyFormat,
+    /// Preserve unsupported Confluence fragments instead of refusing conversion
     #[arg(long)]
     allow_lossy: bool,
 }
 
 #[derive(Args, Debug)]
 struct WriteContentArgs {
+    /// New page or blog-post title
     title: String,
+    /// Destination space key
     space: String,
+    /// Parent page ID, URL, or SPACE:Title; pages only
     #[arg(long)]
     parent: Option<String>,
     #[command(flatten)]
     body: BodyInput,
+    /// Label to add; repeat for multiple labels
     #[arg(long = "label")]
     labels: Vec<String>,
+    /// Content property as key=value; repeat for multiple properties
     #[arg(long = "property")]
     properties: Vec<String>,
-    #[arg(long, default_value = "current")]
+    /// Confluence content status
+    #[arg(long, default_value = "current", value_parser = ["current", "draft"])]
     status: String,
 }
 
 #[derive(Args, Debug)]
 struct UpdateContentArgs {
+    /// Page ID, page URL, SPACE:Title, or blog-post content ID
     reference: String,
+    /// Replacement title; preserves the existing title when omitted
     #[arg(long)]
     title: Option<String>,
+    /// Replacement parent page ID, URL, or SPACE:Title; pages only
     #[arg(long)]
     parent: Option<String>,
     #[command(flatten)]
     body: BodyInput,
+    /// Label to merge into existing labels; repeat for multiple labels
     #[arg(long = "label")]
     labels: Vec<String>,
+    /// Content property as key=value to merge; repeat for multiple properties
     #[arg(long = "property")]
     properties: Vec<String>,
+    /// Replace all labels instead of merging supplied labels
     #[arg(long)]
     replace_labels: bool,
+    /// Replace all properties instead of merging supplied properties
     #[arg(long)]
     replace_properties: bool,
+    /// Expected current version; defaults to the version fetched before updating
     #[arg(long)]
     version: Option<u64>,
-    #[arg(long, default_value = "current")]
+    /// Confluence content status
+    #[arg(long, default_value = "current", value_parser = ["current", "draft"])]
     status: String,
 }
 
 #[derive(Args, Debug, Clone)]
-struct ProfileInputArgs {
-    #[arg(long)]
+struct AuthLoginArgs {
+    /// Profile name; alternatively pass the global --profile option
+    #[arg(long, conflicts_with = "profile")]
     name: Option<String>,
+    #[command(flatten)]
+    input: ProfileInputArgs,
+}
+
+#[derive(Args, Debug)]
+struct ProfileAddArgs {
+    /// New profile name
+    #[arg(long, conflicts_with = "profile")]
+    name: String,
+    #[command(flatten)]
+    input: ProfileInputArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ProfileInputArgs {
+    /// Confluence Cloud or self-hosted Data Center
     #[arg(long, value_enum)]
     provider: Option<ProviderArg>,
+    /// Confluence site hostname or base URL
     #[arg(long)]
     domain: Option<String>,
+    /// REST API path override; normally discovered from the provider
     #[arg(long)]
     api_path: Option<String>,
-    #[arg(long)]
+    /// Authentication scheme: basic for Cloud, bearer for most Data Center PATs
+    #[arg(long, value_parser = ["basic", "bearer"])]
     auth_type: Option<String>,
+    /// Username or email required by basic authentication
     #[arg(long)]
     username: Option<String>,
     /// Deprecated: use CONFLUENCE_API_TOKEN or --token-stdin to avoid process-list exposure
@@ -469,8 +687,10 @@ struct ProfileInputArgs {
     /// Read the API token or PAT from stdin
     #[arg(long)]
     token_stdin: bool,
+    /// Refuse all write operations through this profile
     #[arg(long)]
     read_only: bool,
+    /// Disable prompts and require all necessary options or environment variables
     #[arg(long)]
     non_interactive: bool,
     /// Store the credential in the protected config file instead of the OS keychain
@@ -480,11 +700,27 @@ struct ProfileInputArgs {
     #[arg(long, env = "CONFLUENCE_CLOUD_ID")]
     cloud_id: Option<String>,
     /// Cloud token type: scoped or classic
-    #[arg(long, env = "CONFLUENCE_TOKEN_KIND")]
+    #[arg(long, env = "CONFLUENCE_TOKEN_KIND", value_parser = ["scoped", "classic"])]
     token_kind: Option<String>,
     /// Recorded token expiry date (YYYY-MM-DD)
-    #[arg(long)]
+    #[arg(long, value_parser = validate_date)]
     expires_at: Option<String>,
+}
+
+fn validate_date(value: &str) -> std::result::Result<String, String> {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map(|_| value.to_string())
+        .map_err(|_| "expected a calendar date in YYYY-MM-DD format".to_string())
+}
+
+fn validate_since(value: &str) -> std::result::Result<String, String> {
+    if chrono::DateTime::parse_from_rfc3339(value).is_ok()
+        || chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+    {
+        Ok(value.to_string())
+    } else {
+        Err("expected YYYY-MM-DD or an RFC 3339 timestamp".to_string())
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -543,27 +779,35 @@ struct DoctorSummary {
 
 pub async fn run() -> Result<()> {
     let raw_args = std::env::args().collect::<Vec<_>>();
+    if raw_args.len() == 1 {
+        let mut command = Cli::command();
+        command.print_long_help()?;
+        println!();
+        return Ok(());
+    }
     let cli = Cli::try_parse().unwrap_or_else(|err| {
         use clap::error::ErrorKind;
         match err.kind() {
             // Let clap handle help and version display normally (exit 0)
             ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => err.exit(),
-            // For actual errors, emit a structured error to stderr
+            // Keep Clap's full, actionable human diagnostics. Machine consumers
+            // receive the same diagnostic in a stable JSON error envelope.
             _ => {
-                let msg = err.to_string();
-                // Keep only the first meaningful line (clap includes usage/hint)
-                let first_line = msg
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or(&msg)
-                    .trim()
-                    .to_string();
                 let machine = crate::output::machine_readable_errors(
                     raw_args.iter().skip(1),
                     std::io::stdout().is_terminal(),
                 );
-                let exit = crate::output::render_error("invalid_input", &first_line, None, machine);
-                std::process::exit(exit);
+                if machine {
+                    let rendered = err.to_string();
+                    let message = rendered
+                        .trim()
+                        .strip_prefix("error: ")
+                        .unwrap_or(rendered.trim())
+                        .to_string();
+                    let exit = crate::output::render_error("invalid_input", &message, None, true);
+                    std::process::exit(exit);
+                }
+                err.exit();
             }
         }
     });
@@ -579,8 +823,10 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         Commands::Init => config::init(output).await,
-        Commands::Auth { command } => handle_auth(command, cli.profile.as_deref(), output).await,
-        Commands::Profile { command } => handle_profile(command, output),
+        Commands::Auth { command } => {
+            handle_auth(command, cli.profile.as_deref(), output, yes).await
+        }
+        Commands::Profile { command } => handle_profile(command, output, yes),
         Commands::Space { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
             handle_space(&*provider, command, output).await
@@ -609,6 +855,12 @@ pub async fn run() -> Result<()> {
             render_plan(&plan, output, show_diff)
         }
         Commands::Apply(args) => {
+            if args.delete_remote {
+                confirm_destructive(
+                    yes,
+                    "Apply remote attachment deletions requested by --delete-remote?",
+                )?;
+            }
             let provider = provider_from_profile(cli.profile.as_deref())?;
             let plan = sync::apply_path(
                 &*provider,
@@ -626,7 +878,7 @@ pub async fn run() -> Result<()> {
         }
         Commands::Label { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
-            handle_label(&*provider, command, output).await
+            handle_label(&*provider, command, output, yes).await
         }
         Commands::Comment { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
@@ -634,7 +886,7 @@ pub async fn run() -> Result<()> {
         }
         Commands::Property { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
-            handle_property(&*provider, command, output).await
+            handle_property(&*provider, command, output, yes).await
         }
         Commands::Completions { shell } => {
             let mut command = Cli::command();
@@ -645,7 +897,10 @@ pub async fn run() -> Result<()> {
             if crate::schema::print_schema(command.as_deref()) {
                 Ok(())
             } else {
-                bail!("command `{}` is not declared", command.unwrap_or_default())
+                Err(crate::output::typed_error(
+                    "not_found",
+                    format!("command `{}` is not declared", command.unwrap_or_default()),
+                ))
             }
         }
     }
@@ -666,31 +921,31 @@ async fn handle_auth(
     command: AuthCommand,
     profile_override: Option<&str>,
     output: OutputFormat,
+    yes: bool,
 ) -> Result<()> {
     match command {
         AuthCommand::Login(args) => {
-            let mut args = *args;
+            let args = *args;
             let guided = args.name.is_none()
                 && profile_override.is_none()
-                && args.provider.is_none()
-                && args.domain.is_none()
-                && args.api_path.is_none()
-                && args.auth_type.is_none()
-                && args.username.is_none()
-                && args.token.is_none()
-                && !args.token_stdin
-                && !args.non_interactive
-                && !args.insecure_storage
-                && args.cloud_id.is_none()
-                && args.token_kind.is_none()
-                && args.expires_at.is_none();
+                && args.input.provider.is_none()
+                && args.input.domain.is_none()
+                && args.input.api_path.is_none()
+                && args.input.auth_type.is_none()
+                && args.input.username.is_none()
+                && args.input.token.is_none()
+                && !args.input.token_stdin
+                && !args.input.read_only
+                && !args.input.non_interactive
+                && !args.input.insecure_storage
+                && args.input.cloud_id.is_none()
+                && args.input.token_kind.is_none()
+                && args.input.expires_at.is_none();
             if guided {
                 return crate::config::init(output).await;
             }
-            if args.name.is_none() {
-                args.name = profile_override.map(str::to_owned);
-            }
-            let resolved = run_login(login_input(args)?)?;
+            let name = args.name.or_else(|| profile_override.map(str::to_owned));
+            let resolved = run_login(login_input(args.input, name)?)?;
             if output.is_json() {
                 print_json(&resolved.redact())?;
             } else {
@@ -713,7 +968,12 @@ async fn handle_auth(
                         resolved.api_path,
                         resolved.credential_store,
                         resolved.token_kind,
-                        resolved.expires_at.unwrap_or_else(|| "-".to_string()),
+                        resolved
+                            .expires_at
+                            .clone()
+                            .unwrap_or_else(|| "-".to_string()),
+                        crate::config::expiration_status(resolved.expires_at.as_deref())
+                            .to_string(),
                         resolved.read_only.to_string(),
                     ]],
                 );
@@ -739,6 +999,7 @@ async fn handle_auth(
                         "credential_store",
                         "token_kind",
                         "expires_at",
+                        "expiration_status",
                         "read_only",
                         "status",
                     ],
@@ -761,6 +1022,7 @@ async fn handle_auth(
             }
         }
         AuthCommand::Logout => {
+            confirm_destructive(yes, "Remove the selected profile credential?")?;
             let name = logout(profile_override)?;
             if output.is_json() {
                 print_json(&json!({ "profile": name, "status": "logged_out" }))?;
@@ -1005,10 +1267,10 @@ async fn handle_doctor(
     Ok(())
 }
 
-fn handle_profile(command: ProfileCommand, output: OutputFormat) -> Result<()> {
+fn handle_profile(command: ProfileCommand, output: OutputFormat, yes: bool) -> Result<()> {
     match command {
         ProfileCommand::Add(args) => {
-            let resolved = run_login(login_input(args)?)?;
+            let resolved = run_login(login_input(args.input, Some(args.name))?)?;
             if output.is_json() {
                 print_json(&resolved.redact())?;
             } else {
@@ -1049,9 +1311,12 @@ fn handle_profile(command: ProfileCommand, output: OutputFormat) -> Result<()> {
                 let filtered = filter_fields_vec(paged, fields.as_deref());
                 print_items_json(&filtered, total, limit.unwrap_or(shown), offset)?;
             } else {
-                let rows = config
-                    .profiles
-                    .iter()
+                let mut visible = config.profiles.iter().skip(offset).collect::<Vec<_>>();
+                if let Some(limit) = limit {
+                    visible.truncate(limit);
+                }
+                let rows = visible
+                    .into_iter()
                     .map(|(name, profile)| {
                         vec![
                             name.clone(),
@@ -1095,20 +1360,41 @@ fn handle_profile(command: ProfileCommand, output: OutputFormat) -> Result<()> {
             let mut config = AppConfig::load()?;
             config.set_active_profile(&name)?;
             config.save()?;
-            print_message(&format!("Active profile set to `{name}`"));
+            print_status(
+                output,
+                json!({ "profile": name, "active": true }),
+                &format!("Active profile set to `{name}`"),
+            )?;
         }
         ProfileCommand::Remove { name } => {
+            confirm_destructive(yes, &format!("Remove profile `{name}` and its credential?"))?;
             let mut config = AppConfig::load()?;
+            let original = config.clone();
+            let uses_keyring = config
+                .profiles
+                .get(&name)
+                .is_some_and(|profile| profile.credential_store.as_deref() == Some("keyring"));
             config.remove_profile(&name)?;
             config.save()?;
-            let _ = crate::credentials::delete(&name);
-            print_message(&format!("Removed profile `{name}`"));
+            if uses_keyring && let Err(error) = crate::credentials::delete(&name) {
+                original.save().with_context(|| {
+                    format!("credential cleanup failed and profile `{name}` could not be restored")
+                })?;
+                return Err(error).with_context(|| {
+                    format!("credential cleanup failed; profile `{name}` was restored")
+                });
+            }
+            print_status(
+                output,
+                json!({ "profile": name, "removed": true }),
+                &format!("Removed profile `{name}`"),
+            )?;
         }
     }
     Ok(())
 }
 
-fn login_input(args: ProfileInputArgs) -> Result<LoginInput> {
+fn login_input(args: ProfileInputArgs, name: Option<String>) -> Result<LoginInput> {
     let token = if args.token_stdin {
         let mut value = String::new();
         io::stdin()
@@ -1116,14 +1402,17 @@ fn login_input(args: ProfileInputArgs) -> Result<LoginInput> {
             .context("failed to read token from stdin")?;
         let value = value.trim_end_matches(['\r', '\n']).to_string();
         if value.is_empty() {
-            bail!("token read from stdin is empty");
+            return Err(crate::output::typed_error(
+                "invalid_input",
+                "token read from stdin is empty",
+            ));
         }
         Some(value)
     } else {
         args.token
     };
     Ok(LoginInput {
-        profile: args.name,
+        profile: name,
         provider: args.provider.map(ProviderArg::into_model),
         domain: args.domain,
         api_path: args.api_path,
@@ -1151,16 +1440,27 @@ async fn handle_space(
             all,
             fields,
         } => {
-            let fetch_limit = if all { 10_000 } else { limit };
-            let mut spaces = provider.list_spaces(fetch_limit).await?;
+            // Providers currently expose an all-or-prefix API. Fetch the complete
+            // set so offset pages and `total` remain truthful.
+            let mut spaces = provider.list_spaces(usize::MAX).await?;
             let total = spaces.len();
-            if !all && offset > 0 {
-                spaces = spaces.into_iter().skip(offset).collect();
+            if !all {
+                spaces = spaces.into_iter().skip(offset).take(limit).collect();
             }
-            render_spaces_list(&spaces, output, total, limit, offset, fields.as_deref())?;
-            if !all && !output.is_json() && total > limit {
+            let reported_limit = if all { total } else { limit };
+            let reported_offset = if all { 0 } else { offset };
+            render_spaces_list(
+                &spaces,
+                output,
+                total,
+                reported_limit,
+                reported_offset,
+                fields.as_deref(),
+            )?;
+            if !all && !output.is_json() && total > offset + spaces.len() {
                 print_message(&format!(
-                    "Showing first {limit} spaces - use --all to fetch all"
+                    "Showing {} of {total} spaces from offset {offset} - use --all to fetch all",
+                    spaces.len()
                 ));
             }
         }
@@ -1184,11 +1484,17 @@ async fn handle_search(
         let text_clause = if args.cql {
             args.query.clone()
         } else {
-            format!("text ~ \"{}\"", args.query.replace('"', "\\\""))
+            format!(
+                "text ~ \"{}\"",
+                crate::provider::escape_cql_literal(&args.query)
+            )
         };
         let mut clauses = vec![text_clause];
         if let Some(space) = &args.space {
-            clauses.push(format!("space = \"{space}\""));
+            clauses.push(format!(
+                "space = \"{}\"",
+                crate::provider::escape_cql_literal(space)
+            ));
         }
         if let Some(content_type) = args.r#type {
             let type_str = match content_type {
@@ -1205,8 +1511,9 @@ async fn handle_search(
         .search(&query, is_cql, args.limit, args.offset)
         .await?;
     render_search_results_list(
-        &results,
+        &results.items,
         output,
+        results.total,
         args.limit,
         args.offset,
         args.fields.as_deref(),
@@ -1284,9 +1591,9 @@ async fn handle_page(
                     title: current.title,
                     parent_id: Some(parent_id),
                     body_storage: current.body_storage.unwrap_or_default(),
-                    version: current
-                        .version
-                        .ok_or_else(|| anyhow!("page version unavailable"))?,
+                    version: current.version.ok_or_else(|| {
+                        crate::output::typed_error("api_error", "page version unavailable")
+                    })?,
                     message: Some("Moved via confluence-cli".to_string()),
                     status: current.status,
                     labels: current.labels,
@@ -1353,10 +1660,9 @@ async fn handle_page(
                     title: args.title.unwrap_or(current.title),
                     parent_id,
                     body_storage,
-                    version: args
-                        .version
-                        .or(current.version)
-                        .ok_or_else(|| anyhow!("page version unavailable"))?,
+                    version: args.version.or(current.version).ok_or_else(|| {
+                        crate::output::typed_error("api_error", "page version unavailable")
+                    })?,
                     message: Some("Updated via confluence-cli".to_string()),
                     status: args.status,
                     labels,
@@ -1469,10 +1775,9 @@ async fn handle_blog(
                     title: args.title.unwrap_or(current.title),
                     parent_id: None,
                     body_storage,
-                    version: args
-                        .version
-                        .or(current.version)
-                        .ok_or_else(|| anyhow!("blog version unavailable"))?,
+                    version: args.version.or(current.version).ok_or_else(|| {
+                        crate::output::typed_error("api_error", "blog version unavailable")
+                    })?,
                     message: Some("Updated via confluence-cli".to_string()),
                     status: args.status,
                     labels,
@@ -1519,7 +1824,11 @@ async fn handle_pull(
         }
     };
     if output.is_json() {
-        print_json(&written)?;
+        let items = written
+            .iter()
+            .map(|path| json!({ "path": path }))
+            .collect::<Vec<_>>();
+        print_items_json(&items, items.len(), items.len(), 0)?;
     } else {
         let items = written
             .iter()
@@ -1537,16 +1846,37 @@ async fn handle_attachment(
     yes: bool,
 ) -> Result<()> {
     match command {
-        AttachmentCommand::List { reference, fields } => {
+        AttachmentCommand::List {
+            reference,
+            limit,
+            offset,
+            fields,
+        } => {
             let id = provider.resolve_page_ref(&reference).await?;
             let attachments = provider.list_attachments(&id).await?;
-            render_attachments_list(&attachments, output, fields.as_deref())?;
+            let (attachments, total) = paginate(attachments, limit, offset);
+            render_attachments_list(
+                &attachments,
+                output,
+                total,
+                limit,
+                offset,
+                fields.as_deref(),
+            )?;
         }
         AttachmentCommand::Download {
             reference,
             attachment_id,
             output: path,
+            force,
         } => {
+            if path.exists() && !force {
+                crate::output::print_error(
+                    "conflict",
+                    &format!("output file `{}` already exists", path.display()),
+                    Some("pass --force to replace it"),
+                );
+            }
             let id = provider.resolve_page_ref(&reference).await?;
             let bytes = provider.download_attachment(&id, &attachment_id).await?;
             if let Some(parent) = path.parent() {
@@ -1566,14 +1896,52 @@ async fn handle_attachment(
             replace,
             minor_edit,
         } => {
+            for file in &files {
+                let metadata = fs::metadata(file)
+                    .with_context(|| format!("cannot read upload file `{}`", file.display()))?;
+                if !metadata.is_file() {
+                    return Err(crate::output::typed_error(
+                        "invalid_input",
+                        format!("upload path `{}` is not a regular file", file.display()),
+                    ));
+                }
+            }
+            if replace {
+                confirm_destructive(
+                    yes,
+                    "Replace same-named remote attachments requested by --replace?",
+                )?;
+            }
             let id = provider.resolve_page_ref(&reference).await?;
+            let upload_count = files.len();
             let mut uploaded = Vec::new();
             for file in files {
-                uploaded.push(
-                    provider
-                        .upload_attachment(&id, &file, comment.as_deref(), replace, minor_edit)
-                        .await?,
-                );
+                match provider
+                    .upload_attachment(&id, &file, comment.as_deref(), replace, minor_edit)
+                    .await
+                {
+                    Ok(item) => uploaded.push(item),
+                    Err(error) => {
+                        let completed = uploaded
+                            .iter()
+                            .map(|item: &AttachmentInfo| item.title.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(error).with_context(|| {
+                            format!(
+                                "attachment upload failed for `{}` after {}/{} completed{}",
+                                file.display(),
+                                uploaded.len(),
+                                upload_count,
+                                if completed.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" ({completed})")
+                                }
+                            )
+                        });
+                    }
+                }
             }
             render_attachments(&uploaded, output)?;
         }
@@ -1598,15 +1966,22 @@ async fn handle_label(
     provider: &dyn ConfluenceProvider,
     command: LabelCommand,
     output: OutputFormat,
+    yes: bool,
 ) -> Result<()> {
     match command {
-        LabelCommand::List { reference, fields } => {
+        LabelCommand::List {
+            reference,
+            limit,
+            offset,
+            fields,
+        } => {
             let id = provider.resolve_page_ref(&reference).await?;
             let labels = provider.list_labels(&id).await?;
+            let (labels, total) = paginate(labels, limit, offset);
             if output.is_json() {
                 let items: Vec<Value> = labels.iter().map(|l| json!({"label": l})).collect();
                 let filtered = filter_fields_vec(items, fields.as_deref());
-                print_items_json(&filtered, filtered.len(), filtered.len(), 0)?;
+                print_items_json(&filtered, total, limit, offset)?;
             } else {
                 print_list(&labels);
             }
@@ -1622,6 +1997,7 @@ async fn handle_label(
         }
         LabelCommand::Remove { reference, label } => {
             let id = provider.resolve_page_ref(&reference).await?;
+            confirm_destructive(yes, &format!("Remove label `{label}` from page {id}?"))?;
             provider.remove_label(&id, &label).await?;
             print_status(
                 output,
@@ -1640,10 +2016,16 @@ async fn handle_comment(
     yes: bool,
 ) -> Result<()> {
     match command {
-        CommentCommand::List { reference, fields } => {
+        CommentCommand::List {
+            reference,
+            limit,
+            offset,
+            fields,
+        } => {
             let id = provider.resolve_page_ref(&reference).await?;
             let comments = provider.list_comments(&id).await?;
-            render_comments_list(&comments, output, fields.as_deref())?;
+            let (comments, total) = paginate(comments, limit, offset);
+            render_comments_list(&comments, output, total, limit, offset, fields.as_deref())?;
         }
         CommentCommand::Add { reference, body } => {
             let id = provider.resolve_page_ref(&reference).await?;
@@ -1673,19 +2055,31 @@ async fn handle_property(
     provider: &dyn ConfluenceProvider,
     command: PropertyCommand,
     output: OutputFormat,
+    yes: bool,
 ) -> Result<()> {
     match command {
-        PropertyCommand::List { reference, fields } => {
+        PropertyCommand::List {
+            reference,
+            limit,
+            offset,
+            fields,
+        } => {
             let id = provider.resolve_page_ref(&reference).await?;
             let properties = provider.list_properties(&id).await?;
-            render_properties_list(&properties, output, fields.as_deref())?;
+            let (properties, total) = paginate(properties, limit, offset);
+            render_properties_list(&properties, output, total, limit, offset, fields.as_deref())?;
         }
         PropertyCommand::Get { reference, key } => {
             let id = provider.resolve_page_ref(&reference).await?;
             let property = provider.get_property(&id, &key).await?;
             match property {
                 Some(property) => render_properties(&[property], output)?,
-                None => bail!("property `{key}` not found"),
+                None => {
+                    return Err(crate::output::typed_error(
+                        "not_found",
+                        format!("property `{key}` not found"),
+                    ));
+                }
             }
         }
         PropertyCommand::Set {
@@ -1705,6 +2099,7 @@ async fn handle_property(
         }
         PropertyCommand::Delete { reference, key } => {
             let id = provider.resolve_page_ref(&reference).await?;
+            confirm_destructive(yes, &format!("Delete property `{key}` from page {id}?"))?;
             provider.delete_property(&id, &key).await?;
             print_status(
                 output,
@@ -1737,15 +2132,22 @@ fn read_body_text(input: &BodyInput) -> Result<String> {
         return fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()));
     }
-    bail!("missing body content; pass --body or --body-file")
+    Err(crate::output::typed_error_with_hint(
+        "invalid_input",
+        "missing body content",
+        "pass --body TEXT or --body-file PATH",
+    ))
 }
 
 fn parse_properties(values: &[String]) -> Result<BTreeMap<String, Value>> {
     let mut properties = BTreeMap::new();
     for item in values {
-        let (key, raw_value) = item
-            .split_once('=')
-            .ok_or_else(|| anyhow!("invalid property `{item}`; expected key=value"))?;
+        let (key, raw_value) = item.split_once('=').ok_or_else(|| {
+            crate::output::typed_error(
+                "invalid_input",
+                format!("invalid property `{item}`; expected key=value"),
+            )
+        })?;
         let value = serde_json::from_str(raw_value).unwrap_or(Value::String(raw_value.to_string()));
         properties.insert(key.to_string(), value);
     }
@@ -1927,6 +2329,12 @@ fn filter_fields_vec(items: Vec<Value>, fields: Option<&str>) -> Vec<Value> {
         .collect()
 }
 
+fn paginate<T>(items: Vec<T>, limit: usize, offset: usize) -> (Vec<T>, usize) {
+    let total = items.len();
+    let page = items.into_iter().skip(offset).take(limit).collect();
+    (page, total)
+}
+
 fn render_spaces_list(
     spaces: &[SpaceSummary],
     output: OutputFormat,
@@ -1963,18 +2371,23 @@ fn render_spaces_list(
 fn render_search_results_list(
     results: &[SearchResult],
     output: OutputFormat,
+    total: Option<usize>,
     limit: usize,
     offset: usize,
     fields: Option<&str>,
 ) -> Result<()> {
     if output.is_json() {
-        let total = results.len();
         let items: Vec<Value> = results
             .iter()
             .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
             .collect();
         let filtered = filter_fields_vec(items, fields);
-        print_items_json(&filtered, total, limit, offset)
+        print_json(&json!({
+            "items": filtered,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }))
     } else {
         let rows = results
             .iter()
@@ -2017,16 +2430,18 @@ fn render_content_items_list(
 fn render_attachments_list(
     items: &[AttachmentInfo],
     output: OutputFormat,
+    total: usize,
+    limit: usize,
+    offset: usize,
     fields: Option<&str>,
 ) -> Result<()> {
     if output.is_json() {
-        let total = items.len();
         let json_items: Vec<Value> = items
             .iter()
             .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
             .collect();
         let filtered = filter_fields_vec(json_items, fields);
-        print_items_json(&filtered, total, total, 0)
+        print_items_json(&filtered, total, limit, offset)
     } else {
         render_attachments(items, output)
     }
@@ -2035,16 +2450,18 @@ fn render_attachments_list(
 fn render_comments_list(
     items: &[CommentInfo],
     output: OutputFormat,
+    total: usize,
+    limit: usize,
+    offset: usize,
     fields: Option<&str>,
 ) -> Result<()> {
     if output.is_json() {
-        let total = items.len();
         let json_items: Vec<Value> = items
             .iter()
             .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
             .collect();
         let filtered = filter_fields_vec(json_items, fields);
-        print_items_json(&filtered, total, total, 0)
+        print_items_json(&filtered, total, limit, offset)
     } else {
         render_comments(items, output)
     }
@@ -2053,16 +2470,18 @@ fn render_comments_list(
 fn render_properties_list(
     items: &[ContentProperty],
     output: OutputFormat,
+    total: usize,
+    limit: usize,
+    offset: usize,
     fields: Option<&str>,
 ) -> Result<()> {
     if output.is_json() {
-        let total = items.len();
         let json_items: Vec<Value> = items
             .iter()
             .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
             .collect();
         let filtered = filter_fields_vec(json_items, fields);
-        print_items_json(&filtered, total, total, 0)
+        print_items_json(&filtered, total, limit, offset)
     } else {
         render_properties(items, output)
     }
@@ -2292,7 +2711,11 @@ fn confirm_destructive(yes: bool, prompt: &str) -> Result<()> {
     if input.trim().eq_ignore_ascii_case("y") {
         Ok(())
     } else {
-        bail!("aborted")
+        crate::output::print_error(
+            "confirmation_required",
+            "operation cancelled; no changes were made",
+            None,
+        )
     }
 }
 
@@ -2402,11 +2825,13 @@ mod tests {
                         reference,
                         attachment_id,
                         output,
+                        force,
                     },
             } => {
                 assert_eq!(reference, "REF");
                 assert_eq!(attachment_id, "ATT");
                 assert_eq!(output, std::path::PathBuf::from("/tmp/dest"));
+                assert!(!force);
             }
             other => panic!("expected `attachment download`, got {other:?}"),
         }
@@ -2419,5 +2844,103 @@ mod tests {
         assert_eq!(cli.output, OutputArg::Json);
         let cli = Cli::parse_from(["confluence", "-o", "text", "schema"]);
         assert_eq!(cli.output, OutputArg::Text);
+    }
+
+    #[test]
+    fn body_commands_parse_without_global_output_id_collisions() {
+        for args in [
+            vec![
+                "confluence",
+                "page",
+                "create",
+                "Title",
+                "SPACE",
+                "--body",
+                "text",
+            ],
+            vec!["confluence", "page", "update", "123", "--body", "text"],
+            vec![
+                "confluence",
+                "blog",
+                "create",
+                "Title",
+                "SPACE",
+                "--body",
+                "text",
+            ],
+            vec!["confluence", "blog", "update", "123", "--body", "text"],
+            vec!["confluence", "comment", "add", "123", "--body", "text"],
+            vec!["confluence", "comment", "update", "456", "--body", "text"],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|error| {
+                panic!("failed to parse {args:?}: {error}");
+            });
+        }
+    }
+
+    #[test]
+    fn body_and_body_file_conflict() {
+        let error = Cli::try_parse_from([
+            "confluence",
+            "page",
+            "create",
+            "Title",
+            "SPACE",
+            "--body",
+            "text",
+            "--body-file",
+            "page.md",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn page_tree_recursive_can_be_disabled() {
+        let cli = Cli::parse_from(["confluence", "page", "tree", "123", "--recursive", "false"]);
+        match cli.command {
+            Commands::Page {
+                command: PageCommand::Tree { recursive, .. },
+            } => assert!(!recursive),
+            other => panic!("expected page tree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_add_requires_an_explicit_name() {
+        let error = Cli::try_parse_from(["confluence", "profile", "add"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(error.to_string().contains("--name <NAME>"));
+    }
+
+    #[test]
+    fn every_public_command_and_argument_has_help() {
+        fn walk(command: &clap::Command) {
+            for subcommand in command
+                .get_subcommands()
+                .filter(|sub| sub.get_name() != "help")
+            {
+                assert!(
+                    subcommand.get_about().is_some(),
+                    "command `{}` is missing an about description",
+                    subcommand.get_name()
+                );
+                for argument in subcommand.get_arguments().filter(|arg| {
+                    arg.get_id() != "help" && !arg.is_hide_set() && !arg.is_global_set()
+                }) {
+                    assert!(
+                        argument.get_help().is_some(),
+                        "argument `{}` on `{}` is missing help",
+                        argument.get_id(),
+                        subcommand.get_name()
+                    );
+                }
+                walk(subcommand);
+            }
+        }
+        walk(&Cli::command());
     }
 }

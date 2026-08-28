@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -21,6 +21,13 @@ use crate::model::{
 pub mod cloud;
 pub mod datacenter;
 
+#[derive(Debug)]
+pub struct SearchPage {
+    pub items: Vec<SearchResult>,
+    /// Exact total reported by Confluence, when the deployment exposes it.
+    pub total: Option<usize>,
+}
+
 #[async_trait]
 pub trait ConfluenceProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
@@ -36,7 +43,7 @@ pub trait ConfluenceProvider: Send + Sync {
         cql: bool,
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<SearchResult>>;
+    ) -> Result<SearchPage>;
     async fn get_content(
         &self,
         kind: ContentKind,
@@ -171,7 +178,10 @@ impl HttpClient {
         if !status.is_success() {
             let raw = response.text().await.unwrap_or_default();
             let message = extract_error_message(&raw);
-            bail!("request to {url} failed with {status}: {message}");
+            return Err(crate::output::http_error(
+                status,
+                format!("request to {url} failed with {status}: {message}"),
+            ));
         }
         Ok(response.json::<T>().await?)
     }
@@ -186,7 +196,10 @@ impl HttpClient {
         if !status.is_success() {
             let raw = response.text().await.unwrap_or_default();
             let message = extract_error_message(&raw);
-            bail!("request to {url} failed with {status}: {message}");
+            return Err(crate::output::http_error(
+                status,
+                format!("request to {url} failed with {status}: {message}"),
+            ));
         }
         Ok(())
     }
@@ -199,7 +212,10 @@ impl HttpClient {
         if !status.is_success() {
             let raw = response.text().await.unwrap_or_default();
             let message = extract_error_message(&raw);
-            bail!("request to {url} failed with {status}: {message}");
+            return Err(crate::output::http_error(
+                status,
+                format!("request to {url} failed with {status}: {message}"),
+            ));
         }
         Ok(response.bytes().await?)
     }
@@ -308,6 +324,8 @@ fn retry_delay(attempt: usize, retry_after: Option<&HeaderValue>) -> Duration {
 pub struct Results<T> {
     pub results: Vec<T>,
     pub limit: Option<usize>,
+    #[serde(default, rename = "totalSize")]
+    pub total_size: Option<usize>,
     #[serde(default)]
     pub _links: Links,
 }
@@ -661,7 +679,10 @@ pub async fn resolve_reference_via_url_or_search(
                 return Ok(value);
             }
         }
-        bail!("could not extract a Confluence page ID from {reference}");
+        return Err(crate::output::typed_error(
+            "invalid_input",
+            format!("could not extract a Confluence page ID from {reference}"),
+        ));
     }
 
     if let Some((space_key, title)) = reference.split_once(':') {
@@ -674,12 +695,22 @@ pub async fn resolve_reference_via_url_or_search(
             .json(Method::GET, client.v1_url(&query), None)
             .await?;
         match results.results.len() {
-            0 => bail!("no page found for {reference}"),
+            0 => Err(crate::output::typed_error(
+                "not_found",
+                format!("no page found for {reference}"),
+            )),
             1 => Ok(results.results[0].id.clone()),
-            _ => bail!("multiple pages matched {reference}"),
+            _ => Err(crate::output::typed_error(
+                "conflict",
+                format!("multiple pages matched {reference}"),
+            )),
         }
     } else {
-        bail!("unsupported page reference `{reference}`; use an ID, URL, or SPACE:Title")
+        Err(crate::output::typed_error_with_hint(
+            "invalid_input",
+            format!("unsupported page reference `{reference}`"),
+            "use a numeric ID, Confluence URL, or SPACE:Title",
+        ))
     }
 }
 
@@ -687,9 +718,13 @@ pub fn build_search_cql(query: &str, cql: bool) -> String {
     if cql {
         query.to_string()
     } else {
-        let escaped = query.replace('"', "\\\"");
+        let escaped = escape_cql_literal(query);
         format!("text ~ \"{escaped}\" order by lastmodified desc")
     }
+}
+
+pub fn escape_cql_literal(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 pub fn normalize_properties(properties: Vec<ContentProperty>) -> BTreeMap<String, Value> {
@@ -721,10 +756,14 @@ fn extract_error_message(raw: &str) -> String {
 
 pub fn ensure_writable(profile: &ResolvedProfile) -> Result<()> {
     if profile.read_only {
-        bail!(
-            "profile `{}` is read-only; refusing to perform a write operation",
-            profile.name
-        );
+        return Err(crate::output::typed_error_with_hint(
+            "read_only",
+            format!(
+                "profile `{}` is read-only; refusing to perform a write operation",
+                profile.name
+            ),
+            "disable read-only mode for the active profile",
+        ));
     }
     Ok(())
 }
@@ -837,6 +876,12 @@ mod tests {
     fn search_cql_plain_text_escapes_quotes() {
         let cql = build_search_cql(r#"say "hi""#, false);
         assert_eq!(cql, r#"text ~ "say \"hi\"" order by lastmodified desc"#);
+    }
+
+    #[test]
+    fn search_cql_plain_text_escapes_backslashes() {
+        let cql = build_search_cql(r"docs\draft", false);
+        assert_eq!(cql, r#"text ~ "docs\\draft" order by lastmodified desc"#);
     }
 
     #[test]

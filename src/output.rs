@@ -16,6 +16,54 @@ static QUIET: AtomicBool = AtomicBool::new(false);
 static COLOR_DISABLED: AtomicBool = AtomicBool::new(false);
 static MACHINE_ERRORS: AtomicBool = AtomicBool::new(false);
 
+#[derive(Debug)]
+pub struct CliError {
+    pub kind: &'static str,
+    pub message: String,
+    pub hint: Option<String>,
+}
+
+impl Display for CliError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliError {}
+
+pub fn typed_error(kind: &'static str, message: impl Into<String>) -> anyhow::Error {
+    CliError {
+        kind,
+        message: message.into(),
+        hint: None,
+    }
+    .into()
+}
+
+pub fn typed_error_with_hint(
+    kind: &'static str,
+    message: impl Into<String>,
+    hint: impl Into<String>,
+) -> anyhow::Error {
+    CliError {
+        kind,
+        message: message.into(),
+        hint: Some(hint.into()),
+    }
+    .into()
+}
+
+pub fn http_error(status: reqwest::StatusCode, message: impl Into<String>) -> anyhow::Error {
+    let kind = match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => "auth",
+        reqwest::StatusCode::NOT_FOUND => "not_found",
+        reqwest::StatusCode::TOO_MANY_REQUESTS => "rate_limit",
+        reqwest::StatusCode::CONFLICT => "conflict",
+        _ => "api_error",
+    };
+    typed_error(kind, message)
+}
+
 pub fn configure(quiet: bool, no_color: bool, machine_errors: bool) {
     QUIET.store(quiet, Ordering::Relaxed);
     COLOR_DISABLED.store(no_color, Ordering::Relaxed);
@@ -85,6 +133,10 @@ pub fn print_items_json<T: Serialize>(
 }
 
 pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+    debug_assert!(
+        rows.iter().all(|row| row.len() == headers.len()),
+        "table rows must have the same number of cells as headers"
+    );
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
     table.set_header(headers.iter().map(|h| Cell::new(*h)).collect::<Vec<_>>());
@@ -139,49 +191,30 @@ pub fn render_error(kind: &str, message: &str, hint: Option<&str>, machine: bool
 
 pub fn render_anyhow(error: &anyhow::Error, machine: bool) -> i32 {
     let message = format!("{error:#}");
-    let lower = message.to_ascii_lowercase();
-    let (kind, hint) = if lower.contains("requires a terminal")
-        || lower.contains("interactive setup")
-        || lower.contains("non-interactive")
-    {
-        (
-            "tty_required",
-            Some("run the command in a terminal or use its documented non-interactive flags"),
-        )
-    } else if lower.contains("read-only") || lower.contains("read only") {
-        (
-            "read_only",
-            Some("disable read-only mode for the active profile"),
-        )
-    } else if lower.contains("not found") || lower.contains("not declared") || lower.contains("404")
-    {
-        ("not_found", None)
-    } else if lower.contains("unauthorized")
-        || lower.contains("authentication")
-        || lower.contains("credential")
-        || lower.contains("401")
-        || lower.contains("403")
-    {
-        (
-            "auth",
-            Some("run `confluence doctor` to verify the active profile"),
-        )
-    } else if lower.contains("rate limit") || lower.contains("429") {
-        ("rate_limit", Some("wait and retry the same command"))
-    } else if lower.contains("conflict")
-        || lower.contains("version mismatch")
-        || lower.contains("409")
-    {
-        ("conflict", None)
-    } else if lower.contains("http") || lower.contains("request") || lower.contains("network") {
-        (
-            "api_error",
-            Some("run `confluence doctor` to check connectivity"),
-        )
-    } else {
-        ("unexpected_error", None)
-    };
-    render_error(kind, &message, hint, machine)
+    for cause in error.chain() {
+        if let Some(typed) = cause.downcast_ref::<CliError>() {
+            return render_error(typed.kind, &message, typed.hint.as_deref(), machine);
+        }
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>() {
+            let kind = if request.is_connect() || request.is_timeout() {
+                "network"
+            } else {
+                "api_error"
+            };
+            return render_error(
+                kind,
+                &message,
+                Some("run `confluence doctor` to check connectivity"),
+                machine,
+            );
+        }
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>()
+            && io_error.kind() == std::io::ErrorKind::NotFound
+        {
+            return render_error("not_found", &message, None, machine);
+        }
+    }
+    render_error("unexpected_error", &message, None, machine)
 }
 
 pub fn machine_readable_errors<I>(args: I, stdout_is_terminal: bool) -> bool
@@ -193,11 +226,15 @@ where
         .into_iter()
         .map(|arg| arg.as_ref().to_owned())
         .collect::<Vec<_>>();
-    let explicit_text = args.windows(2).any(|pair| pair == ["--output", "text"])
+    let explicit_text = args
+        .windows(2)
+        .any(|pair| pair == ["--output", "text"] || pair == ["-o", "text"])
         || args
             .iter()
             .any(|arg| arg == "--output=text" || arg == "-otext");
-    let explicit_json = args.windows(2).any(|pair| pair == ["--output", "json"])
+    let explicit_json = args
+        .windows(2)
+        .any(|pair| pair == ["--output", "json"] || pair == ["-o", "json"])
         || args
             .iter()
             .any(|arg| arg == "--output=json" || arg == "-ojson" || arg == "--json");

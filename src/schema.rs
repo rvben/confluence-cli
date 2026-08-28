@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use std::any::TypeId;
 
 fn arg_to_json(arg: &clap::Arg) -> Value {
     let mut obj = serde_json::Map::new();
@@ -13,9 +14,16 @@ fn arg_to_json(arg: &clap::Arg) -> Value {
     };
     obj.insert("name".into(), json!(name));
 
-    let is_bool = !arg.get_action().takes_values();
+    let value_type = arg.get_value_parser().type_id();
+    let is_bool = !arg.get_action().takes_values() || value_type == TypeId::of::<bool>();
     if is_bool {
         obj.insert("type".into(), json!("boolean"));
+    } else if value_type == TypeId::of::<usize>()
+        || value_type == TypeId::of::<u64>()
+        || value_type == TypeId::of::<u32>()
+        || value_type == TypeId::of::<i64>()
+    {
+        obj.insert("type".into(), json!("integer"));
     } else {
         let possible: Vec<String> = arg
             .get_possible_values()
@@ -34,7 +42,9 @@ fn arg_to_json(arg: &clap::Arg) -> Value {
         obj.insert("description".into(), json!(help));
     }
 
-    if arg.is_positional() {
+    if arg.is_required_set() {
+        obj.insert("required".into(), json!(true));
+    } else if arg.is_positional() {
         obj.insert("required".into(), json!(arg.is_required_set()));
     }
 
@@ -43,14 +53,6 @@ fn arg_to_json(arg: &clap::Arg) -> Value {
     }
 
     Value::Object(obj)
-}
-
-fn make_extra_arg(name: &str, typ: &str, description: &str) -> Value {
-    json!({
-        "name": name,
-        "type": typ,
-        "description": description,
-    })
 }
 
 fn is_mutating(path: &str) -> bool {
@@ -62,16 +64,51 @@ fn is_mutating(path: &str) -> bool {
     mutating_verbs.contains(&last_word)
 }
 
+fn effect_kind(path: &str) -> &'static str {
+    if matches!(
+        path,
+        "pull page" | "pull tree" | "pull space" | "attachment download"
+    ) {
+        "local_write"
+    } else if is_mutating(path) {
+        "remote_or_config_write"
+    } else {
+        "read_only"
+    }
+}
+
+fn is_destructive(path: &str) -> bool {
+    matches!(
+        path,
+        "auth logout"
+            | "profile remove"
+            | "page delete"
+            | "blog delete"
+            | "attachment delete"
+            | "label remove"
+            | "comment delete"
+            | "property delete"
+    )
+}
+
+fn is_idempotent(path: &str) -> bool {
+    !is_mutating(path)
+        || matches!(
+            path,
+            "profile use" | "label add" | "label remove" | "property set" | "property delete"
+        )
+}
+
 fn output_fields_for(path: &str) -> Vec<Value> {
     let content_fields = || {
         vec![
             json!({"name": "id", "type": "string"}),
             json!({"name": "kind", "type": "string"}),
-            json!({"name": "space_key", "type": "string"}),
+            json!({"name": "space_key", "type": "string|null"}),
             json!({"name": "title", "type": "string"}),
             json!({"name": "status", "type": "string"}),
-            json!({"name": "version", "type": "integer"}),
-            json!({"name": "parent_id", "type": "string"}),
+            json!({"name": "version", "type": "integer|null"}),
+            json!({"name": "parent_id", "type": "string|null"}),
         ]
     };
 
@@ -79,50 +116,69 @@ fn output_fields_for(path: &str) -> Vec<Value> {
         "page get" | "page list" | "page tree" | "page move" | "page create" | "page update"
         | "blog get" | "blog list" | "blog create" | "blog update" => content_fields(),
 
-        "page delete" | "blog delete" | "attachment delete" | "comment delete"
-        | "property delete" | "label remove" => {
+        "page delete" | "blog delete" => {
             vec![
                 json!({"name": "id", "type": "string"}),
                 json!({"name": "deleted", "type": "boolean"}),
             ]
         }
 
+        "attachment delete" => vec![
+            json!({"name": "attachment_id", "type": "string"}),
+            json!({"name": "deleted", "type": "boolean"}),
+        ],
+
+        "comment delete" => vec![
+            json!({"name": "comment_id", "type": "string"}),
+            json!({"name": "deleted", "type": "boolean"}),
+        ],
+
+        "property delete" => vec![
+            json!({"name": "key", "type": "string"}),
+            json!({"name": "deleted", "type": "boolean"}),
+        ],
+
+        "label remove" => vec![
+            json!({"name": "label", "type": "string"}),
+            json!({"name": "removed", "type": "boolean"}),
+        ],
+
         "space list" | "space get" => vec![
             json!({"name": "id", "type": "string"}),
             json!({"name": "key", "type": "string"}),
             json!({"name": "name", "type": "string"}),
-            json!({"name": "type", "type": "string"}),
-            json!({"name": "homepage_id", "type": "string"}),
+            json!({"name": "space_type", "type": "string|null"}),
+            json!({"name": "homepage_id", "type": "string|null"}),
         ],
 
         "search" => vec![
             json!({"name": "id", "type": "string"}),
             json!({"name": "kind", "type": "string"}),
-            json!({"name": "space_key", "type": "string"}),
+            json!({"name": "space_key", "type": "string|null"}),
             json!({"name": "title", "type": "string"}),
-            json!({"name": "web_url", "type": "string"}),
+            json!({"name": "web_url", "type": "string|null"}),
         ],
 
         "attachment list" | "attachment upload" => vec![
             json!({"name": "id", "type": "string"}),
             json!({"name": "title", "type": "string"}),
-            json!({"name": "media_type", "type": "string"}),
-            json!({"name": "file_size", "type": "integer"}),
-            json!({"name": "download_url", "type": "string"}),
+            json!({"name": "media_type", "type": "string|null"}),
+            json!({"name": "file_size", "type": "integer|null"}),
+            json!({"name": "download_url", "type": "string|null"}),
         ],
 
         "comment list" | "comment add" | "comment update" => vec![
             json!({"name": "id", "type": "string"}),
-            json!({"name": "author", "type": "string"}),
-            json!({"name": "created_at", "type": "string"}),
+            json!({"name": "author", "type": "string|null"}),
+            json!({"name": "created_at", "type": "string|null"}),
             json!({"name": "body_storage", "type": "string"}),
         ],
 
         "property list" | "property get" | "property set" => vec![
-            json!({"name": "id", "type": "string"}),
+            json!({"name": "id", "type": "string|null"}),
             json!({"name": "key", "type": "string"}),
-            json!({"name": "version", "type": "integer"}),
-            json!({"name": "value", "type": "string"}),
+            json!({"name": "version", "type": "integer|null"}),
+            json!({"name": "value", "type": "json"}),
         ],
 
         "auth login" | "profile add" => vec![
@@ -131,9 +187,9 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "base_url", "type": "string"}),
             json!({"name": "api_path", "type": "string"}),
             json!({"name": "credential_store", "type": "string"}),
-            json!({"name": "cloud_id", "type": "string"}),
+            json!({"name": "cloud_id", "type": "string|null"}),
             json!({"name": "token_kind", "type": "string"}),
-            json!({"name": "expires_at", "type": "string"}),
+            json!({"name": "expires_at", "type": "string|null"}),
             json!({"name": "read_only", "type": "boolean"}),
         ],
 
@@ -143,9 +199,9 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "base_url", "type": "string"}),
             json!({"name": "api_path", "type": "string"}),
             json!({"name": "credential_store", "type": "string"}),
-            json!({"name": "cloud_id", "type": "string"}),
+            json!({"name": "cloud_id", "type": "string|null"}),
             json!({"name": "token_kind", "type": "string"}),
-            json!({"name": "expires_at", "type": "string"}),
+            json!({"name": "expires_at", "type": "string|null"}),
             json!({"name": "expiration_status", "type": "string"}),
             json!({"name": "read_only", "type": "boolean"}),
         ],
@@ -166,8 +222,8 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "configExists", "type": "boolean"}),
             json!({"name": "cloudTokenUrl", "type": "string"}),
             json!({"name": "dcPatDocs", "type": "string"}),
-            json!({"name": "envVars", "type": "string"}),
-            json!({"name": "example", "type": "string"}),
+            json!({"name": "envVars", "type": "object"}),
+            json!({"name": "example", "type": "object"}),
         ],
 
         "profile list" => vec![
@@ -177,22 +233,31 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "api_path", "type": "string"}),
             json!({"name": "credential_store", "type": "string"}),
             json!({"name": "token_kind", "type": "string"}),
-            json!({"name": "expires_at", "type": "string"}),
+            json!({"name": "expires_at", "type": "string|null"}),
             json!({"name": "read_only", "type": "boolean"}),
             json!({"name": "active", "type": "boolean"}),
         ],
 
-        // profile use and profile remove only emit eprintln! (no JSON output)
+        "profile use" => vec![
+            json!({"name": "profile", "type": "string"}),
+            json!({"name": "active", "type": "boolean"}),
+        ],
+
+        "profile remove" => vec![
+            json!({"name": "profile", "type": "string"}),
+            json!({"name": "removed", "type": "boolean"}),
+        ],
+
         "pull page" | "pull tree" | "pull space" => vec![json!({"name": "path", "type": "string"})],
 
         "doctor" => vec![
             json!({"name": "config_path", "type": "string"}),
             json!({"name": "config_exists", "type": "boolean"}),
-            json!({"name": "active_profile", "type": "string"}),
+            json!({"name": "active_profile", "type": "string|null"}),
             json!({"name": "stored_profiles", "type": "integer"}),
-            json!({"name": "resolved_profile", "type": "string"}),
-            json!({"name": "checks", "type": "string"}),
-            json!({"name": "summary", "type": "string"}),
+            json!({"name": "resolved_profile", "type": "object|null"}),
+            json!({"name": "checks", "type": "array"}),
+            json!({"name": "summary", "type": "object"}),
         ],
 
         "attachment download" => vec![
@@ -212,7 +277,7 @@ fn output_fields_for(path: &str) -> Vec<Value> {
         "plan" | "apply" => vec![
             json!({"name": "action", "type": "string"}),
             json!({"name": "title", "type": "string"}),
-            json!({"name": "content_id", "type": "string"}),
+            json!({"name": "content_id", "type": "string|null"}),
             json!({"name": "path", "type": "string"}),
             json!({"name": "details", "type": "string"}),
         ],
@@ -236,7 +301,14 @@ const LIST_COMMANDS: &[&str] = &[
 
 fn walk_commands(cmd: &clap::Command, prefix: &str, out: &mut Vec<Value>) {
     let global_ids = [
-        "help", "version", "output", "json", "profile", "quiet", "no_color", "yes",
+        "help",
+        "version",
+        "output_format",
+        "json",
+        "profile",
+        "quiet",
+        "no_color",
+        "yes",
     ];
 
     for sub in cmd.get_subcommands() {
@@ -264,34 +336,6 @@ fn walk_commands(cmd: &clap::Command, prefix: &str, out: &mut Vec<Value>) {
                 args.push(arg_to_json(arg));
             }
 
-            // Inject list-command pagination flags when not already present
-            if LIST_COMMANDS.contains(&path.as_str()) {
-                let has_limit = args.iter().any(|a| a["name"] == "--limit");
-                let has_offset = args.iter().any(|a| a["name"] == "--offset");
-                let has_fields = args.iter().any(|a| a["name"] == "--fields");
-                if !has_limit {
-                    args.push(make_extra_arg(
-                        "--limit",
-                        "integer",
-                        "Maximum number of items to return",
-                    ));
-                }
-                if !has_offset {
-                    args.push(make_extra_arg(
-                        "--offset",
-                        "integer",
-                        "Number of items to skip",
-                    ));
-                }
-                if !has_fields {
-                    args.push(make_extra_arg(
-                        "--fields",
-                        "string",
-                        "Comma-separated list of fields to include in JSON output",
-                    ));
-                }
-            }
-
             let mut entry = serde_json::Map::new();
             entry.insert("name".into(), json!(path));
 
@@ -305,14 +349,10 @@ fn walk_commands(cmd: &clap::Command, prefix: &str, out: &mut Vec<Value>) {
             }
 
             entry.insert("mutating".into(), json!(is_mutating(&path)));
-            entry.insert(
-                "effects".into(),
-                json!(if is_mutating(&path) {
-                    "non_idempotent"
-                } else {
-                    "read_only"
-                }),
-            );
+            entry.insert("effects".into(), json!(effect_kind(&path)));
+            entry.insert("idempotent".into(), json!(is_idempotent(&path)));
+            entry.insert("destructive".into(), json!(is_destructive(&path)));
+            entry.insert("requires_confirmation".into(), json!(is_destructive(&path)));
 
             if !args.is_empty() {
                 entry.insert("args".into(), json!(args));
@@ -334,6 +374,7 @@ pub fn generate(cmd: &clap::Command) -> Value {
 
     let mut document = json!({
         "clispec": "0.3",
+        "response_contract": "1",
         "name": "confluence",
         "version": env!("CARGO_PKG_VERSION"),
         "description": "Markdown-sync-first Confluence CLI in Rust",
@@ -394,6 +435,12 @@ pub fn generate(cmd: &clap::Command) -> Value {
                 "description": "A destructive operation requires confirmation. Re-run with --yes to confirm."
             },
             {
+                "kind": "read_only",
+                "exit_code": 2,
+                "retryable": false,
+                "description": "The selected profile forbids write operations."
+            },
+            {
                 "kind": "auth",
                 "exit_code": 3,
                 "retryable": false,
@@ -410,6 +457,12 @@ pub fn generate(cmd: &clap::Command) -> Value {
                 "exit_code": 5,
                 "retryable": false,
                 "description": "Confluence returned an API error."
+            },
+            {
+                "kind": "network",
+                "exit_code": 5,
+                "retryable": true,
+                "description": "A connection or timeout failure prevented the request."
             },
             {
                 "kind": "rate_limit",
@@ -466,6 +519,35 @@ fn enrich_v03(document: &mut Value) {
                 json!({"style":"offset","limit_arg":"--limit","offset_arg":"--offset"}),
             );
             object.insert("fields_arg".into(), json!("--fields"));
+            object.insert(
+                "output_envelope".into(),
+                json!({
+                    "items": "array",
+                    "total": if name == "search" { "integer|null" } else { "integer" },
+                    "limit": "integer",
+                    "offset": "integer"
+                }),
+            );
+        }
+        if name == "apply" {
+            object.insert("destructive_when".into(), json!(["--delete-remote"]));
+            object.insert(
+                "requires_confirmation_when".into(),
+                json!(["--delete-remote"]),
+            );
+        }
+        if name == "attachment upload" {
+            object.insert("destructive_when".into(), json!(["--replace"]));
+            object.insert("partial_success_possible".into(), json!(true));
+        }
+        if matches!(
+            name.as_str(),
+            "page create" | "page update" | "page move" | "blog create" | "blog update"
+        ) {
+            object.insert("partial_success_possible".into(), json!(true));
+        }
+        if name == "attachment download" {
+            object.insert("overwrites_when".into(), json!(["--force"]));
         }
         if name == "profile list" {
             object.insert("example".into(), json!({"args":["profile","list"]}));
@@ -502,10 +584,12 @@ pub fn print_schema(command_filter: Option<&str>) -> bool {
         || schema["commands"]
             .as_array()
             .is_some_and(|commands| !commands.is_empty());
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&schema).expect("serialize schema")
-    );
+    if found {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&schema).expect("serialize schema")
+        );
+    }
     found
 }
 
@@ -575,6 +659,116 @@ mod tests {
                 "error {} missing exit_code",
                 err["kind"]
             );
+        }
+    }
+
+    #[test]
+    fn schema_has_no_generated_placeholder_descriptions() {
+        let schema = generate(&test_cmd());
+        for command in schema["commands"].as_array().unwrap() {
+            let description = command["description"].as_str().unwrap_or_default();
+            assert!(
+                !description.starts_with("Run the ") && !description.trim().is_empty(),
+                "command {} has placeholder documentation",
+                command["name"]
+            );
+            for argument in command["args"].as_array().into_iter().flatten() {
+                assert!(
+                    argument.get("description").is_some(),
+                    "argument {} on {} lacks a description",
+                    argument["name"],
+                    command["name"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn list_schema_uses_only_real_clap_arguments() {
+        let schema = generate(&test_cmd());
+        for command in schema["commands"].as_array().unwrap() {
+            let name = command["name"].as_str().unwrap();
+            if !LIST_COMMANDS.contains(&name) {
+                continue;
+            }
+            let argument_names = command["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|argument| argument["name"].as_str())
+                .collect::<Vec<_>>();
+            for required in ["--limit", "--offset", "--fields"] {
+                assert!(
+                    argument_names.contains(&required),
+                    "{name} lacks real {required} support"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delete_and_remove_output_contracts_match_runtime_keys() {
+        let schema = generate(&test_cmd());
+        let fields = |name: &str| {
+            schema["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|command| command["name"] == name)
+                .unwrap()["output_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|field| field["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fields("attachment delete"), ["attachment_id", "deleted"]);
+        assert_eq!(fields("comment delete"), ["comment_id", "deleted"]);
+        assert_eq!(fields("property delete"), ["key", "deleted"]);
+        assert_eq!(fields("label remove"), ["label", "removed"]);
+    }
+
+    #[test]
+    fn schema_versions_response_contract_and_declares_runtime_errors() {
+        let schema = generate(&test_cmd());
+        assert_eq!(schema["response_contract"], "1");
+        let kinds = schema["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|error| error["kind"].as_str())
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"read_only"));
+        assert!(kinds.contains(&"network"));
+    }
+
+    #[test]
+    fn schema_preserves_required_options_and_numeric_argument_types() {
+        let schema = generate(&test_cmd());
+        let command = |name: &str| {
+            schema["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|command| command["name"] == name)
+                .unwrap()
+        };
+        let profile_name = command("profile add")["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|argument| argument["name"] == "--name")
+            .unwrap();
+        assert_eq!(profile_name["required"], true);
+
+        for argument_name in ["--limit", "--offset"] {
+            let argument = command("attachment list")["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|argument| argument["name"] == argument_name)
+                .unwrap();
+            assert_eq!(argument["type"], "integer");
         }
     }
 }
