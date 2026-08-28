@@ -110,6 +110,10 @@ jobs:
         if: ${{ inputs.skip_crates_io == true }}
         run: echo "Skipping crates.io publishing as requested"
 
+      - name: Remove package staging before cache save
+        if: ${{ always() }}
+        run: rm -rf target/package
+
   build:
     needs: verify
     strategy:
