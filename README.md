@@ -128,7 +128,9 @@ Pulls are staged beside the destination and installed as one snapshot. A pull
 refuses to replace local Markdown changes or unmanaged files; inspect and apply
 or preserve those files first. Use `--force` only when the remote snapshot
 should replace the entire destination. Attachment names are confined to their
-page's `attachments/` directory.
+page's `attachments/` directory. Filtered `pull space --since ...` exports must
+use a new or empty destination, because partial results cannot safely replace a
+complete local snapshot.
 
 Inspect the planned changes:
 
@@ -155,7 +157,7 @@ Local content is stored as:
 - `<slug>/.confluence.json`
 - `<slug>/attachments/*`
 
-The frontmatter carries editable metadata like `title`, `type`, `labels`, `status`, `parent`, and `properties`. The sidecar stores remote ids, versions, hashes, and attachment mappings used for safe sync and drift detection.
+The frontmatter carries editable metadata such as `title`, `type`, `labels`, `status`, and `properties`. `parent` is informational: move a page directory beneath its desired local parent to reparent it. The sidecar stores remote ids, versions, hashes, and attachment mappings used for safe sync and drift detection.
 
 ## `doctor`
 

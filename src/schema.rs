@@ -288,12 +288,21 @@ fn output_fields_for(path: &str) -> Vec<Value> {
 
         // completions: outputs shell completion scripts (unstructured text, not records)
         // schema: outputs the schema itself (not a structured record)
-        "plan" | "apply" => vec![
+        "apply" => vec![
             json!({"name": "action", "type": "string"}),
             json!({"name": "title", "type": "string"}),
             json!({"name": "content_id", "type": "string|null"}),
             json!({"name": "path", "type": "string"}),
             json!({"name": "details", "type": "string"}),
+        ],
+
+        "plan" => vec![
+            json!({"name": "action", "type": "string"}),
+            json!({"name": "title", "type": "string"}),
+            json!({"name": "content_id", "type": "string|null"}),
+            json!({"name": "path", "type": "string"}),
+            json!({"name": "details", "type": "string"}),
+            json!({"name": "diff", "type": "string", "optional": true}),
         ],
 
         _ => vec![],
@@ -562,6 +571,20 @@ fn enrich_v03(document: &mut Value) {
             object.insert("idempotent".into(), json!(false));
             object.insert("overwrites_when".into(), json!(["--force"]));
             object.insert("destructive_when".into(), json!(["--force"]));
+            object.insert("pagination".into(), json!({"style":"none"}));
+            object.insert(
+                "output_envelope".into(),
+                json!({
+                    "items": "array",
+                    "total": "integer",
+                    "limit": "integer",
+                    "offset": "integer"
+                }),
+            );
+        }
+        if matches!(name.as_str(), "plan" | "apply") {
+            object.insert("pagination".into(), json!({"style":"none"}));
+            object.insert("output_envelope".into(), json!({"items":"array"}));
         }
         if matches!(
             name.as_str(),
@@ -836,6 +859,66 @@ mod tests {
         assert_eq!(
             command("attachment upload")["requires_confirmation_when"],
             json!(["--replace"])
+        );
+    }
+
+    #[test]
+    fn schema_declares_non_pageable_collection_envelopes() {
+        let schema = generate(&test_cmd());
+        let command = |name: &str| {
+            schema["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|command| command["name"] == name)
+                .unwrap()
+        };
+
+        for name in ["pull page", "pull tree", "pull space"] {
+            let entry = command(name);
+            assert_eq!(entry["cardinality"], "bounded");
+            assert_eq!(entry["pagination"], json!({"style":"none"}));
+            assert_eq!(
+                entry["output_envelope"],
+                json!({
+                    "items": "array",
+                    "total": "integer",
+                    "limit": "integer",
+                    "offset": "integer"
+                })
+            );
+        }
+
+        for name in ["plan", "apply"] {
+            let entry = command(name);
+            assert_eq!(entry["cardinality"], "bounded");
+            assert_eq!(entry["pagination"], json!({"style":"none"}));
+            assert_eq!(entry["output_envelope"], json!({"items":"array"}));
+        }
+    }
+
+    #[test]
+    fn plan_schema_declares_optional_diff_field() {
+        let schema = generate(&test_cmd());
+        let commands = schema["commands"].as_array().unwrap();
+        let fields = |name: &str| {
+            commands
+                .iter()
+                .find(|command| command["name"] == name)
+                .unwrap()["output_fields"]
+                .as_array()
+                .unwrap()
+        };
+
+        let diff = fields("plan")
+            .iter()
+            .find(|field| field["name"] == "diff")
+            .expect("plan should declare its optional diff field");
+        assert_eq!(diff["type"], "string");
+        assert_eq!(diff["optional"], true);
+        assert!(
+            fields("apply").iter().all(|field| field["name"] != "diff"),
+            "apply never emits diffs"
         );
     }
 

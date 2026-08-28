@@ -215,3 +215,73 @@ fn piped_auto_init_emits_machine_readable_setup_instructions() {
     assert!(document["envVars"].is_object());
     assert!(output.stderr.is_empty());
 }
+
+#[test]
+fn bare_noninteractive_auth_login_requires_a_tty() {
+    for args in [
+        vec!["auth", "login"],
+        vec!["--output", "json", "auth", "login"],
+    ] {
+        let output = confluence(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "unexpected status for {args:?}"
+        );
+        assert!(output.stdout.is_empty());
+        let error: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("structured tty error");
+        assert_eq!(error["error"]["kind"], "tty_required");
+        assert!(
+            error["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("--non-interactive")
+        );
+    }
+}
+
+#[test]
+fn no_op_updates_fail_before_profile_resolution() {
+    for args in [
+        ["--output", "json", "page", "update", "123"],
+        ["--output", "json", "blog", "update", "456"],
+    ] {
+        let output = confluence(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "unexpected status for {args:?}"
+        );
+        assert!(output.stdout.is_empty());
+        let error: serde_json::Value =
+            serde_json::from_slice(&output.stderr).expect("structured invalid-input error");
+        assert_eq!(error["error"]["kind"], "invalid_input");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("at least one requested change")
+        );
+    }
+}
+
+#[test]
+fn doctor_text_output_is_readable_in_a_standard_terminal() {
+    let output = confluence(&[
+        "--output",
+        "text",
+        "doctor",
+        "--skip-network",
+        "--profile",
+        "missing",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Configuration:"));
+    assert!(stdout.contains("Checks:"));
+    assert!(
+        stdout.lines().all(|line| line.chars().count() <= 100),
+        "doctor output exceeded 100 columns:\n{stdout}"
+    );
+}

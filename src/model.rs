@@ -99,6 +99,9 @@ pub struct SearchResult {
 pub struct AttachmentInfo {
     pub id: String,
     pub title: String,
+    /// Remote attachment version, when exposed by the provider.
+    #[serde(default)]
+    pub version: Option<u64>,
     pub media_type: Option<String>,
     pub file_size: Option<u64>,
     pub download_url: Option<String>,
@@ -152,6 +155,9 @@ pub struct UpdateContentRequest {
 pub struct AttachmentState {
     pub id: String,
     pub file_name: String,
+    /// Remote version captured when the attachment was last synchronized.
+    #[serde(default)]
+    pub remote_version: Option<u64>,
     pub media_type: Option<String>,
     pub sha256: Option<String>,
 }

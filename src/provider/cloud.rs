@@ -146,6 +146,7 @@ impl CloudProvider {
         AttachmentInfo {
             id: attachment.id,
             title: attachment.title,
+            version: attachment.version.map(|version| version.number),
             media_type: attachment
                 .metadata
                 .as_ref()
@@ -527,7 +528,7 @@ impl ConfluenceProvider for CloudProvider {
     async fn list_attachments(&self, content_id: &str) -> Result<Vec<AttachmentInfo>> {
         Ok(fetch_all_v1::<V1Attachment>(
             &self.http,
-            &format!("/content/{content_id}/child/attachment?limit=200&expand=metadata,extensions"),
+            &format!("/content/{content_id}/child/attachment?limit=200&expand=metadata,extensions,version"),
         )
         .await?
         .into_iter()

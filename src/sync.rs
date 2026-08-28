@@ -80,6 +80,7 @@ pub async fn pull_space_since(
     force: bool,
 ) -> Result<Vec<PathBuf>> {
     validate_pull_destination(root, force)?;
+    validate_filtered_pull_destination(root)?;
     let space = crate::provider::escape_cql_literal(space);
     let since = crate::provider::escape_cql_literal(since);
     let cql = format!(r#"space = "{space}" AND lastModified > "{since}""#);
@@ -119,6 +120,7 @@ pub fn plan_path(
 
     let mut plan = SyncPlan::default();
     for doc in docs {
+        validate_informational_parent(&doc)?;
         let storage = render_body_storage(
             &doc,
             &link_index,
@@ -270,6 +272,79 @@ fn properties_hash(properties: &BTreeMap<String, serde_json::Value>) -> String {
     sha256_hex(serialized.as_bytes())
 }
 
+fn validate_informational_parent(doc: &LocalDocument) -> Result<()> {
+    if let Some(previous) = &doc.sidecar.last_pulled_parent
+        && previous != &doc.frontmatter.parent
+    {
+        return Err(crate::output::typed_error_with_hint(
+            crate::output::ErrorKind::InvalidInput,
+            format!(
+                "frontmatter parent is informational and was edited in {}",
+                doc.markdown_path.display()
+            ),
+            "restore the pulled parent value and move the page directory beneath its desired local parent before applying",
+        ));
+    }
+    Ok(())
+}
+
+fn normalized_labels(labels: &[String]) -> BTreeSet<&str> {
+    labels.iter().map(String::as_str).collect()
+}
+
+fn desired_status(status: &str) -> &str {
+    if status.is_empty() { "current" } else { status }
+}
+
+fn remote_metadata_drift(doc: &LocalDocument, remote: &ContentItem) -> Vec<&'static str> {
+    let mut drift = Vec::new();
+    // Metadata endpoints do not consistently bump the content version, so use
+    // the pulled values as a three-way-merge base. A matching local/remote
+    // value is safe even when both changed independently to the same value.
+    if doc.sidecar.last_pulled_title.is_some()
+        && normalized_labels(&remote.labels) != normalized_labels(&doc.sidecar.last_pulled_labels)
+        && normalized_labels(&remote.labels) != normalized_labels(&doc.frontmatter.labels)
+    {
+        drift.push("labels");
+    }
+    if let Some(base) = doc.sidecar.last_pulled_status.as_deref()
+        && remote.status != base
+        && remote.status != desired_status(&doc.frontmatter.status)
+    {
+        drift.push("status");
+    }
+    if let Some(base_hash) = doc.sidecar.last_pulled_properties_hash.as_deref()
+        && properties_hash(&remote.properties) != base_hash
+        && remote.properties != doc.frontmatter.properties
+    {
+        drift.push("properties");
+    }
+    drift
+}
+
+fn metadata_needs_update(doc: &LocalDocument, remote: &ContentItem) -> bool {
+    remote.title != doc.frontmatter.title
+        || remote.status != desired_status(&doc.frontmatter.status)
+        || normalized_labels(&remote.labels) != normalized_labels(&doc.frontmatter.labels)
+        || remote.properties != doc.frontmatter.properties
+}
+
+fn take_create_properties(frontmatter: &mut Frontmatter) -> BTreeMap<String, serde_json::Value> {
+    let mut properties = frontmatter.properties.clone();
+    properties.remove("space_key");
+    frontmatter.properties.remove("space_key");
+    properties
+}
+
+fn attachment_bytes_conflict(
+    base_hash: Option<&str>,
+    local_hash: Option<&String>,
+    remote_hash: &str,
+) -> bool {
+    base_hash.is_some_and(|base| base != remote_hash)
+        && local_hash.is_none_or(|local| local != remote_hash)
+}
+
 /// Build a unified diff between the last-pulled markdown body and the current one.
 fn compute_body_diff(sidecar: &Sidecar, current_body: &str) -> String {
     let old_body = sidecar
@@ -306,6 +381,7 @@ pub async fn apply_path(
     // against drift that happens after this preflight.
     let mut preflight_remotes = BTreeMap::new();
     for doc in &docs {
+        validate_informational_parent(doc)?;
         render_body_storage(doc, &link_index, allow_lossy, web_path_prefix.as_str())?;
         derive_parent_id_from_fs(&doc.directory, &doc.sidecar)?;
         local_attachment_hashes(&doc.directory)?;
@@ -313,8 +389,19 @@ pub async fn apply_path(
             let remote = provider
                 .get_content(doc.frontmatter.content_kind(), content_id, false)
                 .await?;
-            if !force && doc.sidecar.remote_version != remote.version {
-                return Err(remote_drift_error(doc, content_id, remote.version));
+            if !force {
+                if doc.sidecar.remote_version != remote.version {
+                    return Err(remote_drift_error(doc, content_id, remote.version));
+                }
+                let metadata_drift = remote_metadata_drift(doc, &remote);
+                if !metadata_drift.is_empty() {
+                    return Err(remote_metadata_drift_error(
+                        doc,
+                        content_id,
+                        &metadata_drift,
+                    ));
+                }
+                validate_remote_attachment_drift(provider, doc, content_id, delete_remote).await?;
             }
             preflight_remotes.insert(content_id.clone(), remote);
         } else {
@@ -365,9 +452,7 @@ pub async fn apply_path(
             })?;
             let needs_update = body_changed(&doc.sidecar, &markdown_hash, &storage_hash)
                 || doc.sidecar.remote_parent_id != derived_parent_id
-                || remote.title != title
-                || remote.labels != doc.frontmatter.labels
-                || remote.properties != doc.frontmatter.properties;
+                || metadata_needs_update(doc, &remote);
             if needs_update {
                 let version = remote.version.ok_or_else(|| {
                     crate::output::typed_error(
@@ -384,11 +469,7 @@ pub async fn apply_path(
                         body_storage: body_storage.clone(),
                         version,
                         message: Some("Updated via confluence-cli".to_string()),
-                        status: if doc.frontmatter.status.is_empty() {
-                            "current".to_string()
-                        } else {
-                            doc.frontmatter.status.clone()
-                        },
+                        status: desired_status(&doc.frontmatter.status).to_string(),
                         labels: doc.frontmatter.labels.clone(),
                         properties: doc.frontmatter.properties.clone(),
                     })
@@ -416,8 +497,11 @@ pub async fn apply_path(
             // Strip the space_key bootstrap property — it is a local-only
             // sentinel used to specify the target space for new pages and must
             // not be written as a Confluence page property.
-            let mut create_properties = doc.frontmatter.properties.clone();
-            create_properties.remove("space_key");
+            let create_properties = take_create_properties(&mut doc.frontmatter);
+            // `space_key` is only a bootstrap hint for a new local document.
+            // Once an ID exists the sidecar owns the space association, so
+            // remove the hint before any later reconciliation update can leak
+            // it into Confluence as a content property.
             let created = provider
                 .create_content(&crate::model::CreateContentRequest {
                     kind,
@@ -425,11 +509,7 @@ pub async fn apply_path(
                     space: space_key.clone(),
                     parent_id: derived_parent_id.clone(),
                     body_storage: body_storage.clone(),
-                    status: if doc.frontmatter.status.is_empty() {
-                        "current".to_string()
-                    } else {
-                        doc.frontmatter.status.clone()
-                    },
+                    status: desired_status(&doc.frontmatter.status).to_string(),
                     labels: doc.frontmatter.labels.clone(),
                     properties: create_properties,
                 })
@@ -464,9 +544,10 @@ pub async fn apply_path(
         // Track metadata so plan can detect future title/label/status/properties changes.
         doc.sidecar.last_pulled_title = Some(doc.frontmatter.title.clone());
         doc.sidecar.last_pulled_labels = doc.frontmatter.labels.clone();
-        doc.sidecar.last_pulled_status = Some(doc.frontmatter.status.clone());
+        doc.sidecar.last_pulled_status = Some(desired_status(&doc.frontmatter.status).to_string());
         doc.sidecar.last_pulled_properties_hash =
             Some(properties_hash(&doc.frontmatter.properties));
+        doc.sidecar.last_pulled_parent = Some(doc.frontmatter.parent.clone());
         doc.sidecar.last_pulled_body_markdown = Some(doc.body_markdown.clone());
         save_document(doc).map_err(|error| partial_apply_error(error, &applied))?;
     }
@@ -542,6 +623,86 @@ fn remote_drift_error(
             remote_version
         ),
         "run `confluence pull ...` to refresh local metadata, or rerun `confluence apply ... --force` if local content should win",
+    )
+}
+
+fn remote_metadata_drift_error(
+    doc: &LocalDocument,
+    content_id: &str,
+    fields: &[&str],
+) -> anyhow::Error {
+    crate::output::typed_error_with_hint(
+        crate::output::ErrorKind::Conflict,
+        format!(
+            "remote metadata drift for `{}` at {} (content {}): {} changed since the last pull",
+            doc.frontmatter.title,
+            doc.directory.display(),
+            content_id,
+            fields.join(", ")
+        ),
+        "pull a fresh snapshot and merge the remote metadata, or rerun `confluence apply ... --force` if local metadata should win",
+    )
+}
+
+async fn validate_remote_attachment_drift(
+    provider: &dyn ConfluenceProvider,
+    doc: &LocalDocument,
+    content_id: &str,
+    delete_remote: bool,
+) -> Result<()> {
+    let local = local_attachment_hashes(&doc.directory)?;
+    let remote = provider.list_attachments(content_id).await?;
+    let remote_by_title = remote
+        .iter()
+        .map(|attachment| (attachment.title.as_str(), attachment))
+        .collect::<BTreeMap<_, _>>();
+
+    for (title, previous) in &doc.sidecar.attachment_map {
+        let local_hash = local.get(&previous.file_name);
+        let Some(current) = remote_by_title.get(title.as_str()) else {
+            if local_hash.is_some() {
+                return Err(remote_attachment_drift_error(doc, content_id, title));
+            }
+            continue;
+        };
+        let bytes = provider
+            .download_attachment(content_id, &current.id)
+            .await?;
+        let remote_hash = sha256_hex(&bytes);
+        if attachment_bytes_conflict(previous.sha256.as_deref(), local_hash, &remote_hash) {
+            return Err(remote_attachment_drift_error(doc, content_id, title));
+        }
+    }
+
+    if delete_remote {
+        for attachment in &remote {
+            if !doc.sidecar.attachment_map.contains_key(&attachment.title)
+                && !local.contains_key(&attachment.title)
+            {
+                return Err(remote_attachment_drift_error(
+                    doc,
+                    content_id,
+                    &attachment.title,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remote_attachment_drift_error(
+    doc: &LocalDocument,
+    content_id: &str,
+    title: &str,
+) -> anyhow::Error {
+    crate::output::typed_error_with_hint(
+        crate::output::ErrorKind::Conflict,
+        format!(
+            "remote attachment drift for `{title}` on `{}` at {} (content {content_id})",
+            doc.frontmatter.title,
+            doc.directory.display(),
+        ),
+        "pull a fresh snapshot and merge the attachment, or rerun `confluence apply ... --force` if the local file should win",
     )
 }
 
@@ -769,6 +930,29 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
+fn validate_filtered_pull_destination(root: &Path) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(root).with_context(|| {
+        format!(
+            "failed to inspect filtered pull destination {}",
+            root.display()
+        )
+    })?;
+    if entries.next().transpose()?.is_none() {
+        return Ok(());
+    }
+    Err(crate::output::typed_error_with_hint(
+        crate::output::ErrorKind::InvalidInput,
+        format!(
+            "filtered pull destination `{}` is not empty",
+            root.display()
+        ),
+        "use a new empty destination for `pull space --since`; a filtered snapshot cannot safely replace a complete local export",
+    ))
+}
+
 fn dirty_pull_destination_error(root: &Path) -> anyhow::Error {
     crate::output::typed_error_with_hint(
         crate::output::ErrorKind::Conflict,
@@ -834,6 +1018,7 @@ async fn write_items(
                 AttachmentState {
                     id: attachment.id.clone(),
                     file_name: attachment.title.clone(),
+                    remote_version: attachment.version,
                     media_type: attachment.media_type.clone(),
                     sha256: Some(sha256_hex(&bytes)),
                 },
@@ -879,6 +1064,7 @@ async fn write_items(
             last_pulled_labels: item.labels.clone(),
             last_pulled_status: Some(item.status.clone()),
             last_pulled_properties_hash: Some(props_hash),
+            last_pulled_parent: Some(frontmatter.parent.clone()),
             last_pulled_body_markdown: Some(body_markdown.clone()),
         };
         docs_to_write.push(LocalDocument {
@@ -929,6 +1115,21 @@ fn safe_local_attachment_file_name(title: &str) -> Result<&str> {
 
 fn attachment_file_name_is_safe(title: &str) -> bool {
     let mut components = Path::new(title).components();
+    let windows_stem = title
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([' ', '.'])
+        .to_ascii_uppercase();
+    let windows_reserved = matches!(windows_stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || windows_stem
+            .strip_prefix("COM")
+            .and_then(|suffix| suffix.parse::<u8>().ok())
+            .is_some_and(|number| (1..=9).contains(&number))
+        || windows_stem
+            .strip_prefix("LPT")
+            .and_then(|suffix| suffix.parse::<u8>().ok())
+            .is_some_and(|number| (1..=9).contains(&number));
     matches!(
         (components.next(), components.next()),
         (Some(Component::Normal(_)), None)
@@ -937,6 +1138,11 @@ fn attachment_file_name_is_safe(title: &str) -> bool {
                 && !title.contains('/')
                 && !title.contains('\\')
                 && !title.contains('\0')
+                && !title.chars().any(|character| {
+                    character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+                })
+                && !title.ends_with([' ', '.'])
+                && !windows_reserved
     )
 }
 
@@ -1788,13 +1994,22 @@ async fn sync_attachments(
     fs::create_dir_all(&attachments_dir)
         .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
     let local_hashes = local_attachment_hashes(&doc.directory)?;
-    let known = doc.sidecar.attachment_map.clone();
+    let current_remote = provider.list_attachments(content_id).await?;
 
     for (file_name, hash) in &local_hashes {
-        let current = known
-            .get(file_name)
-            .and_then(|attachment| attachment.sha256.as_deref());
-        if current != Some(hash.as_str()) {
+        let current = current_remote
+            .iter()
+            .find(|attachment| attachment.title == *file_name);
+        let remote_hash = if let Some(attachment) = current {
+            Some(sha256_hex(
+                &provider
+                    .download_attachment(content_id, &attachment.id)
+                    .await?,
+            ))
+        } else {
+            None
+        };
+        if remote_hash.as_deref() != Some(hash.as_str()) {
             let uploaded = provider
                 .upload_attachment(
                     content_id,
@@ -1817,15 +2032,15 @@ async fn sync_attachments(
 
     if delete_remote {
         let local_names: BTreeSet<_> = local_hashes.keys().cloned().collect();
-        for (file_name, attachment) in known {
-            if !local_names.contains(&file_name) {
+        for attachment in &current_remote {
+            if !local_names.contains(&attachment.title) {
                 provider
                     .delete_attachment(content_id, &attachment.id)
                     .await?;
                 applied.items.push(PlanItem {
                     action: PlanActionKind::DeleteAttachment,
-                    title: file_name,
-                    content_id: Some(attachment.id),
+                    title: attachment.title.clone(),
+                    content_id: Some(attachment.id.clone()),
                     path: attachments_dir.clone(),
                     details: "attachment deleted remotely".to_string(),
                     diff: None,
@@ -1838,19 +2053,17 @@ async fn sync_attachments(
     let mut attachment_map = BTreeMap::new();
     for attachment in refreshed {
         let file_name = safe_attachment_file_name(&attachment.title)?;
-        let path = attachments_dir.join(file_name);
-        let sha = if path.exists() {
-            Some(sha256_hex(fs::read(&path)?))
-        } else {
-            None
-        };
+        let remote_bytes = provider
+            .download_attachment(content_id, &attachment.id)
+            .await?;
         attachment_map.insert(
             attachment.title.clone(),
             AttachmentState {
                 id: attachment.id,
-                file_name: attachment.title,
+                file_name: file_name.to_string(),
+                remote_version: attachment.version,
                 media_type: attachment.media_type,
-                sha256: sha,
+                sha256: Some(sha256_hex(&remote_bytes)),
             },
         );
     }
@@ -1966,6 +2179,18 @@ mod tests {
         assert!(validate_pull_destination(dir.path(), false).is_err());
     }
 
+    #[test]
+    fn filtered_pull_requires_an_empty_destination_even_with_force() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("existing.md"), "keep").expect("existing file");
+
+        let error = validate_filtered_pull_destination(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("filtered pull destination"));
+
+        let empty = tempdir().expect("empty tempdir");
+        validate_filtered_pull_destination(empty.path()).expect("empty destination");
+    }
+
     #[cfg(unix)]
     #[test]
     fn pull_destination_rejects_symbolic_links_even_with_force() {
@@ -1995,6 +2220,7 @@ mod tests {
             AttachmentState {
                 id: "attachment-1".to_string(),
                 file_name: "report.txt".to_string(),
+                remote_version: Some(1),
                 media_type: Some("text/plain".to_string()),
                 sha256: Some(sha256_hex(b"report")),
             },
@@ -2037,6 +2263,13 @@ mod tests {
             ".",
             "..",
             "nul\0byte",
+            "report:final.pdf",
+            "trailing. ",
+            "trailing.",
+            "NUL",
+            "con.txt",
+            "COM1.log",
+            "lpt9",
         ] {
             assert!(
                 safe_attachment_file_name(unsafe_name).is_err(),
@@ -2258,6 +2491,158 @@ mod tests {
                 .any(|item| item.action == PlanActionKind::UpdateContent
                     && item.details.contains("title"))
         );
+    }
+
+    #[test]
+    fn status_difference_requires_a_remote_update() {
+        let doc = LocalDocument {
+            directory: PathBuf::from("page"),
+            markdown_path: PathBuf::from("page/index.md"),
+            sidecar_path: PathBuf::from("page/.confluence.json"),
+            frontmatter: Frontmatter {
+                title: "Page".to_string(),
+                kind: "page".to_string(),
+                labels: vec!["managed".to_string()],
+                status: "draft".to_string(),
+                parent: None,
+                properties: BTreeMap::new(),
+            },
+            body_markdown: String::new(),
+            sidecar: Sidecar::default(),
+        };
+        let remote = ContentItem {
+            id: "123".to_string(),
+            kind: ContentKind::Page,
+            title: "Page".to_string(),
+            status: "current".to_string(),
+            space_id: None,
+            space_key: None,
+            parent_id: None,
+            version: Some(1),
+            body_storage: None,
+            labels: vec!["managed".to_string()],
+            properties: BTreeMap::new(),
+            web_url: None,
+            created_at: None,
+            updated_at: None,
+        };
+
+        assert!(metadata_needs_update(&doc, &remote));
+    }
+
+    #[test]
+    fn three_way_metadata_check_rejects_remote_only_changes() {
+        let mut base_properties = BTreeMap::new();
+        base_properties.insert("owner".to_string(), serde_json::json!("base"));
+        let mut local_properties = BTreeMap::new();
+        local_properties.insert("owner".to_string(), serde_json::json!("local"));
+        let mut remote_properties = BTreeMap::new();
+        remote_properties.insert("owner".to_string(), serde_json::json!("remote"));
+        let doc = LocalDocument {
+            directory: PathBuf::from("page"),
+            markdown_path: PathBuf::from("page/index.md"),
+            sidecar_path: PathBuf::from("page/.confluence.json"),
+            frontmatter: Frontmatter {
+                title: "Page".to_string(),
+                kind: "page".to_string(),
+                labels: vec!["local".to_string()],
+                status: "draft".to_string(),
+                parent: None,
+                properties: local_properties,
+            },
+            body_markdown: String::new(),
+            sidecar: Sidecar {
+                last_pulled_title: Some("Page".to_string()),
+                last_pulled_labels: vec!["base".to_string()],
+                last_pulled_status: Some("current".to_string()),
+                last_pulled_properties_hash: Some(properties_hash(&base_properties)),
+                ..Sidecar::default()
+            },
+        };
+        let remote = ContentItem {
+            id: "123".to_string(),
+            kind: ContentKind::Page,
+            title: "Page".to_string(),
+            status: "archived".to_string(),
+            space_id: None,
+            space_key: None,
+            parent_id: None,
+            version: Some(1),
+            body_storage: None,
+            labels: vec!["remote".to_string()],
+            properties: remote_properties,
+            web_url: None,
+            created_at: None,
+            updated_at: None,
+        };
+
+        assert_eq!(
+            remote_metadata_drift(&doc, &remote),
+            vec!["labels", "status", "properties"]
+        );
+    }
+
+    #[test]
+    fn parent_frontmatter_edits_are_rejected_instead_of_ignored() {
+        let doc = LocalDocument {
+            directory: PathBuf::from("page"),
+            markdown_path: PathBuf::from("page/index.md"),
+            sidecar_path: PathBuf::from("page/.confluence.json"),
+            frontmatter: Frontmatter {
+                title: "Page".to_string(),
+                kind: "page".to_string(),
+                labels: Vec::new(),
+                status: "current".to_string(),
+                parent: Some("edited-parent".to_string()),
+                properties: BTreeMap::new(),
+            },
+            body_markdown: String::new(),
+            sidecar: Sidecar {
+                last_pulled_parent: Some(Some("pulled-parent".to_string())),
+                ..Sidecar::default()
+            },
+        };
+
+        let error = validate_informational_parent(&doc).unwrap_err();
+        assert!(error.to_string().contains("parent is informational"));
+    }
+
+    #[test]
+    fn create_consumes_local_space_key_without_sending_it_as_metadata() {
+        let mut frontmatter = Frontmatter {
+            properties: BTreeMap::from([
+                ("space_key".to_string(), serde_json::json!("DOCS")),
+                ("owner".to_string(), serde_json::json!("Ada")),
+            ]),
+            ..Frontmatter::default()
+        };
+
+        let remote = take_create_properties(&mut frontmatter);
+        assert!(!remote.contains_key("space_key"));
+        assert!(!frontmatter.properties.contains_key("space_key"));
+        assert_eq!(remote.get("owner"), Some(&serde_json::json!("Ada")));
+    }
+
+    #[test]
+    fn attachment_three_way_check_preserves_matching_changes_and_rejects_divergence() {
+        let same_as_remote = "remote".to_string();
+        let local_edit = "local".to_string();
+
+        assert!(!attachment_bytes_conflict(
+            Some("base"),
+            Some(&same_as_remote),
+            "remote"
+        ));
+        assert!(attachment_bytes_conflict(
+            Some("base"),
+            Some(&local_edit),
+            "remote"
+        ));
+        assert!(!attachment_bytes_conflict(
+            Some("base"),
+            Some(&local_edit),
+            "base"
+        ));
     }
 
     #[test]

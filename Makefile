@@ -29,19 +29,19 @@ fmt:
 
 lint:
 	cargo fmt -- --check
-	cargo clippy --locked -- -D warnings
+	cargo clippy --locked --all-targets -- -D warnings
 
 check: lint test
 
 release-check:
 	cargo fmt --all --check
-	cargo clippy --locked -- -D warnings
+	cargo clippy --locked --all-targets -- -D warnings
 	cargo test --locked --all-targets
 	cargo run --locked -- >/dev/null
 	cargo run --locked -- --help >/dev/null
 	cargo run --locked -- page create --help >/dev/null
 	cargo run --locked -- schema --command 'page get' >/dev/null
-	cargo package --locked --allow-dirty
+	cargo package --locked
 	install_dir="$$(mktemp -d)"; trap 'rm -rf "$$install_dir"' EXIT; cargo install --locked --path . --root "$$install_dir"; "$$install_dir/bin/confluence" --version
 
 release-patch:

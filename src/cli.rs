@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -120,7 +120,7 @@ enum Commands {
         after_help = "Run `confluence plan PATH` first. Apply refuses remote-version drift unless --force is passed."
     )]
     Apply(ApplyArgs),
-    /// List, download, upload, replace, or delete attachments
+    /// List, download, upload, or delete attachments; uploads can replace existing files
     Attachment {
         #[command(subcommand)]
         command: AttachmentCommand,
@@ -161,7 +161,7 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum AuthCommand {
-    /// Configure and verify a profile; starts a guided wizard without flags
+    /// Configure a profile; starts a credential-verifying guided wizard without flags
     Login(Box<AuthLoginArgs>),
     /// Verify the selected profile and display its authentication status
     Status,
@@ -372,10 +372,10 @@ enum PullCommand {
         space: String,
         /// Destination directory
         output: PathBuf,
-        /// Export only content updated since YYYY-MM-DD or an RFC 3339 timestamp
+        /// Export only recently updated content into a new or empty destination
         #[arg(long, value_parser = validate_since)]
         since: Option<String>,
-        /// Replace a dirty or unmanaged destination with the remote snapshot
+        /// Replace a dirty destination for a full-space pull; filtered pulls still require an empty destination
         #[arg(long)]
         force: bool,
     },
@@ -452,7 +452,7 @@ enum AttachmentCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Upload one or more files to a page
+    /// Upload one or more files to a page, optionally replacing same-named attachments
     Upload {
         /// Page ID, Confluence URL, or SPACE:Title
         reference: String,
@@ -609,11 +609,11 @@ struct BodyInput {
 
 #[derive(Args, Debug)]
 struct PageWriteContentArgs {
-    /// New page or blog-post title
+    /// New page title
     title: String,
     /// Destination space key
     space: String,
-    /// Parent page ID, URL, or SPACE:Title; pages only
+    /// Parent page ID, URL, or SPACE:Title
     #[arg(long)]
     parent: Option<String>,
     #[command(flatten)]
@@ -636,7 +636,7 @@ struct PageUpdateContentArgs {
     /// Replacement title; preserves the existing title when omitted
     #[arg(long)]
     title: Option<String>,
-    /// Replacement parent page ID, URL, or SPACE:Title; pages only
+    /// Replacement parent page ID, URL, or SPACE:Title
     #[arg(long)]
     parent: Option<String>,
     #[command(flatten)]
@@ -656,14 +656,14 @@ struct PageUpdateContentArgs {
     /// Expected current version; defaults to the version fetched before updating
     #[arg(long)]
     version: Option<u64>,
-    /// Confluence content status
-    #[arg(long, default_value = "current", value_parser = ["current", "draft"])]
-    status: String,
+    /// Replacement content status; preserves the existing status when omitted
+    #[arg(long, value_parser = ["current", "draft"])]
+    status: Option<String>,
 }
 
 #[derive(Args, Debug)]
 struct BlogWriteContentArgs {
-    /// New blog-post title
+    /// New blog post title
     title: String,
     /// Destination space key
     space: String,
@@ -682,7 +682,7 @@ struct BlogWriteContentArgs {
 
 #[derive(Args, Debug)]
 struct BlogUpdateContentArgs {
-    /// Blog-post content ID
+    /// Blog post content ID
     reference: String,
     /// Replacement title; preserves the existing title when omitted
     #[arg(long)]
@@ -704,9 +704,62 @@ struct BlogUpdateContentArgs {
     /// Expected current version; defaults to the version fetched before updating
     #[arg(long)]
     version: Option<u64>,
-    /// Confluence content status
-    #[arg(long, default_value = "current", value_parser = ["current", "draft"])]
-    status: String,
+    /// Replacement content status; preserves the existing status when omitted
+    #[arg(long, value_parser = ["current", "draft"])]
+    status: Option<String>,
+}
+
+impl BodyInput {
+    fn is_provided(&self) -> bool {
+        self.body.is_some() || self.body_file.is_some()
+    }
+}
+
+impl PageUpdateContentArgs {
+    fn has_changes(&self) -> bool {
+        self.title.is_some()
+            || self.parent.is_some()
+            || self.body.is_provided()
+            || !self.labels.is_empty()
+            || !self.properties.is_empty()
+            || self.replace_labels
+            || self.replace_properties
+            || self.status.is_some()
+    }
+}
+
+impl BlogUpdateContentArgs {
+    fn has_changes(&self) -> bool {
+        self.title.is_some()
+            || self.body.is_provided()
+            || !self.labels.is_empty()
+            || !self.properties.is_empty()
+            || self.replace_labels
+            || self.replace_properties
+            || self.status.is_some()
+    }
+}
+
+fn validate_page_update(args: &PageUpdateContentArgs) -> Result<()> {
+    if args.has_changes() {
+        return Ok(());
+    }
+    Err(crate::output::typed_error_with_hint(
+        crate::output::ErrorKind::InvalidInput,
+        "page update requires at least one requested change",
+        "pass --title, --parent, --body, --body-file, --label, --property, --replace-labels, --replace-properties, or --status",
+    ))
+}
+
+fn validate_blog_update(args: &BlogUpdateContentArgs) -> Result<()> {
+    if args.has_changes() {
+        return Ok(());
+    }
+    Err(crate::output::typed_error_with_hint(
+        crate::output::ErrorKind::InvalidInput,
+        "blog update requires at least one requested change",
+        "pass --title, --body, --body-file, --label, --property, --replace-labels, --replace-properties, or --status",
+    ))
 }
 
 #[derive(Args, Debug, Clone)]
@@ -899,10 +952,16 @@ pub async fn run() -> Result<()> {
             handle_search(&*provider, args, output).await
         }
         Commands::Page { command } => {
+            if let PageCommand::Update(args) = &command {
+                validate_page_update(args)?;
+            }
             let provider = provider_from_profile(cli.profile.as_deref())?;
             handle_page(&*provider, command, output, yes).await
         }
         Commands::Blog { command } => {
+            if let BlogCommand::Update(args) = &command {
+                validate_blog_update(args)?;
+            }
             let provider = provider_from_profile(cli.profile.as_deref())?;
             handle_blog(&*provider, command, output, yes).await
         }
@@ -952,11 +1011,7 @@ pub async fn run() -> Result<()> {
             let provider = provider_from_profile(cli.profile.as_deref())?;
             handle_property(&*provider, command, output, yes).await
         }
-        Commands::Completions { shell } => {
-            let mut command = Cli::command();
-            generate(shell, &mut command, "confluence", &mut io::stdout());
-            Ok(())
-        }
+        Commands::Completions { shell } => write_completions(shell, &mut io::stdout()),
         Commands::Schema { command } => {
             if crate::schema::print_schema(command.as_deref()) {
                 Ok(())
@@ -979,6 +1034,25 @@ fn provider_from_profile(profile_override: Option<&str>) -> Result<Box<dyn Confl
 fn resolved_profile(profile_override: Option<&str>) -> Result<ResolvedProfile> {
     let config = AppConfig::load()?;
     config.resolved_profile(profile_override)
+}
+
+fn write_completions<W: Write>(shell: Shell, writer: &mut W) -> Result<()> {
+    let mut command = Cli::command();
+    let mut buffer = Vec::new();
+    generate(shell, &mut command, "confluence", &mut buffer);
+    if let Err(error) = writer.write_all(&buffer) {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(error).context("failed to write shell completions");
+    }
+    if let Err(error) = writer.flush() {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(error).context("failed to flush shell completions");
+    }
+    Ok(())
 }
 
 async fn handle_auth(
@@ -1006,6 +1080,13 @@ async fn handle_auth(
                 && args.input.token_kind.is_none()
                 && args.input.expires_at.is_none();
             if guided {
+                if output.is_json() || !io::stdin().is_terminal() {
+                    return Err(crate::output::typed_error_with_hint(
+                        crate::output::ErrorKind::TtyRequired,
+                        "guided authentication requires an interactive terminal",
+                        "run `confluence init --output json` for setup instructions, or pass explicit options to `confluence auth login --non-interactive`",
+                    ));
+                }
                 return crate::config::init(output).await;
             }
             let name = args.name.or_else(|| profile_override.map(str::to_owned));
@@ -1674,13 +1755,14 @@ async fn handle_page(
                 pages.truncate(limit);
             }
             let shown = pages.len();
+            let (reported_limit, reported_offset) = list_window_metadata(all, total, limit, offset);
             render_content_items_list(
                 &pages,
                 output,
                 false,
                 total,
-                limit,
-                offset,
+                reported_limit,
+                reported_offset,
                 fields.as_deref(),
             )?;
             if !all && !output.is_json() && total > shown + offset {
@@ -1756,9 +1838,10 @@ async fn handle_page(
             render_content_items(&[created], output, true)?;
         }
         PageCommand::Update(args) => {
+            validate_page_update(&args)?;
             let id = provider.resolve_page_ref(&args.reference).await?;
             let current = provider.get_content(ContentKind::Page, &id, true).await?;
-            let body_storage = if args.body.body.is_some() || args.body.body_file.is_some() {
+            let body_storage = if args.body.is_provided() {
                 read_body_storage(&args.body)?
             } else {
                 current.body_storage.clone().unwrap_or_default()
@@ -1799,7 +1882,7 @@ async fn handle_page(
                         )
                     })?,
                     message: Some("Updated via confluence-cli".to_string()),
-                    status: args.status,
+                    status: args.status.unwrap_or(current.status),
                     labels,
                     properties,
                 })
@@ -1840,13 +1923,14 @@ async fn handle_blog(
                 posts.truncate(limit);
             }
             let shown = posts.len();
+            let (reported_limit, reported_offset) = list_window_metadata(all, total, limit, offset);
             render_content_items_list(
                 &posts,
                 output,
                 false,
                 total,
-                limit,
-                offset,
+                reported_limit,
+                reported_offset,
                 fields.as_deref(),
             )?;
             if !all && !output.is_json() && total > shown + offset {
@@ -1878,10 +1962,11 @@ async fn handle_blog(
             render_content_items(&[created], output, true)?;
         }
         BlogCommand::Update(args) => {
+            validate_blog_update(&args)?;
             let current = provider
                 .get_content(ContentKind::BlogPost, &args.reference, true)
                 .await?;
-            let body_storage = if args.body.body.is_some() || args.body.body_file.is_some() {
+            let body_storage = if args.body.is_provided() {
                 read_body_storage(&args.body)?
             } else {
                 current.body_storage.clone().unwrap_or_default()
@@ -1917,7 +2002,7 @@ async fn handle_blog(
                         )
                     })?,
                     message: Some("Updated via confluence-cli".to_string()),
-                    status: args.status,
+                    status: args.status.unwrap_or(current.status),
                     labels,
                     properties,
                 })
@@ -2482,6 +2567,10 @@ fn paginate<T>(items: Vec<T>, limit: usize, offset: usize) -> (Vec<T>, usize) {
     (page, total)
 }
 
+fn list_window_metadata(all: bool, total: usize, limit: usize, offset: usize) -> (usize, usize) {
+    if all { (total, 0) } else { (limit, offset) }
+}
+
 fn render_spaces_list(
     spaces: &[SpaceSummary],
     output: OutputFormat,
@@ -2670,63 +2759,97 @@ fn render_doctor(report: &DoctorReport, output: OutputFormat) -> Result<()> {
     if output.is_json() {
         return print_json(report);
     }
+    print!("{}", doctor_text(report));
+    Ok(())
+}
 
-    print_table(
-        &[
-            "config_path",
-            "config_exists",
-            "active_profile",
-            "stored_profiles",
-        ],
-        &[vec![
-            report.config_path.clone(),
-            report.config_exists.to_string(),
-            report
-                .active_profile
-                .clone()
-                .unwrap_or_else(|| "-".to_string()),
-            report.stored_profiles.to_string(),
-        ]],
+const DOCTOR_TEXT_WIDTH: usize = 100;
+
+fn doctor_text(report: &DoctorReport) -> String {
+    let mut output = String::from("Configuration:\n");
+    push_doctor_field(&mut output, "path", &report.config_path);
+    push_doctor_field(
+        &mut output,
+        "exists",
+        if report.config_exists { "yes" } else { "no" },
+    );
+    push_doctor_field(
+        &mut output,
+        "active profile",
+        report.active_profile.as_deref().unwrap_or("-"),
+    );
+    push_doctor_field(
+        &mut output,
+        "stored profiles",
+        &report.stored_profiles.to_string(),
     );
 
     if let Some(profile) = &report.resolved_profile {
-        print_table(
-            &[
-                "profile",
-                "provider",
-                "base_url",
-                "api_path",
-                "auth",
-                "read_only",
-            ],
-            &[vec![
-                profile.name.clone(),
-                profile.provider.to_string(),
-                profile.base_url.clone(),
-                profile.api_path.clone(),
-                doctor_auth_kind(profile).to_string(),
-                profile.read_only.to_string(),
-            ]],
-        );
+        output.push_str("\nResolved profile:\n");
+        push_doctor_field(&mut output, "name", &profile.name);
+        push_doctor_field(&mut output, "provider", &profile.provider.to_string());
+        push_doctor_field(&mut output, "base URL", &profile.base_url);
+        push_doctor_field(&mut output, "API path", &profile.api_path);
+        push_doctor_field(&mut output, "auth", doctor_auth_kind(profile));
+        push_doctor_field(&mut output, "read only", &profile.read_only.to_string());
     }
 
-    let rows = report
-        .checks
-        .iter()
-        .map(|check| {
-            vec![
-                check.name.clone(),
-                doctor_status_label(check.status).to_string(),
-                check.details.clone(),
-            ]
-        })
-        .collect::<Vec<_>>();
-    print_table(&["check", "status", "details"], &rows);
-    println!(
-        "Doctor summary: {} passed, {} warned, {} failed",
+    output.push_str("\nChecks:\n");
+    for check in &report.checks {
+        let label = format!("{} {}", doctor_status_label(check.status), check.name);
+        push_doctor_field(&mut output, &label, &check.details);
+    }
+    output.push_str(&format!(
+        "\nDoctor summary: {} passed, {} warned, {} failed\n",
         report.summary.passed, report.summary.warned, report.summary.failed
-    );
-    Ok(())
+    ));
+    output
+}
+
+fn push_doctor_field(output: &mut String, label: &str, value: &str) {
+    let prefix = format!("  {label}: ");
+    let continuation = " ".repeat(prefix.chars().count());
+    let content_width = DOCTOR_TEXT_WIDTH
+        .saturating_sub(prefix.chars().count())
+        .max(20);
+    for (index, line) in wrap_text(value, content_width).into_iter().enumerate() {
+        output.push_str(if index == 0 { &prefix } else { &continuation });
+        output.push_str(&line);
+        output.push('\n');
+    }
+}
+
+fn wrap_text(value: &str, width: usize) -> Vec<String> {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        while start < chars.len() && chars[start].is_whitespace() {
+            start += 1;
+        }
+        if start == chars.len() {
+            break;
+        }
+        let hard_end = (start + width).min(chars.len());
+        let end = if hard_end == chars.len() {
+            hard_end
+        } else {
+            (start..hard_end)
+                .rev()
+                .find(|&index| chars[index].is_whitespace())
+                .filter(|&index| index > start)
+                .unwrap_or(hard_end)
+        };
+        lines.push(chars[start..end].iter().collect());
+        start = end;
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn push_doctor_check(
@@ -3042,6 +3165,99 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn update_status_is_optional_and_explicit_status_is_a_change() {
+        let cli = Cli::parse_from(["confluence", "page", "update", "123"]);
+        let Commands::Page {
+            command: PageCommand::Update(page),
+        } = cli.command
+        else {
+            panic!("expected page update");
+        };
+        assert_eq!(page.status, None);
+        assert!(!page.has_changes());
+        assert!(validate_page_update(&page).is_err());
+
+        let cli = Cli::parse_from(["confluence", "blog", "update", "456", "--status", "draft"]);
+        let Commands::Blog {
+            command: BlogCommand::Update(blog),
+        } = cli.command
+        else {
+            panic!("expected blog update");
+        };
+        assert_eq!(blog.status.as_deref(), Some("draft"));
+        assert!(blog.has_changes());
+        validate_blog_update(&blog).expect("explicit status is a requested change");
+    }
+
+    #[test]
+    fn version_alone_does_not_turn_a_noop_into_an_update() {
+        let cli = Cli::parse_from(["confluence", "page", "update", "123", "--version", "9"]);
+        let Commands::Page {
+            command: PageCommand::Update(page),
+        } = cli.command
+        else {
+            panic!("expected page update");
+        };
+        assert!(!page.has_changes());
+        let error = validate_page_update(&page).expect_err("version is only a precondition");
+        assert!(error.to_string().contains("at least one requested change"));
+    }
+
+    #[test]
+    fn all_list_metadata_describes_the_returned_window() {
+        assert_eq!(list_window_metadata(true, 37, 5, 12), (37, 0));
+        assert_eq!(list_window_metadata(false, 37, 5, 12), (5, 12));
+    }
+
+    #[test]
+    fn completions_ignore_broken_pipe_writes() {
+        struct BrokenPipeWriter;
+
+        impl Write for BrokenPipeWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "reader closed"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        write_completions(Shell::Zsh, &mut BrokenPipeWriter)
+            .expect("a closed completion consumer is a successful exit");
+    }
+
+    #[test]
+    fn doctor_text_stays_within_a_readable_width() {
+        let report = DoctorReport {
+            config_path: format!("/{}", "very-long-directory-name/".repeat(10)),
+            config_exists: true,
+            active_profile: Some("work".to_string()),
+            stored_profiles: 1,
+            resolved_profile: None,
+            checks: vec![DoctorCheck {
+                name: "connectivity".to_string(),
+                status: DoctorCheckStatus::Fail,
+                details: "a detailed diagnostic that should wrap cleanly ".repeat(10),
+            }],
+            summary: DoctorSummary {
+                passed: 2,
+                warned: 0,
+                failed: 1,
+            },
+        };
+        let rendered = doctor_text(&report);
+        assert!(rendered.contains("Configuration:"));
+        assert!(rendered.contains("fail connectivity:"));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| line.chars().count() <= DOCTOR_TEXT_WIDTH),
+            "doctor output exceeded {DOCTOR_TEXT_WIDTH} columns:\n{rendered}"
+        );
     }
 
     #[test]

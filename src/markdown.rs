@@ -67,6 +67,10 @@ pub struct Sidecar {
     /// SHA-256 of the JSON-serialised properties map as of the last pull/apply.
     #[serde(default)]
     pub last_pulled_properties_hash: Option<String>,
+    /// Informational parent value written to frontmatter at the last pull/apply.
+    /// The nested option distinguishes a root page from a legacy sidecar.
+    #[serde(default)]
+    pub last_pulled_parent: Option<Option<String>>,
     /// Markdown body as of the last pull/apply, used to render a real plan diff.
     #[serde(default)]
     pub last_pulled_body_markdown: Option<String>,

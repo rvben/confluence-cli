@@ -438,6 +438,8 @@ pub struct V2Body {
 pub struct V1Attachment {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub version: Option<V1Version>,
     pub metadata: Option<V1AttachmentMetadata>,
     pub extensions: Option<V1AttachmentExtensions>,
     #[serde(default)]

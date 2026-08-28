@@ -37,6 +37,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
 
       - name: Validate release metadata
         shell: bash
@@ -52,6 +54,7 @@ jobs:
           tag="v${version}"
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             test "$GITHUB_REF_NAME" = "$tag"
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main
           elif [[ "$DRY_RUN" != "true" ]]; then
             test "$GITHUB_REF_TYPE" = "tag"
             test "$GITHUB_REF_NAME" = "$tag"
@@ -67,6 +70,10 @@ jobs:
 
       - name: Run release check
         run: make release-check
+
+      - name: Remove package staging before cache save
+        if: ${{ always() }}
+        run: rm -rf target/package
 
   publish-crates:
     needs:
@@ -247,6 +254,7 @@ jobs:
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
           enable-cache: false
+          ignore-empty-workdir: true
 
       - name: Download wheels
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -306,11 +314,10 @@ jobs:
         id: check-token
         run: |
           if [ -z "$HOMEBREW_TAP_DEPLOY_KEY" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "HOMEBREW_TAP_DEPLOY_KEY not set, skipping Homebrew formula update"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "HOMEBREW_TAP_DEPLOY_KEY is required for a real release" >&2
+            exit 1
           fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - name: Download release artifacts
         if: steps.check-token.outputs.skip == 'false'
