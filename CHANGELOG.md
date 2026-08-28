@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.21](https://github.com/rvben/confluence-cli/compare/v0.1.20...v0.1.21) - 2026-08-28
+
+### Fixed
+
+- harden synchronization and release safety ([4b6624e](https://github.com/rvben/confluence-cli/commit/4b6624ed018b537dc9185bbcb5c4607f61b7d896))
+
 ## [0.1.20](https://github.com/rvben/confluence-cli/compare/v0.1.19...v0.1.20) - 2026-08-28
 
 ### Fixed
