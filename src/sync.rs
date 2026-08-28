@@ -7,6 +7,7 @@ use chrono::Utc;
 use pathdiff::diff_paths;
 use regex::Regex;
 use similar::{ChangeTag, TextDiff};
+use tempfile::Builder;
 use walkdir::WalkDir;
 
 use crate::markdown::{
@@ -38,14 +39,17 @@ pub async fn pull_page(
     reference: &str,
     root: &Path,
     recursive: bool,
+    force: bool,
 ) -> Result<Vec<PathBuf>> {
+    validate_pull_destination(root, force)?;
     let root_id = provider.resolve_page_ref(reference).await?;
     let root_item = provider
         .get_content(ContentKind::Page, &root_id, true)
         .await?;
     let mut items = vec![root_item];
     if recursive {
-        items.extend(provider.list_children(&root_id, true).await?);
+        let children = provider.list_children(&root_id, true).await?;
+        items.extend(children);
     }
     pull_items(provider, root, items).await
 }
@@ -54,13 +58,15 @@ pub async fn pull_space(
     provider: &dyn ConfluenceProvider,
     space: &str,
     root: &Path,
+    force: bool,
 ) -> Result<Vec<PathBuf>> {
+    validate_pull_destination(root, force)?;
     let mut items = provider
-        .list_space_content(ContentKind::Page, space, true)
+        .list_space_content(ContentKind::Page, space)
         .await?;
     items.extend(
         provider
-            .list_space_content(ContentKind::BlogPost, space, false)
+            .list_space_content(ContentKind::BlogPost, space)
             .await?,
     );
     pull_items(provider, root, items).await
@@ -71,17 +77,28 @@ pub async fn pull_space_since(
     space: &str,
     root: &Path,
     since: &str,
+    force: bool,
 ) -> Result<Vec<PathBuf>> {
+    validate_pull_destination(root, force)?;
     let space = crate::provider::escape_cql_literal(space);
     let since = crate::provider::escape_cql_literal(since);
-    let cql = format!(r#"space = "{space}" AND type = page AND lastModified > "{since}""#);
-    let results = provider.search(&cql, true, 1000, 0).await?.items;
-    let mut written = Vec::new();
-    for result in results {
-        let paths = pull_page(provider, &result.id, root, false).await?;
-        written.extend(paths);
+    let cql = format!(r#"space = "{space}" AND lastModified > "{since}""#);
+    let mut offset = 0usize;
+    let mut listed = Vec::new();
+    loop {
+        let page = provider.search(&cql, true, 200, offset).await?;
+        let count = page.items.len();
+        listed.extend(page.items);
+        offset += count;
+        if count < 200 || page.total.is_some_and(|total| offset >= total) {
+            break;
+        }
     }
-    Ok(written)
+    let mut items = Vec::with_capacity(listed.len());
+    for result in listed {
+        items.push(provider.get_content(result.kind, &result.id, true).await?);
+    }
+    pull_items(provider, root, items).await
 }
 
 pub fn plan_path(
@@ -90,17 +107,7 @@ pub fn plan_path(
     delete_remote: bool,
     show_diff: bool,
 ) -> Result<SyncPlan> {
-    let docs = load_local_documents(root)?;
-    if docs.is_empty() {
-        return Err(crate::output::typed_error_with_hint(
-            "invalid_input",
-            format!(
-                "sync path `{}` contains no index.md documents",
-                root.display()
-            ),
-            "run `confluence pull ...` first or point PATH at a pulled Markdown tree",
-        ));
-    }
+    let docs = load_required_local_documents(root)?;
     let indexes = scan_local_documents(root)?;
     let mut parent_ids = BTreeMap::new();
     for doc in &indexes {
@@ -265,11 +272,10 @@ fn properties_hash(properties: &BTreeMap<String, serde_json::Value>) -> String {
 
 /// Build a unified diff between the last-pulled markdown body and the current one.
 fn compute_body_diff(sidecar: &Sidecar, current_body: &str) -> String {
-    // The sidecar stores the last-pulled markdown hash but not the full text.
-    // We use an empty string as the "old" body when no prior body is stored,
-    // which gives a useful all-added diff for newly tracked pages.
-    let old_body = "";
-    let _ = sidecar; // sidecar reserved for future full-body storage
+    let old_body = sidecar
+        .last_pulled_body_markdown
+        .as_deref()
+        .unwrap_or_default();
     let diff = TextDiff::from_lines(old_body, current_body);
     let mut output = String::new();
     for change in diff.iter_all_changes() {
@@ -290,10 +296,47 @@ pub async fn apply_path(
     delete_remote: bool,
     force: bool,
 ) -> Result<SyncPlan> {
-    let mut docs = load_local_documents(root)?;
+    let mut docs = load_required_local_documents(root)?;
     docs.sort_by_key(|doc| doc.directory.components().count());
     let mut link_index = build_link_index(&docs);
     let web_path_prefix = provider.web_path_prefix();
+
+    // Validate the complete collection and every expected remote version before
+    // making the first remote mutation. Versioned update calls still protect
+    // against drift that happens after this preflight.
+    let mut preflight_remotes = BTreeMap::new();
+    for doc in &docs {
+        render_body_storage(doc, &link_index, allow_lossy, web_path_prefix.as_str())?;
+        derive_parent_id_from_fs(&doc.directory, &doc.sidecar)?;
+        local_attachment_hashes(&doc.directory)?;
+        if let Some(content_id) = &doc.sidecar.content_id {
+            let remote = provider
+                .get_content(doc.frontmatter.content_kind(), content_id, false)
+                .await?;
+            if !force && doc.sidecar.remote_version != remote.version {
+                return Err(remote_drift_error(doc, content_id, remote.version));
+            }
+            preflight_remotes.insert(content_id.clone(), remote);
+        } else {
+            let has_space = doc.sidecar.space_key.is_some()
+                || doc
+                    .frontmatter
+                    .properties
+                    .get("space_key")
+                    .and_then(|value| value.as_str())
+                    .is_some();
+            if !has_space {
+                return Err(crate::output::typed_error_with_hint(
+                    crate::output::ErrorKind::InvalidInput,
+                    format!(
+                        "document {} is missing space_key metadata",
+                        doc.directory.display()
+                    ),
+                    "set `space_key` in frontmatter properties or pull an existing page before applying",
+                ));
+            }
+        }
+    }
 
     let mut applied = SyncPlan::default();
     for doc in &mut docs {
@@ -314,21 +357,12 @@ pub async fn apply_path(
         let title = doc.frontmatter.title.clone();
 
         let content = if let Some(content_id) = doc.sidecar.content_id.clone() {
-            let remote = provider.get_content(kind, &content_id, false).await?;
-            if !force && doc.sidecar.remote_version != remote.version {
-                return Err(crate::output::typed_error_with_hint(
-                    "conflict",
-                    format!(
-                        "remote version drift for `{}` at {} (content {}): local sidecar version {:?}, remote {:?}",
-                        title,
-                        doc.directory.display(),
-                        content_id,
-                        doc.sidecar.remote_version,
-                        remote.version
-                    ),
-                    "run `confluence pull ...` to refresh local metadata, or rerun `confluence apply ... --force` if local content should win",
-                ));
-            }
+            let remote = preflight_remotes.remove(&content_id).ok_or_else(|| {
+                crate::output::typed_error(
+                    crate::output::ErrorKind::Unexpected,
+                    format!("missing preflight state for remote content {content_id}"),
+                )
+            })?;
             let needs_update = body_changed(&doc.sidecar, &markdown_hash, &storage_hash)
                 || doc.sidecar.remote_parent_id != derived_parent_id
                 || remote.title != title
@@ -337,7 +371,7 @@ pub async fn apply_path(
             if needs_update {
                 let version = remote.version.ok_or_else(|| {
                     crate::output::typed_error(
-                        "api_error",
+                        crate::output::ErrorKind::Api,
                         format!("remote content {content_id} has no version"),
                     )
                 })?;
@@ -358,7 +392,8 @@ pub async fn apply_path(
                         labels: doc.frontmatter.labels.clone(),
                         properties: doc.frontmatter.properties.clone(),
                     })
-                    .await?;
+                    .await
+                    .map_err(|error| partial_apply_error(error, &applied))?;
                 applied.items.push(PlanItem {
                     action: PlanActionKind::UpdateContent,
                     title: title.clone(),
@@ -398,7 +433,8 @@ pub async fn apply_path(
                     labels: doc.frontmatter.labels.clone(),
                     properties: create_properties,
                 })
-                .await?;
+                .await
+                .map_err(|error| partial_apply_error(error, &applied))?;
             applied.items.push(PlanItem {
                 action: PlanActionKind::CreateContent,
                 title: title.clone(),
@@ -412,7 +448,9 @@ pub async fn apply_path(
 
         doc.sidecar.content_id = Some(content.id.clone());
         link_index.set_content_id(&doc.directory, &content.id);
-        sync_attachments(provider, doc, &content.id, delete_remote, &mut applied).await?;
+        sync_attachments(provider, doc, &content.id, delete_remote, &mut applied)
+            .await
+            .map_err(|error| partial_apply_error(error, &applied))?;
 
         doc.sidecar.provider = Some(provider.kind());
         doc.sidecar.web_path_prefix = Some(web_path_prefix.clone());
@@ -429,7 +467,8 @@ pub async fn apply_path(
         doc.sidecar.last_pulled_status = Some(doc.frontmatter.status.clone());
         doc.sidecar.last_pulled_properties_hash =
             Some(properties_hash(&doc.frontmatter.properties));
-        save_document(doc)?;
+        doc.sidecar.last_pulled_body_markdown = Some(doc.body_markdown.clone());
+        save_document(doc).map_err(|error| partial_apply_error(error, &applied))?;
     }
 
     reconcile_local_link_updates(
@@ -438,9 +477,11 @@ pub async fn apply_path(
         &link_index,
         allow_lossy,
         web_path_prefix.as_str(),
+        force,
         &mut applied,
     )
-    .await?;
+    .await
+    .map_err(|error| partial_apply_error(error, &applied))?;
 
     if applied.items.is_empty() {
         applied.items.push(PlanItem {
@@ -456,12 +497,61 @@ pub async fn apply_path(
     Ok(applied)
 }
 
+fn partial_apply_error(error: anyhow::Error, applied: &SyncPlan) -> anyhow::Error {
+    let (kind, hint) = crate::output::classify_anyhow(&error);
+    let cause_details = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<crate::output::CliError>()
+            .and_then(|typed| typed.details.clone())
+    });
+    let source_partial = cause_details
+        .as_ref()
+        .and_then(|details| details.get("partial_success"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    crate::output::typed_error_with_details(
+        kind,
+        format!(
+            "apply failed after {} completed remote action(s): {error:#}",
+            applied.items.len()
+        ),
+        hint,
+        serde_json::json!({
+            "operation": "apply",
+            "partial_success": !applied.items.is_empty() || source_partial,
+            "completed_count": applied.items.len(),
+            "completed_items": &applied.items,
+            "cause": cause_details,
+        }),
+    )
+}
+
+fn remote_drift_error(
+    doc: &LocalDocument,
+    content_id: &str,
+    remote_version: Option<u64>,
+) -> anyhow::Error {
+    crate::output::typed_error_with_hint(
+        crate::output::ErrorKind::Conflict,
+        format!(
+            "remote version drift for `{}` at {} (content {}): local sidecar version {:?}, remote {:?}",
+            doc.frontmatter.title,
+            doc.directory.display(),
+            content_id,
+            doc.sidecar.remote_version,
+            remote_version
+        ),
+        "run `confluence pull ...` to refresh local metadata, or rerun `confluence apply ... --force` if local content should win",
+    )
+}
+
 async fn reconcile_local_link_updates(
     provider: &dyn ConfluenceProvider,
     docs: &mut [LocalDocument],
     link_index: &LinkIndex,
     allow_lossy: bool,
     web_path_prefix: &str,
+    force: bool,
     applied: &mut SyncPlan,
 ) -> Result<()> {
     for doc in docs {
@@ -479,9 +569,12 @@ async fn reconcile_local_link_updates(
         let remote = provider
             .get_content(doc.frontmatter.content_kind(), &content_id, false)
             .await?;
+        if !force && doc.sidecar.remote_version != remote.version {
+            return Err(remote_drift_error(doc, &content_id, remote.version));
+        }
         let version = remote.version.ok_or_else(|| {
             crate::output::typed_error(
-                "api_error",
+                crate::output::ErrorKind::Api,
                 format!("remote content {content_id} has no version"),
             )
         })?;
@@ -515,6 +608,7 @@ async fn reconcile_local_link_updates(
         doc.sidecar.storage_hash = Some(final_hash.clone());
         doc.sidecar.remote_storage_hash = Some(final_hash);
         doc.sidecar.last_pulled_hash = Some(markdown_body_hash(&doc.body_markdown));
+        doc.sidecar.last_pulled_body_markdown = Some(doc.body_markdown.clone());
         doc.sidecar.last_sync_at = Some(Utc::now());
         save_document(doc)?;
     }
@@ -527,29 +621,209 @@ async fn pull_items(
     root: &Path,
     items: Vec<ContentItem>,
 ) -> Result<Vec<PathBuf>> {
+    let parent = root
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let staging = Builder::new()
+        .prefix(".confluence-pull-")
+        .tempdir_in(parent)
+        .with_context(|| format!("failed to stage pull beside {}", root.display()))?;
+    let staged_root = staging.path().join("snapshot");
+    let staged_paths = write_items(provider, &staged_root, items).await?;
+    install_staged_snapshot(&staged_root, root)?;
+
+    staged_paths
+        .into_iter()
+        .map(|path| {
+            let relative = path.strip_prefix(&staged_root).with_context(|| {
+                format!(
+                    "staged path {} escaped snapshot {}",
+                    path.display(),
+                    staged_root.display()
+                )
+            })?;
+            Ok(root.join(relative))
+        })
+        .collect()
+}
+
+fn install_staged_snapshot(staged_root: &Path, root: &Path) -> Result<()> {
+    let parent = root
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let backup = Builder::new()
+        .prefix(".confluence-backup-")
+        .tempdir_in(parent)
+        .with_context(|| format!("failed to create backup beside {}", root.display()))?;
+    let previous = backup.path().join("previous");
+    let had_previous = root.exists();
+    if had_previous {
+        fs::rename(root, &previous)
+            .with_context(|| format!("failed to stage existing destination {}", root.display()))?;
+    }
+    if let Err(error) = fs::rename(staged_root, root) {
+        if had_previous && let Err(restore_error) = fs::rename(&previous, root) {
+            let recovery_directory = backup.keep();
+            let recovery_path = recovery_directory.join("previous");
+            return Err(crate::output::typed_error_with_details(
+                crate::output::ErrorKind::Unexpected,
+                format!(
+                    "failed to install pulled snapshot at {} and failed to restore the previous destination; the previous snapshot is preserved at {}: install error: {error}; restore error: {restore_error}",
+                    root.display(),
+                    recovery_path.display(),
+                ),
+                Some(format!(
+                    "move `{}` back to `{}` after resolving the filesystem error",
+                    recovery_path.display(),
+                    root.display()
+                )),
+                serde_json::json!({
+                    "operation": "install_pull_snapshot",
+                    "destination": root,
+                    "recovery_path": recovery_path,
+                    "install_error": error.to_string(),
+                    "restore_error": restore_error.to_string(),
+                }),
+            ));
+        }
+        return Err(error)
+            .with_context(|| format!("failed to install pulled snapshot at {}", root.display()));
+    }
+    Ok(())
+}
+
+fn validate_pull_destination(root: &Path, force: bool) -> Result<()> {
+    let destination_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if destination_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(crate::output::typed_error_with_hint(
+            crate::output::ErrorKind::InvalidInput,
+            format!("pull destination `{}` is a symbolic link", root.display()),
+            "use the link's real target path explicitly",
+        ));
+    }
+    if destination_metadata.is_none() || force {
+        return Ok(());
+    }
+    if !destination_metadata.is_some_and(|metadata| metadata.is_dir()) {
+        return Err(crate::output::typed_error(
+            crate::output::ErrorKind::InvalidInput,
+            format!("pull destination `{}` is not a directory", root.display()),
+        ));
+    }
+
+    let docs = load_local_documents(root)?;
+    if docs.is_empty() {
+        if fs::read_dir(root)?.next().is_none() {
+            return Ok(());
+        }
+        return Err(dirty_pull_destination_error(root));
+    }
+
+    // Missing pulled attachments are local changes even when a normal plan would
+    // not schedule remote deletion without --delete-remote.
+    let plan = plan_path(root, false, true, false)?;
+    if plan
+        .items
+        .iter()
+        .any(|item| item.action != PlanActionKind::Noop)
+    {
+        return Err(dirty_pull_destination_error(root));
+    }
+
+    for entry in WalkDir::new(root) {
+        let entry = entry?;
+        if entry.path() == root {
+            continue;
+        }
+        if entry.file_type().is_dir() {
+            let managed_directory = docs.iter().any(|doc| {
+                entry.path() == doc.directory
+                    || entry.path() == doc.directory.join("attachments")
+                    || doc.directory.starts_with(entry.path())
+            });
+            if !managed_directory {
+                return Err(dirty_pull_destination_error(root));
+            }
+            continue;
+        }
+        let managed = docs.iter().any(|doc| {
+            entry.file_type().is_file()
+                && (entry.path() == doc.markdown_path
+                    || entry.path() == doc.sidecar_path
+                    || entry.path().parent() == Some(doc.directory.join("attachments").as_path()))
+        });
+        if !managed {
+            return Err(dirty_pull_destination_error(root));
+        }
+    }
+    Ok(())
+}
+
+fn dirty_pull_destination_error(root: &Path) -> anyhow::Error {
+    crate::output::typed_error_with_hint(
+        crate::output::ErrorKind::Conflict,
+        format!(
+            "pull destination `{}` contains local changes or unmanaged files",
+            root.display()
+        ),
+        "choose an empty destination, apply or preserve local changes first, or rerun pull with --force to replace the destination",
+    )
+}
+
+async fn write_items(
+    provider: &dyn ConfluenceProvider,
+    root: &Path,
+    items: Vec<ContentItem>,
+) -> Result<Vec<PathBuf>> {
     let mut item_map = BTreeMap::new();
     for item in items {
         item_map.insert(item.id.clone(), item);
     }
 
     let paths = compute_paths(root, &item_map);
+    let mut path_owners = BTreeMap::new();
+    for (content_id, path) in &paths {
+        if !path.starts_with(root) {
+            return Err(crate::output::typed_error(
+                crate::output::ErrorKind::Api,
+                format!("remote content {content_id} produced a path outside the pull snapshot"),
+            ));
+        }
+        if let Some(previous_id) = path_owners.insert(path.clone(), content_id.clone()) {
+            return Err(crate::output::typed_error(
+                crate::output::ErrorKind::Conflict,
+                format!(
+                    "remote content IDs {previous_id} and {content_id} map to the same local path {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
     let mut docs_to_write = Vec::new();
     let mut written = Vec::new();
     for item in item_map.values() {
         let Some(dir) = paths.get(&item.id) else {
             continue;
         };
-        let attachments = provider
-            .list_attachments(&item.id)
-            .await
-            .unwrap_or_default();
+        let attachments = provider.list_attachments(&item.id).await?;
         let attachments_dir = dir.join("attachments");
         fs::create_dir_all(&attachments_dir)
             .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
 
         let mut attachment_map = BTreeMap::new();
         for attachment in &attachments {
-            let attachment_path = attachments_dir.join(&attachment.title);
+            let file_name = safe_attachment_file_name(&attachment.title)?;
+            let attachment_path = attachments_dir.join(file_name);
             let bytes = provider
                 .download_attachment(&item.id, &attachment.id)
                 .await?;
@@ -605,6 +879,7 @@ async fn pull_items(
             last_pulled_labels: item.labels.clone(),
             last_pulled_status: Some(item.status.clone()),
             last_pulled_properties_hash: Some(props_hash),
+            last_pulled_body_markdown: Some(body_markdown.clone()),
         };
         docs_to_write.push(LocalDocument {
             directory: dir.clone(),
@@ -632,12 +907,64 @@ async fn pull_items(
     Ok(written)
 }
 
+fn safe_attachment_file_name(title: &str) -> Result<&str> {
+    if attachment_file_name_is_safe(title) {
+        return Ok(title);
+    }
+    Err(crate::output::typed_error(
+        crate::output::ErrorKind::Api,
+        format!("remote attachment name `{title}` is not a safe file name"),
+    ))
+}
+
+fn safe_local_attachment_file_name(title: &str) -> Result<&str> {
+    if attachment_file_name_is_safe(title) {
+        return Ok(title);
+    }
+    Err(crate::output::typed_error(
+        crate::output::ErrorKind::InvalidInput,
+        format!("local attachment name `{title}` is not a portable safe file name"),
+    ))
+}
+
+fn attachment_file_name_is_safe(title: &str) -> bool {
+    let mut components = Path::new(title).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+            if title != "."
+                && title != ".."
+                && !title.contains('/')
+                && !title.contains('\\')
+                && !title.contains('\0')
+    )
+}
+
 fn load_local_documents(root: &Path) -> Result<Vec<LocalDocument>> {
     let indexes = scan_local_documents(root)?;
     indexes
         .into_iter()
         .map(|index| load_document(&index.directory))
         .collect()
+}
+
+fn load_required_local_documents(root: &Path) -> Result<Vec<LocalDocument>> {
+    let docs = load_local_documents(root)?;
+    if docs.is_empty() {
+        return Err(crate::output::typed_error_with_hint(
+            crate::output::ErrorKind::InvalidInput,
+            format!(
+                "sync path `{}` contains no index.md documents",
+                root.display()
+            ),
+            "run `confluence pull ...` first or point PATH at a pulled Markdown tree",
+        ));
+    }
+    Ok(docs)
+}
+
+pub fn validate_sync_path(root: &Path) -> Result<()> {
+    load_required_local_documents(root).map(|_| ())
 }
 
 impl LinkIndex {
@@ -1423,7 +1750,14 @@ fn local_attachment_hashes(doc_dir: &Path) -> Result<BTreeMap<String, String>> {
     for entry in WalkDir::new(&attachments_dir).min_depth(1).max_depth(1) {
         let entry = entry?;
         if !entry.file_type().is_file() {
-            continue;
+            return Err(crate::output::typed_error_with_hint(
+                crate::output::ErrorKind::InvalidInput,
+                format!(
+                    "attachment path `{}` is not a regular file",
+                    entry.path().display()
+                ),
+                "place attachment files directly in the page's attachments directory",
+            ));
         }
         let bytes = fs::read(entry.path())
             .with_context(|| format!("failed to read {}", entry.path().display()))?;
@@ -1437,6 +1771,7 @@ fn local_attachment_hashes(doc_dir: &Path) -> Result<BTreeMap<String, String>> {
                     entry.path().display()
                 )
             })?;
+        safe_local_attachment_file_name(file_name)?;
         hashes.insert(file_name.to_string(), sha256_hex(bytes));
     }
     Ok(hashes)
@@ -1502,7 +1837,8 @@ async fn sync_attachments(
     let refreshed = provider.list_attachments(content_id).await?;
     let mut attachment_map = BTreeMap::new();
     for attachment in refreshed {
-        let path = attachments_dir.join(&attachment.title);
+        let file_name = safe_attachment_file_name(&attachment.title)?;
+        let path = attachments_dir.join(file_name);
         let sha = if path.exists() {
             Some(sha256_hex(fs::read(&path)?))
         } else {
@@ -1535,6 +1871,224 @@ mod tests {
         render_document,
     };
     use crate::model::ProviderKind;
+
+    fn write_clean_managed_document(root: &Path, body: &str) -> PathBuf {
+        let page_dir = root.join("root-page--123");
+        fs::create_dir_all(&page_dir).expect("create page directory");
+        let frontmatter = Frontmatter {
+            title: "Root Page".to_string(),
+            kind: "page".to_string(),
+            labels: vec!["managed".to_string()],
+            status: "current".to_string(),
+            parent: None,
+            properties: BTreeMap::new(),
+        };
+        let storage = markdown_to_storage(body, false).expect("storage");
+        fs::write(
+            page_dir.join("index.md"),
+            render_document(&frontmatter, body).expect("render markdown"),
+        )
+        .expect("write markdown");
+        fs::write(
+            page_dir.join(".confluence.json"),
+            serde_json::to_string_pretty(&Sidecar {
+                content_id: Some("123".to_string()),
+                space_key: Some("DOCS".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                remote_version: Some(3),
+                last_pulled_hash: Some(markdown_body_hash(body)),
+                last_pulled_body_markdown: Some(body.to_string()),
+                storage_hash: Some(sha256_hex(storage.storage.as_bytes())),
+                last_pulled_title: Some("Root Page".to_string()),
+                last_pulled_labels: vec!["managed".to_string()],
+                last_pulled_status: Some("current".to_string()),
+                last_pulled_properties_hash: Some(properties_hash(&BTreeMap::new())),
+                ..Sidecar::default()
+            })
+            .expect("serialize sidecar"),
+        )
+        .expect("write sidecar");
+        page_dir
+    }
+
+    #[test]
+    fn pull_destination_accepts_clean_managed_snapshot() {
+        let dir = tempdir().expect("tempdir");
+        write_clean_managed_document(dir.path(), "# Root");
+        validate_pull_destination(dir.path(), false).expect("clean pull destination");
+    }
+
+    #[test]
+    fn pull_destination_rejects_local_markdown_changes_without_force() {
+        let dir = tempdir().expect("tempdir");
+        let page_dir = write_clean_managed_document(dir.path(), "# Root");
+        fs::write(
+            page_dir.join("index.md"),
+            render_document(
+                &Frontmatter {
+                    title: "Root Page".to_string(),
+                    kind: "page".to_string(),
+                    labels: vec!["managed".to_string()],
+                    status: "current".to_string(),
+                    parent: None,
+                    properties: BTreeMap::new(),
+                },
+                "# Locally edited",
+            )
+            .expect("render edited markdown"),
+        )
+        .expect("edit markdown");
+
+        let error = validate_pull_destination(dir.path(), false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("local changes or unmanaged files")
+        );
+        validate_pull_destination(dir.path(), true).expect("force permits replacement");
+    }
+
+    #[test]
+    fn pull_destination_rejects_unmanaged_files_without_force() {
+        let dir = tempdir().expect("tempdir");
+        write_clean_managed_document(dir.path(), "# Root");
+        fs::write(dir.path().join("notes.txt"), "keep me").expect("write unmanaged file");
+
+        assert!(validate_pull_destination(dir.path(), false).is_err());
+    }
+
+    #[test]
+    fn pull_destination_rejects_unmanaged_directories_without_force() {
+        let dir = tempdir().expect("tempdir");
+        write_clean_managed_document(dir.path(), "# Root");
+        fs::create_dir(dir.path().join("private-notes")).expect("unmanaged directory");
+
+        assert!(validate_pull_destination(dir.path(), false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_destination_rejects_symbolic_links_even_with_force() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        fs::create_dir(&target).expect("target directory");
+        let link = dir.path().join("destination");
+        symlink(&target, &link).expect("destination symlink");
+
+        assert!(validate_pull_destination(&link, false).is_err());
+        assert!(validate_pull_destination(&link, true).is_err());
+    }
+
+    #[test]
+    fn pull_destination_treats_deleted_pulled_attachment_as_local_change() {
+        let dir = tempdir().expect("tempdir");
+        let page_dir = write_clean_managed_document(dir.path(), "# Root");
+        let attachments = page_dir.join("attachments");
+        fs::create_dir_all(&attachments).expect("attachments directory");
+        let attachment_path = attachments.join("report.txt");
+        fs::write(&attachment_path, "report").expect("attachment");
+        let mut doc = load_document(&page_dir).expect("load document");
+        doc.sidecar.attachment_map.insert(
+            "report.txt".to_string(),
+            AttachmentState {
+                id: "attachment-1".to_string(),
+                file_name: "report.txt".to_string(),
+                media_type: Some("text/plain".to_string()),
+                sha256: Some(sha256_hex(b"report")),
+            },
+        );
+        save_document(&doc).expect("save attachment state");
+        validate_pull_destination(dir.path(), false).expect("unchanged attachment");
+
+        fs::remove_file(&attachment_path).expect("delete attachment locally");
+
+        assert!(validate_pull_destination(dir.path(), false).is_err());
+    }
+
+    #[test]
+    fn installing_snapshot_replaces_stale_destination_content() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("destination");
+        let staged = dir.path().join("staged");
+        fs::create_dir_all(&root).expect("create destination");
+        fs::create_dir_all(&staged).expect("create staged snapshot");
+        fs::write(root.join("stale.txt"), "stale").expect("write stale file");
+        fs::write(staged.join("fresh.txt"), "fresh").expect("write fresh file");
+
+        install_staged_snapshot(&staged, &root).expect("install snapshot");
+
+        assert!(!root.join("stale.txt").exists());
+        assert_eq!(fs::read_to_string(root.join("fresh.txt")).unwrap(), "fresh");
+    }
+
+    #[test]
+    fn attachment_names_must_be_single_safe_path_components() {
+        assert_eq!(
+            safe_attachment_file_name("report.pdf").unwrap(),
+            "report.pdf"
+        );
+        for unsafe_name in [
+            "../secret",
+            "folder/file",
+            r"folder\file",
+            "/absolute",
+            ".",
+            "..",
+            "nul\0byte",
+        ] {
+            assert!(
+                safe_attachment_file_name(unsafe_name).is_err(),
+                "accepted unsafe attachment name {unsafe_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_attachment_entries_must_be_regular_files() {
+        let dir = tempdir().expect("tempdir");
+        let attachments = dir.path().join("attachments");
+        fs::create_dir_all(attachments.join("nested")).expect("nested attachment directory");
+        let error = local_attachment_hashes(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("is not a regular file"));
+    }
+
+    #[test]
+    fn plan_diff_compares_last_pulled_body_with_local_body() {
+        let dir = tempdir().expect("tempdir");
+        let page_dir = write_clean_managed_document(dir.path(), "old line\n");
+        let frontmatter = Frontmatter {
+            title: "Root Page".to_string(),
+            kind: "page".to_string(),
+            labels: vec!["managed".to_string()],
+            status: "current".to_string(),
+            parent: None,
+            properties: BTreeMap::new(),
+        };
+        fs::write(
+            page_dir.join("index.md"),
+            render_document(&frontmatter, "new line\n").expect("render changed document"),
+        )
+        .expect("write changed document");
+
+        let plan = plan_path(dir.path(), false, false, true).expect("plan");
+        let update = plan
+            .items
+            .iter()
+            .find(|item| item.action == PlanActionKind::UpdateContent)
+            .expect("update action");
+        let diff = update.diff.as_deref().expect("body diff");
+        assert!(diff.contains("-old line"));
+        assert!(diff.contains("+new line"));
+    }
+
+    #[test]
+    fn empty_sync_path_is_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let error = plan_path(dir.path(), false, false, false).unwrap_err();
+        assert!(error.to_string().contains("contains no index.md documents"));
+    }
 
     #[test]
     fn plan_detects_new_document() {

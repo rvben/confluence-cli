@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use comfy_table::{Cell, Table, presets::UTF8_FULL};
 use serde::Serialize;
+use serde_json::Value;
 
 pub fn use_color() -> bool {
     !COLOR_DISABLED.load(Ordering::Relaxed)
@@ -16,11 +17,45 @@ static QUIET: AtomicBool = AtomicBool::new(false);
 static COLOR_DISABLED: AtomicBool = AtomicBool::new(false);
 static MACHINE_ERRORS: AtomicBool = AtomicBool::new(false);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    InvalidInput,
+    ConfirmationRequired,
+    ReadOnly,
+    TtyRequired,
+    Auth,
+    NotFound,
+    Api,
+    Network,
+    RateLimit,
+    Conflict,
+    Unexpected,
+}
+
+impl ErrorKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "invalid_input",
+            Self::ConfirmationRequired => "confirmation_required",
+            Self::ReadOnly => "read_only",
+            Self::TtyRequired => "tty_required",
+            Self::Auth => "auth",
+            Self::NotFound => "not_found",
+            Self::Api => "api_error",
+            Self::Network => "network",
+            Self::RateLimit => "rate_limit",
+            Self::Conflict => "conflict",
+            Self::Unexpected => "unexpected_error",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CliError {
-    pub kind: &'static str,
+    pub kind: ErrorKind,
     pub message: String,
     pub hint: Option<String>,
+    pub details: Option<Value>,
 }
 
 impl Display for CliError {
@@ -31,17 +66,18 @@ impl Display for CliError {
 
 impl std::error::Error for CliError {}
 
-pub fn typed_error(kind: &'static str, message: impl Into<String>) -> anyhow::Error {
+pub fn typed_error(kind: ErrorKind, message: impl Into<String>) -> anyhow::Error {
     CliError {
         kind,
         message: message.into(),
         hint: None,
+        details: None,
     }
     .into()
 }
 
 pub fn typed_error_with_hint(
-    kind: &'static str,
+    kind: ErrorKind,
     message: impl Into<String>,
     hint: impl Into<String>,
 ) -> anyhow::Error {
@@ -49,17 +85,33 @@ pub fn typed_error_with_hint(
         kind,
         message: message.into(),
         hint: Some(hint.into()),
+        details: None,
+    }
+    .into()
+}
+
+pub fn typed_error_with_details(
+    kind: ErrorKind,
+    message: impl Into<String>,
+    hint: Option<String>,
+    details: Value,
+) -> anyhow::Error {
+    CliError {
+        kind,
+        message: message.into(),
+        hint,
+        details: Some(details),
     }
     .into()
 }
 
 pub fn http_error(status: reqwest::StatusCode, message: impl Into<String>) -> anyhow::Error {
     let kind = match status {
-        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => "auth",
-        reqwest::StatusCode::NOT_FOUND => "not_found",
-        reqwest::StatusCode::TOO_MANY_REQUESTS => "rate_limit",
-        reqwest::StatusCode::CONFLICT => "conflict",
-        _ => "api_error",
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => ErrorKind::Auth,
+        reqwest::StatusCode::NOT_FOUND => ErrorKind::NotFound,
+        reqwest::StatusCode::TOO_MANY_REQUESTS => ErrorKind::RateLimit,
+        reqwest::StatusCode::CONFLICT => ErrorKind::Conflict,
+        _ => ErrorKind::Api,
     };
     typed_error(kind, message)
 }
@@ -159,6 +211,16 @@ pub fn print_error(kind: &str, message: &str, hint: Option<&str>) -> ! {
 }
 
 pub fn render_error(kind: &str, message: &str, hint: Option<&str>, machine: bool) -> i32 {
+    render_error_with_details(kind, message, hint, None, machine)
+}
+
+fn render_error_with_details(
+    kind: &str,
+    message: &str,
+    hint: Option<&str>,
+    details: Option<&Value>,
+    machine: bool,
+) -> i32 {
     let mut obj = serde_json::json!({
         "error": {
             "kind": kind,
@@ -167,6 +229,9 @@ pub fn render_error(kind: &str, message: &str, hint: Option<&str>, machine: bool
     });
     if let Some(hint) = hint {
         obj["error"]["hint"] = serde_json::Value::String(hint.to_string());
+    }
+    if let Some(details) = details {
+        obj["error"]["details"] = details.clone();
     }
     let exit_code = match kind {
         "invalid_input" | "confirmation_required" | "read_only" | "tty_required" => 2,
@@ -193,13 +258,19 @@ pub fn render_anyhow(error: &anyhow::Error, machine: bool) -> i32 {
     let message = format!("{error:#}");
     for cause in error.chain() {
         if let Some(typed) = cause.downcast_ref::<CliError>() {
-            return render_error(typed.kind, &message, typed.hint.as_deref(), machine);
+            return render_error_with_details(
+                typed.kind.as_str(),
+                &message,
+                typed.hint.as_deref(),
+                typed.details.as_ref(),
+                machine,
+            );
         }
         if let Some(request) = cause.downcast_ref::<reqwest::Error>() {
             let kind = if request.is_connect() || request.is_timeout() {
-                "network"
+                ErrorKind::Network.as_str()
             } else {
-                "api_error"
+                ErrorKind::Api.as_str()
             };
             return render_error(
                 kind,
@@ -211,10 +282,35 @@ pub fn render_anyhow(error: &anyhow::Error, machine: bool) -> i32 {
         if let Some(io_error) = cause.downcast_ref::<std::io::Error>()
             && io_error.kind() == std::io::ErrorKind::NotFound
         {
-            return render_error("not_found", &message, None, machine);
+            return render_error(ErrorKind::NotFound.as_str(), &message, None, machine);
         }
     }
-    render_error("unexpected_error", &message, None, machine)
+    render_error(ErrorKind::Unexpected.as_str(), &message, None, machine)
+}
+
+pub fn classify_anyhow(error: &anyhow::Error) -> (ErrorKind, Option<String>) {
+    for cause in error.chain() {
+        if let Some(typed) = cause.downcast_ref::<CliError>() {
+            return (typed.kind, typed.hint.clone());
+        }
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>() {
+            let kind = if request.is_connect() || request.is_timeout() {
+                ErrorKind::Network
+            } else {
+                ErrorKind::Api
+            };
+            return (
+                kind,
+                Some("run `confluence doctor` to check connectivity".to_string()),
+            );
+        }
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>()
+            && io_error.kind() == std::io::ErrorKind::NotFound
+        {
+            return (ErrorKind::NotFound, None);
+        }
+    }
+    (ErrorKind::Unexpected, None)
 }
 
 pub fn machine_readable_errors<I>(args: I, stdout_is_terminal: bool) -> bool

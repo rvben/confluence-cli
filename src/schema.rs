@@ -56,6 +56,9 @@ fn arg_to_json(arg: &clap::Arg) -> Value {
 }
 
 fn is_mutating(path: &str) -> bool {
+    if path.starts_with("pull ") {
+        return true;
+    }
     let mutating_verbs = [
         "create", "update", "delete", "move", "add", "upload", "set", "apply", "pull", "remove",
         "login", "logout", "migrate", "use", "init",
@@ -95,7 +98,7 @@ fn is_idempotent(path: &str) -> bool {
     !is_mutating(path)
         || matches!(
             path,
-            "profile use" | "label add" | "label remove" | "property set" | "property delete"
+            "profile use" | "label add" | "label remove" | "property delete"
         )
 }
 
@@ -104,11 +107,18 @@ fn output_fields_for(path: &str) -> Vec<Value> {
         vec![
             json!({"name": "id", "type": "string"}),
             json!({"name": "kind", "type": "string"}),
+            json!({"name": "space_id", "type": "string|null"}),
             json!({"name": "space_key", "type": "string|null"}),
             json!({"name": "title", "type": "string"}),
             json!({"name": "status", "type": "string"}),
             json!({"name": "version", "type": "integer|null"}),
             json!({"name": "parent_id", "type": "string|null"}),
+            json!({"name": "body_storage", "type": "string|null"}),
+            json!({"name": "labels", "type": "array"}),
+            json!({"name": "properties", "type": "object"}),
+            json!({"name": "web_url", "type": "string|null"}),
+            json!({"name": "created_at", "type": "string|null"}),
+            json!({"name": "updated_at", "type": "string|null"}),
         ]
     };
 
@@ -149,6 +159,7 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "name", "type": "string"}),
             json!({"name": "space_type", "type": "string|null"}),
             json!({"name": "homepage_id", "type": "string|null"}),
+            json!({"name": "web_url", "type": "string|null"}),
         ],
 
         "search" => vec![
@@ -156,6 +167,7 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "kind", "type": "string"}),
             json!({"name": "space_key", "type": "string|null"}),
             json!({"name": "title", "type": "string"}),
+            json!({"name": "excerpt", "type": "string|null"}),
             json!({"name": "web_url", "type": "string|null"}),
         ],
 
@@ -165,6 +177,7 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "media_type", "type": "string|null"}),
             json!({"name": "file_size", "type": "integer|null"}),
             json!({"name": "download_url", "type": "string|null"}),
+            json!({"name": "comment", "type": "string|null"}),
         ],
 
         "comment list" | "comment add" | "comment update" => vec![
@@ -172,6 +185,7 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "author", "type": "string|null"}),
             json!({"name": "created_at", "type": "string|null"}),
             json!({"name": "body_storage", "type": "string"}),
+            json!({"name": "version", "type": "integer|null"}),
         ],
 
         "property list" | "property get" | "property set" => vec![
@@ -302,7 +316,6 @@ const LIST_COMMANDS: &[&str] = &[
 fn walk_commands(cmd: &clap::Command, prefix: &str, out: &mut Vec<Value>) {
     let global_ids = [
         "help",
-        "version",
         "output_format",
         "json",
         "profile",
@@ -330,7 +343,10 @@ fn walk_commands(cmd: &clap::Command, prefix: &str, out: &mut Vec<Value>) {
             let mut args: Vec<Value> = Vec::new();
 
             for arg in sub.get_arguments() {
-                if global_ids.contains(&arg.get_id().as_str()) || arg.is_hide_set() {
+                if arg.is_global_set()
+                    || global_ids.contains(&arg.get_id().as_str())
+                    || arg.is_hide_set()
+                {
                     continue;
                 }
                 args.push(arg_to_json(arg));
@@ -538,7 +554,14 @@ fn enrich_v03(document: &mut Value) {
         }
         if name == "attachment upload" {
             object.insert("destructive_when".into(), json!(["--replace"]));
+            object.insert("requires_confirmation_when".into(), json!(["--replace"]));
             object.insert("partial_success_possible".into(), json!(true));
+        }
+        if name.starts_with("pull ") {
+            object.insert("mutating".into(), json!(true));
+            object.insert("idempotent".into(), json!(false));
+            object.insert("overwrites_when".into(), json!(["--force"]));
+            object.insert("destructive_when".into(), json!(["--force"]));
         }
         if matches!(
             name.as_str(),
@@ -769,6 +792,77 @@ mod tests {
                 .find(|argument| argument["name"] == argument_name)
                 .unwrap();
             assert_eq!(argument["type"], "integer");
+        }
+    }
+
+    #[test]
+    fn schema_exposes_command_local_version_arguments() {
+        let schema = generate(&test_cmd());
+        for name in ["page update", "blog update"] {
+            let command = schema["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|command| command["name"] == name)
+                .unwrap();
+            assert!(
+                command["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|argument| argument["name"] == "--version"),
+                "{name} omitted --version"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_marks_conditional_overwrites_and_non_idempotent_property_sets() {
+        let schema = generate(&test_cmd());
+        let command = |name: &str| {
+            schema["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|command| command["name"] == name)
+                .unwrap()
+        };
+        assert_eq!(command("property set")["idempotent"], false);
+        for name in ["pull page", "pull tree", "pull space"] {
+            assert_eq!(command(name)["mutating"], true);
+            assert_eq!(command(name)["overwrites_when"], json!(["--force"]));
+            assert_eq!(command(name)["destructive_when"], json!(["--force"]));
+        }
+        assert_eq!(
+            command("attachment upload")["requires_confirmation_when"],
+            json!(["--replace"])
+        );
+    }
+
+    #[test]
+    fn schema_output_fields_are_unique_and_include_runtime_content_fields() {
+        let schema = generate(&test_cmd());
+        for command in schema["commands"].as_array().unwrap() {
+            let mut seen = std::collections::BTreeSet::new();
+            for field in command["output_fields"].as_array().into_iter().flatten() {
+                let name = field["name"].as_str().unwrap();
+                assert!(seen.insert(name), "duplicate output field {name}");
+            }
+        }
+        let page_get = schema["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "page get")
+            .unwrap();
+        let fields = page_get["output_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|field| field["name"].as_str())
+            .collect::<Vec<_>>();
+        for expected in ["body_storage", "labels", "properties", "web_url"] {
+            assert!(fields.contains(&expected), "missing {expected}");
         }
     }
 }

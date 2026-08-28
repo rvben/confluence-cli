@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use serde::Serialize;
@@ -89,7 +89,7 @@ enum Commands {
     Search(SearchArgs),
     /// List, inspect, create, update, move, or delete pages
     #[command(
-        after_help = "Page references accept a numeric ID, a Confluence URL, or SPACE:Title.\n\nExamples:\n  confluence page get DOCS:Getting Started\n  confluence page create 'Release Notes' DOCS --body-file release.md\n  confluence page update DOCS:Roadmap --body-file roadmap.md"
+        after_help = "Page references accept a numeric ID, a Confluence URL, or SPACE:Title.\n\nExamples:\n  confluence page get 'DOCS:Getting Started'\n  confluence page create 'Release Notes' DOCS --body-file release.md\n  confluence page update DOCS:Roadmap --body-file roadmap.md"
     )]
     Page {
         #[command(subcommand)]
@@ -141,11 +141,17 @@ enum Commands {
         command: PropertyCommand,
     },
     /// Generate a completion script for a supported shell
+    #[command(
+        after_help = "This command always writes an opaque shell script; --output does not transform it."
+    )]
     Completions {
         /// Shell whose completion syntax should be generated
         shell: Shell,
     },
     /// Output JSON schema for agent integration
+    #[command(
+        after_help = "This command always writes JSON; --output does not transform the schema."
+    )]
     Schema {
         /// Return only one complete command path
         #[arg(long)]
@@ -290,9 +296,9 @@ enum PageCommand {
         parent: String,
     },
     /// Create a page from Markdown or Confluence storage-format content
-    Create(WriteContentArgs),
+    Create(PageWriteContentArgs),
     /// Update a page while preserving unspecified content and metadata
-    Update(UpdateContentArgs),
+    Update(PageUpdateContentArgs),
     /// Permanently delete a page after confirmation
     Delete {
         /// Page ID, Confluence URL, or SPACE:Title
@@ -328,9 +334,9 @@ enum BlogCommand {
         show_body: bool,
     },
     /// Create a blog post from Markdown or storage-format content
-    Create(WriteContentArgs),
+    Create(BlogWriteContentArgs),
     /// Update a blog post while preserving unspecified content and metadata
-    Update(UpdateContentArgs),
+    Update(BlogUpdateContentArgs),
     /// Permanently delete a blog post after confirmation
     Delete {
         /// Blog post content ID
@@ -346,6 +352,9 @@ enum PullCommand {
         reference: String,
         /// Destination directory
         output: PathBuf,
+        /// Replace a dirty or unmanaged destination with the remote snapshot
+        #[arg(long)]
+        force: bool,
     },
     /// Export a page and all descendants to a Markdown tree
     Tree {
@@ -353,6 +362,9 @@ enum PullCommand {
         reference: String,
         /// Destination directory
         output: PathBuf,
+        /// Replace a dirty or unmanaged destination with the remote snapshot
+        #[arg(long)]
+        force: bool,
     },
     /// Export every page in a space
     Space {
@@ -360,9 +372,12 @@ enum PullCommand {
         space: String,
         /// Destination directory
         output: PathBuf,
-        /// Export only content updated since this RFC 3339 timestamp
+        /// Export only content updated since YYYY-MM-DD or an RFC 3339 timestamp
         #[arg(long, value_parser = validate_since)]
         since: Option<String>,
+        /// Replace a dirty or unmanaged destination with the remote snapshot
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -370,7 +385,7 @@ enum PullCommand {
 struct PlanArgs {
     /// Local Markdown sync directory created by pull
     path: PathBuf,
-    /// Permit conversions that preserve unsupported storage fragments verbatim
+    /// Allow conversions that may escape or degrade unsupported Confluence XML
     #[arg(long)]
     allow_lossy: bool,
     /// Plan deletion of remote attachments removed from the local tree
@@ -385,7 +400,7 @@ struct PlanArgs {
 struct ApplyArgs {
     /// Local Markdown sync directory created by pull
     path: PathBuf,
-    /// Permit conversions that preserve unsupported storage fragments verbatim
+    /// Allow conversions that may escape or degrade unsupported Confluence XML
     #[arg(long)]
     allow_lossy: bool,
     /// Delete remote attachments removed from the local tree; requires confirmation
@@ -587,13 +602,13 @@ struct BodyInput {
     /// Input representation: Markdown is converted to Confluence storage format
     #[arg(long, value_enum, default_value_t = BodyFormat::Markdown)]
     format: BodyFormat,
-    /// Preserve unsupported Confluence fragments instead of refusing conversion
+    /// Allow raw Confluence XML to be escaped or degraded instead of refusing conversion
     #[arg(long)]
     allow_lossy: bool,
 }
 
 #[derive(Args, Debug)]
-struct WriteContentArgs {
+struct PageWriteContentArgs {
     /// New page or blog-post title
     title: String,
     /// Destination space key
@@ -615,8 +630,8 @@ struct WriteContentArgs {
 }
 
 #[derive(Args, Debug)]
-struct UpdateContentArgs {
-    /// Page ID, page URL, SPACE:Title, or blog-post content ID
+struct PageUpdateContentArgs {
+    /// Page ID, page URL, or SPACE:Title
     reference: String,
     /// Replacement title; preserves the existing title when omitted
     #[arg(long)]
@@ -624,6 +639,54 @@ struct UpdateContentArgs {
     /// Replacement parent page ID, URL, or SPACE:Title; pages only
     #[arg(long)]
     parent: Option<String>,
+    #[command(flatten)]
+    body: BodyInput,
+    /// Label to merge into existing labels; repeat for multiple labels
+    #[arg(long = "label")]
+    labels: Vec<String>,
+    /// Content property as key=value to merge; repeat for multiple properties
+    #[arg(long = "property")]
+    properties: Vec<String>,
+    /// Replace all labels instead of merging supplied labels
+    #[arg(long)]
+    replace_labels: bool,
+    /// Replace all properties instead of merging supplied properties
+    #[arg(long)]
+    replace_properties: bool,
+    /// Expected current version; defaults to the version fetched before updating
+    #[arg(long)]
+    version: Option<u64>,
+    /// Confluence content status
+    #[arg(long, default_value = "current", value_parser = ["current", "draft"])]
+    status: String,
+}
+
+#[derive(Args, Debug)]
+struct BlogWriteContentArgs {
+    /// New blog-post title
+    title: String,
+    /// Destination space key
+    space: String,
+    #[command(flatten)]
+    body: BodyInput,
+    /// Label to add; repeat for multiple labels
+    #[arg(long = "label")]
+    labels: Vec<String>,
+    /// Content property as key=value; repeat for multiple properties
+    #[arg(long = "property")]
+    properties: Vec<String>,
+    /// Confluence content status
+    #[arg(long, default_value = "current", value_parser = ["current", "draft"])]
+    status: String,
+}
+
+#[derive(Args, Debug)]
+struct BlogUpdateContentArgs {
+    /// Blog-post content ID
+    reference: String,
+    /// Replacement title; preserves the existing title when omitted
+    #[arg(long)]
+    title: Option<String>,
     #[command(flatten)]
     body: BodyInput,
     /// Label to merge into existing labels; repeat for multiple labels
@@ -855,6 +918,7 @@ pub async fn run() -> Result<()> {
             render_plan(&plan, output, show_diff)
         }
         Commands::Apply(args) => {
+            sync::validate_sync_path(&args.path)?;
             if args.delete_remote {
                 confirm_destructive(
                     yes,
@@ -898,7 +962,7 @@ pub async fn run() -> Result<()> {
                 Ok(())
             } else {
                 Err(crate::output::typed_error(
-                    "not_found",
+                    crate::output::ErrorKind::NotFound,
                     format!("command `{}` is not declared", command.unwrap_or_default()),
                 ))
             }
@@ -1022,8 +1086,26 @@ async fn handle_auth(
             }
         }
         AuthCommand::Logout => {
-            confirm_destructive(yes, "Remove the selected profile credential?")?;
-            let name = logout(profile_override)?;
+            let config = AppConfig::load()?;
+            let name = profile_override
+                .map(ToOwned::to_owned)
+                .or_else(|| config.active_profile.clone())
+                .ok_or_else(|| {
+                    crate::output::typed_error_with_hint(
+                        crate::output::ErrorKind::Auth,
+                        "no active profile configured",
+                        "select a stored profile with --profile or run `confluence auth login`",
+                    )
+                })?;
+            if !config.profiles.contains_key(&name) {
+                return Err(crate::output::typed_error_with_hint(
+                    crate::output::ErrorKind::NotFound,
+                    format!("profile `{name}` not found"),
+                    "run `confluence profile list` to see configured profiles",
+                ));
+            }
+            confirm_destructive(yes, &format!("Remove credential for profile `{name}`?"))?;
+            let name = logout(Some(&name))?;
             if output.is_json() {
                 print_json(&json!({ "profile": name, "status": "logged_out" }))?;
             } else {
@@ -1065,6 +1147,7 @@ async fn handle_doctor(
         checks: Vec::new(),
         summary: DoctorSummary::default(),
     };
+    let mut failure_kind = None;
 
     if report.config_exists {
         push_doctor_check(
@@ -1088,6 +1171,7 @@ async fn handle_doctor(
     let config = match AppConfig::load() {
         Ok(config) => config,
         Err(err) => {
+            let (kind, _) = crate::output::classify_anyhow(&err);
             push_doctor_check(
                 &mut report,
                 "config_load",
@@ -1096,7 +1180,13 @@ async fn handle_doctor(
             );
             finalize_doctor_summary(&mut report);
             render_doctor(&report, output)?;
-            bail!("doctor found {} failing check(s)", report.summary.failed);
+            return Err(crate::output::typed_error(
+                kind,
+                format!(
+                    "doctor found {} failing check(s): {err:#}",
+                    report.summary.failed
+                ),
+            ));
         }
     };
     report.active_profile = config.active_profile.clone();
@@ -1121,6 +1211,7 @@ async fn handle_doctor(
             profile
         }
         Err(err) => {
+            let (kind, _) = crate::output::classify_anyhow(&err);
             push_doctor_check(
                 &mut report,
                 "profile_resolution",
@@ -1129,7 +1220,13 @@ async fn handle_doctor(
             );
             finalize_doctor_summary(&mut report);
             render_doctor(&report, output)?;
-            bail!("doctor found {} failing check(s)", report.summary.failed);
+            return Err(crate::output::typed_error(
+                kind,
+                format!(
+                    "doctor found {} failing check(s): {err:#}",
+                    report.summary.failed
+                ),
+            ));
         }
     };
 
@@ -1140,15 +1237,21 @@ async fn handle_doctor(
             DoctorCheckStatus::Pass,
             format!("using host {}", url.host_str().unwrap_or_default()),
         ),
-        Err(err) => push_doctor_check(
-            &mut report,
-            "base_url",
-            DoctorCheckStatus::Fail,
-            format!("invalid base URL `{}`: {err}", profile.base_url),
-        ),
+        Err(err) => {
+            failure_kind.get_or_insert(crate::output::ErrorKind::InvalidInput);
+            push_doctor_check(
+                &mut report,
+                "base_url",
+                DoctorCheckStatus::Fail,
+                format!("invalid base URL `{}`: {err}", profile.base_url),
+            )
+        }
     }
 
     let (auth_status, auth_details) = doctor_auth_check(&profile);
+    if auth_status == DoctorCheckStatus::Fail {
+        failure_kind.get_or_insert(crate::output::ErrorKind::Auth);
+    }
     push_doctor_check(&mut report, "auth", auth_status, auth_details);
 
     let expiration = crate::config::expiration_status(profile.expires_at.as_deref());
@@ -1180,6 +1283,9 @@ async fn handle_doctor(
                 .to_string(),
         ),
     };
+    if expiration_check.0 == DoctorCheckStatus::Fail {
+        failure_kind.get_or_insert(crate::output::ErrorKind::Auth);
+    }
     push_doctor_check(
         &mut report,
         "token_expiration",
@@ -1203,12 +1309,16 @@ async fn handle_doctor(
                 DoctorCheckStatus::Pass,
                 format!("{} API reachable at {}", profile.provider, profile.base_url),
             ),
-            Err(err) => push_doctor_check(
-                &mut report,
-                "connectivity",
-                DoctorCheckStatus::Fail,
-                err.to_string(),
-            ),
+            Err(err) => {
+                let (kind, _) = crate::output::classify_anyhow(&err);
+                failure_kind.get_or_insert(kind);
+                push_doctor_check(
+                    &mut report,
+                    "connectivity",
+                    DoctorCheckStatus::Fail,
+                    err.to_string(),
+                )
+            }
         }
 
         if let Some(space) = args.space.as_deref() {
@@ -1220,18 +1330,23 @@ async fn handle_doctor(
                     DoctorCheckStatus::Pass,
                     format!("resolved space `{}` ({})", found.key, found.name),
                 ),
-                Err(err) => push_doctor_check(
-                    &mut report,
-                    "space_access",
-                    DoctorCheckStatus::Fail,
-                    format!("failed to access space `{space}`: {err}"),
-                ),
+                Err(err) => {
+                    let (kind, _) = crate::output::classify_anyhow(&err);
+                    failure_kind.get_or_insert(kind);
+                    push_doctor_check(
+                        &mut report,
+                        "space_access",
+                        DoctorCheckStatus::Fail,
+                        format!("failed to access space `{space}`: {err}"),
+                    )
+                }
             }
         }
     }
 
     if let Some(path) = args.path.as_deref() {
         if !path.exists() {
+            failure_kind.get_or_insert(crate::output::ErrorKind::NotFound);
             push_doctor_check(
                 &mut report,
                 "sync_path",
@@ -1249,12 +1364,16 @@ async fn handle_doctor(
                         plan.items.len()
                     ),
                 ),
-                Err(err) => push_doctor_check(
-                    &mut report,
-                    "sync_path",
-                    DoctorCheckStatus::Fail,
-                    format!("failed to inspect `{}`: {err}", path.display()),
-                ),
+                Err(err) => {
+                    let (kind, _) = crate::output::classify_anyhow(&err);
+                    failure_kind.get_or_insert(kind);
+                    push_doctor_check(
+                        &mut report,
+                        "sync_path",
+                        DoctorCheckStatus::Fail,
+                        format!("failed to inspect `{}`: {err}", path.display()),
+                    )
+                }
             }
         }
     }
@@ -1262,7 +1381,10 @@ async fn handle_doctor(
     finalize_doctor_summary(&mut report);
     render_doctor(&report, output)?;
     if report.summary.failed > 0 {
-        bail!("doctor found {} failing check(s)", report.summary.failed);
+        return Err(crate::output::typed_error(
+            failure_kind.unwrap_or(crate::output::ErrorKind::Unexpected),
+            format!("doctor found {} failing check(s)", report.summary.failed),
+        ));
     }
     Ok(())
 }
@@ -1367,8 +1489,15 @@ fn handle_profile(command: ProfileCommand, output: OutputFormat, yes: bool) -> R
             )?;
         }
         ProfileCommand::Remove { name } => {
-            confirm_destructive(yes, &format!("Remove profile `{name}` and its credential?"))?;
             let mut config = AppConfig::load()?;
+            if !config.profiles.contains_key(&name) {
+                return Err(crate::output::typed_error_with_hint(
+                    crate::output::ErrorKind::NotFound,
+                    format!("profile `{name}` not found"),
+                    "run `confluence profile list` to see configured profiles",
+                ));
+            }
+            confirm_destructive(yes, &format!("Remove profile `{name}` and its credential?"))?;
             let original = config.clone();
             let uses_keyring = config
                 .profiles
@@ -1403,7 +1532,7 @@ fn login_input(args: ProfileInputArgs, name: Option<String>) -> Result<LoginInpu
         let value = value.trim_end_matches(['\r', '\n']).to_string();
         if value.is_empty() {
             return Err(crate::output::typed_error(
-                "invalid_input",
+                crate::output::ErrorKind::InvalidInput,
                 "token read from stdin is empty",
             ));
         }
@@ -1536,7 +1665,7 @@ async fn handle_page(
             fields,
         } => {
             let mut pages = provider
-                .list_space_content(ContentKind::Page, &space, false)
+                .list_space_content(ContentKind::Page, &space)
                 .await?;
             let total = pages.len();
             if !all {
@@ -1592,7 +1721,10 @@ async fn handle_page(
                     parent_id: Some(parent_id),
                     body_storage: current.body_storage.unwrap_or_default(),
                     version: current.version.ok_or_else(|| {
-                        crate::output::typed_error("api_error", "page version unavailable")
+                        crate::output::typed_error(
+                            crate::output::ErrorKind::Api,
+                            "page version unavailable",
+                        )
                     })?,
                     message: Some("Moved via confluence-cli".to_string()),
                     status: current.status,
@@ -1661,7 +1793,10 @@ async fn handle_page(
                     parent_id,
                     body_storage,
                     version: args.version.or(current.version).ok_or_else(|| {
-                        crate::output::typed_error("api_error", "page version unavailable")
+                        crate::output::typed_error(
+                            crate::output::ErrorKind::Api,
+                            "page version unavailable",
+                        )
                     })?,
                     message: Some("Updated via confluence-cli".to_string()),
                     status: args.status,
@@ -1696,7 +1831,7 @@ async fn handle_blog(
             fields,
         } => {
             let mut posts = provider
-                .list_space_content(ContentKind::BlogPost, &space, false)
+                .list_space_content(ContentKind::BlogPost, &space)
                 .await?;
             let total = posts.len();
             if !all {
@@ -1776,7 +1911,10 @@ async fn handle_blog(
                     parent_id: None,
                     body_storage,
                     version: args.version.or(current.version).ok_or_else(|| {
-                        crate::output::typed_error("api_error", "blog version unavailable")
+                        crate::output::typed_error(
+                            crate::output::ErrorKind::Api,
+                            "blog version unavailable",
+                        )
                     })?,
                     message: Some("Updated via confluence-cli".to_string()),
                     status: args.status,
@@ -1805,21 +1943,26 @@ async fn handle_pull(
     output: OutputFormat,
 ) -> Result<()> {
     let written = match command {
-        PullCommand::Page { reference, output } => {
-            sync::pull_page(provider, &reference, &output, false).await?
-        }
-        PullCommand::Tree { reference, output } => {
-            sync::pull_page(provider, &reference, &output, true).await?
-        }
+        PullCommand::Page {
+            reference,
+            output,
+            force,
+        } => sync::pull_page(provider, &reference, &output, false, force).await?,
+        PullCommand::Tree {
+            reference,
+            output,
+            force,
+        } => sync::pull_page(provider, &reference, &output, true, force).await?,
         PullCommand::Space {
             space,
             output,
             since,
+            force,
         } => {
             if let Some(since) = since {
-                sync::pull_space_since(provider, &space, &output, &since).await?
+                sync::pull_space_since(provider, &space, &output, &since, force).await?
             } else {
-                sync::pull_space(provider, &space, &output).await?
+                sync::pull_space(provider, &space, &output, force).await?
             }
         }
     };
@@ -1901,7 +2044,7 @@ async fn handle_attachment(
                     .with_context(|| format!("cannot read upload file `{}`", file.display()))?;
                 if !metadata.is_file() {
                     return Err(crate::output::typed_error(
-                        "invalid_input",
+                        crate::output::ErrorKind::InvalidInput,
                         format!("upload path `{}` is not a regular file", file.display()),
                     ));
                 }
@@ -1922,24 +2065,28 @@ async fn handle_attachment(
                 {
                     Ok(item) => uploaded.push(item),
                     Err(error) => {
-                        let completed = uploaded
+                        let completed_names = uploaded
                             .iter()
                             .map(|item: &AttachmentInfo| item.title.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        return Err(error).with_context(|| {
+                            .collect::<Vec<_>>();
+                        let (kind, hint) = crate::output::classify_anyhow(&error);
+                        return Err(crate::output::typed_error_with_details(
+                            kind,
                             format!(
-                                "attachment upload failed for `{}` after {}/{} completed{}",
+                                "attachment upload failed for `{}` after {}/{} completed: {error:#}",
                                 file.display(),
                                 uploaded.len(),
                                 upload_count,
-                                if completed.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" ({completed})")
-                                }
-                            )
-                        });
+                            ),
+                            hint,
+                            json!({
+                                "operation": "attachment_upload",
+                                "failed_path": file,
+                                "completed_count": uploaded.len(),
+                                "requested_count": upload_count,
+                                "completed_items": completed_names,
+                            }),
+                        ));
                     }
                 }
             }
@@ -2076,7 +2223,7 @@ async fn handle_property(
                 Some(property) => render_properties(&[property], output)?,
                 None => {
                     return Err(crate::output::typed_error(
-                        "not_found",
+                        crate::output::ErrorKind::NotFound,
                         format!("property `{key}` not found"),
                     ));
                 }
@@ -2133,7 +2280,7 @@ fn read_body_text(input: &BodyInput) -> Result<String> {
             .with_context(|| format!("failed to read {}", path.display()));
     }
     Err(crate::output::typed_error_with_hint(
-        "invalid_input",
+        crate::output::ErrorKind::InvalidInput,
         "missing body content",
         "pass --body TEXT or --body-file PATH",
     ))
@@ -2144,7 +2291,7 @@ fn parse_properties(values: &[String]) -> Result<BTreeMap<String, Value>> {
     for item in values {
         let (key, raw_value) = item.split_once('=').ok_or_else(|| {
             crate::output::typed_error(
-                "invalid_input",
+                crate::output::ErrorKind::InvalidInput,
                 format!("invalid property `{item}`; expected key=value"),
             )
         })?;
@@ -2699,11 +2846,11 @@ fn confirm_destructive(yes: bool, prompt: &str) -> Result<()> {
         return Ok(());
     }
     if !io::stdin().is_terminal() {
-        crate::output::print_error(
-            "confirmation_required",
+        return Err(crate::output::typed_error_with_hint(
+            crate::output::ErrorKind::ConfirmationRequired,
             prompt,
-            Some("Re-run with --yes to confirm."),
-        );
+            "Re-run with --yes to confirm.",
+        ));
     }
     eprint!("{prompt} [y/N] ");
     let mut input = String::new();
@@ -2711,11 +2858,10 @@ fn confirm_destructive(yes: bool, prompt: &str) -> Result<()> {
     if input.trim().eq_ignore_ascii_case("y") {
         Ok(())
     } else {
-        crate::output::print_error(
-            "confirmation_required",
+        Err(crate::output::typed_error(
+            crate::output::ErrorKind::ConfirmationRequired,
             "operation cancelled; no changes were made",
-            None,
-        )
+        ))
     }
 }
 
@@ -2798,7 +2944,10 @@ mod tests {
         let cli = Cli::parse_from(["confluence", "pull", "page", "REF", "/tmp/dest"]);
         match cli.command {
             Commands::Pull {
-                command: PullCommand::Page { reference, output },
+                command:
+                    PullCommand::Page {
+                        reference, output, ..
+                    },
             } => {
                 assert_eq!(reference, "REF");
                 assert_eq!(output, std::path::PathBuf::from("/tmp/dest"));
@@ -2893,6 +3042,45 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn blog_commands_do_not_advertise_page_parenting() {
+        let error = Cli::try_parse_from([
+            "confluence",
+            "blog",
+            "create",
+            "Title",
+            "SPACE",
+            "--body",
+            "text",
+            "--parent",
+            "123",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+
+        let blog = Cli::command()
+            .find_subcommand("blog")
+            .unwrap()
+            .find_subcommand("create")
+            .unwrap()
+            .clone();
+        assert!(
+            blog.get_arguments()
+                .all(|argument| argument.get_long() != Some("parent"))
+        );
+    }
+
+    #[test]
+    fn every_pull_variant_accepts_force() {
+        for args in [
+            ["confluence", "pull", "page", "123", "dest", "--force"],
+            ["confluence", "pull", "tree", "123", "dest", "--force"],
+            ["confluence", "pull", "space", "DOCS", "dest", "--force"],
+        ] {
+            Cli::try_parse_from(args).expect("pull --force should parse");
+        }
     }
 
     #[test]

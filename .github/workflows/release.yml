@@ -69,7 +69,11 @@ jobs:
         run: make release-check
 
   publish-crates:
-    needs: verify
+    needs:
+      - verify
+      - build
+      - build-wheels
+      - build-sdist
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -107,6 +111,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: macos-14
@@ -158,6 +164,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: macos-14
@@ -260,6 +268,8 @@ jobs:
     needs:
       - build
       - publish-crates
+      - publish-pypi
+    if: ${{ always() && needs.build.result == 'success' && needs.publish-crates.result == 'success' && (inputs.dry_run == true || needs.publish-pypi.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -323,6 +333,7 @@ jobs:
             echo "SHA_MACOS_ARM64=$(checksum "dist/aarch64-apple-darwin/confluence-cli-v${version}-aarch64-apple-darwin.tar.gz.sha256")"
             echo "SHA_MACOS_X86=$(checksum "dist/x86_64-apple-darwin/confluence-cli-v${version}-x86_64-apple-darwin.tar.gz.sha256")"
             echo "SHA_LINUX_X86=$(checksum "dist/x86_64-unknown-linux-gnu/confluence-cli-v${version}-x86_64-unknown-linux-gnu.tar.gz.sha256")"
+            echo "SHA_LINUX_ARM64=$(checksum "dist/aarch64-unknown-linux-gnu/confluence-cli-v${version}-aarch64-unknown-linux-gnu.tar.gz.sha256")"
           } >> "$GITHUB_ENV"
 
       - name: Update Homebrew formula
@@ -338,7 +349,7 @@ jobs:
           mkdir -p ~/.ssh
           echo "$HOMEBREW_TAP_DEPLOY_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > ~/.ssh/known_hosts
 
           git clone git@github.com:rvben/homebrew-tap.git homebrew-tap
           cd homebrew-tap
@@ -362,10 +373,15 @@ jobs:
             end
 
             on_linux do
-              depends_on arch: :x86_64
+              on_arm do
+                url "https://github.com/rvben/confluence-cli/releases/download/vVERSION_PLACEHOLDER/confluence-cli-vVERSION_PLACEHOLDER-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_LINUX_ARM64_PLACEHOLDER"
+              end
 
-              url "https://github.com/rvben/confluence-cli/releases/download/vVERSION_PLACEHOLDER/confluence-cli-vVERSION_PLACEHOLDER-x86_64-unknown-linux-gnu.tar.gz"
-              sha256 "SHA_LINUX_X86_PLACEHOLDER"
+              on_intel do
+                url "https://github.com/rvben/confluence-cli/releases/download/vVERSION_PLACEHOLDER/confluence-cli-vVERSION_PLACEHOLDER-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_LINUX_X86_PLACEHOLDER"
+              end
             end
 
             def install
@@ -383,6 +399,7 @@ jobs:
           sed -i "s/SHA_MACOS_ARM64_PLACEHOLDER/${SHA_MACOS_ARM64}/" Formula/confluence-cli.rb
           sed -i "s/SHA_MACOS_X86_PLACEHOLDER/${SHA_MACOS_X86}/" Formula/confluence-cli.rb
           sed -i "s/SHA_LINUX_X86_PLACEHOLDER/${SHA_LINUX_X86}/" Formula/confluence-cli.rb
+          sed -i "s/SHA_LINUX_ARM64_PLACEHOLDER/${SHA_LINUX_ARM64}/" Formula/confluence-cli.rb
 
           ruby -c Formula/confluence-cli.rb
           if grep -Eq '\b(odie|abort|exit)\b' Formula/confluence-cli.rb; then
@@ -393,7 +410,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/confluence-cli.rb
-          git diff --cached --quiet || git commit -m "Update confluence-cli to ${version}"
+          git diff --cached --quiet || git commit -m "chore(confluence-cli): update to ${version}"
           git push
 
   attest-release:
@@ -414,3 +431,33 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-path: artifacts/**/*
+
+  release-health:
+    name: Release health
+    needs:
+      - publish
+      - update-homebrew
+      - attest-release
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required release jobs
+        shell: bash
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          HOMEBREW_RESULT: ${{ needs.update-homebrew.result }}
+          ATTEST_RESULT: ${{ needs.attest-release.result }}
+        run: |
+          set -euo pipefail
+          test "$PUBLISH_RESULT" = "success"
+          if [[ "$DRY_RUN" != "true" ]]; then
+            test "$HOMEBREW_RESULT" = "success"
+            test "$ATTEST_RESULT" = "success"
+          fi
+          {
+            echo "## Release health"
+            echo "- publish: $PUBLISH_RESULT"
+            echo "- Homebrew: $HOMEBREW_RESULT"
+            echo "- attestations: $ATTEST_RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"

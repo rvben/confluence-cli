@@ -48,7 +48,7 @@ brew tap rvben/tap
 brew install rvben/tap/confluence-cli
 ```
 
-Prebuilt macOS and Linux archives are published on the [GitHub releases page](https://github.com/rvben/confluence-cli/releases).
+Prebuilt macOS and Linux archives for Intel and ARM are published on the [GitHub releases page](https://github.com/rvben/confluence-cli/releases).
 
 ## Quick Start
 
@@ -124,15 +124,24 @@ Pull a page tree:
 confluence pull tree SPACE:ParentPage ./docs/parent-page
 ```
 
+Pulls are staged beside the destination and installed as one snapshot. A pull
+refuses to replace local Markdown changes or unmanaged files; inspect and apply
+or preserve those files first. Use `--force` only when the remote snapshot
+should replace the entire destination. Attachment names are confined to their
+page's `attachments/` directory.
+
 Inspect the planned changes:
 
 ```bash
 confluence plan ./docs/parent-page
 ```
 
-`plan` validates the local tree and compares it with the sidecar state captured by
-`pull`; it does not contact Confluence. `apply` rechecks remote versions and
-refuses drift unless `--force` is explicitly supplied.
+`plan` validates the complete local tree and compares it with the sidecar state
+captured by `pull`; it does not contact Confluence. `apply` validates every local
+document and preflights every remote version before its first write. Versioned
+updates still reject drift that occurs during the apply unless `--force` is
+explicitly supplied. Partial remote mutations are reported in structured error
+details so automation can reconcile them safely.
 
 Apply the diff:
 

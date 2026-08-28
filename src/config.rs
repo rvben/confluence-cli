@@ -129,6 +129,15 @@ impl AppConfig {
     }
 
     pub fn resolved_profile(&self, profile_override: Option<&str>) -> Result<ResolvedProfile> {
+        if let Some(name) = profile_override
+            && !self.profiles.contains_key(name)
+        {
+            return Err(crate::output::typed_error_with_hint(
+                crate::output::ErrorKind::NotFound,
+                format!("profile `{name}` not found"),
+                "run `confluence profile list` to see configured profiles",
+            ));
+        }
         let env_profile = env::var("CONFLUENCE_PROFILE").ok();
         let selected_name = profile_override
             .map(ToOwned::to_owned)
@@ -173,7 +182,7 @@ impl AppConfig {
             }
             (None, None) => {
                 return Err(crate::output::typed_error_with_hint(
-                    "auth",
+                    crate::output::ErrorKind::Auth,
                     "no active profile configured",
                     "run `confluence auth login` or set CONFLUENCE_* environment variables",
                 ));
@@ -181,7 +190,7 @@ impl AppConfig {
         };
         if !matches!(resolved.token_kind.as_str(), "classic" | "scoped") {
             return Err(crate::output::typed_error(
-                "invalid_input",
+                crate::output::ErrorKind::InvalidInput,
                 format!(
                     "unsupported token kind `{}`; expected classic or scoped",
                     resolved.token_kind
@@ -192,7 +201,7 @@ impl AppConfig {
             && resolved.cloud_id.as_deref().unwrap_or_default().is_empty()
         {
             return Err(crate::output::typed_error_with_hint(
-                "auth",
+                crate::output::ErrorKind::Auth,
                 "scoped Cloud token requires a Cloud ID",
                 "run `confluence auth login`",
             ));
@@ -212,7 +221,7 @@ impl AppConfig {
     pub fn remove_profile(&mut self, name: &str) -> Result<()> {
         if self.profiles.remove(name).is_none() {
             return Err(crate::output::typed_error(
-                "not_found",
+                crate::output::ErrorKind::NotFound,
                 format!("profile `{name}` not found"),
             ));
         }
@@ -225,7 +234,7 @@ impl AppConfig {
     pub fn set_active_profile(&mut self, name: &str) -> Result<()> {
         if !self.profiles.contains_key(name) {
             return Err(crate::output::typed_error(
-                "not_found",
+                crate::output::ErrorKind::NotFound,
                 format!("profile `{name}` not found"),
             ));
         }
@@ -317,14 +326,14 @@ fn hydrate_stored_credential(name: &str, mut profile: ProfileConfig) -> Result<P
         Some("file") | None => {}
         Some(other) => {
             return Err(crate::output::typed_error(
-                "invalid_input",
+                crate::output::ErrorKind::InvalidInput,
                 format!("unsupported credential_store `{other}` for profile `{name}`"),
             ));
         }
     }
     if auth_token(&profile.auth).is_empty() {
         return Err(crate::output::typed_error_with_hint(
-            "auth",
+            crate::output::ErrorKind::Auth,
             format!("credential not found for profile `{name}`"),
             "run `confluence auth login`",
         ));
@@ -386,7 +395,7 @@ pub fn build_auth(auth_type: &str, username: Option<String>, token: String) -> R
         "basic" => Ok(AuthConfig::Basic {
             username: username.ok_or_else(|| {
                 crate::output::typed_error(
-                    "invalid_input",
+                    crate::output::ErrorKind::InvalidInput,
                     "basic auth requires a username or email",
                 )
             })?,
@@ -394,7 +403,7 @@ pub fn build_auth(auth_type: &str, username: Option<String>, token: String) -> R
         }),
         "bearer" => Ok(AuthConfig::Bearer { token }),
         other => Err(crate::output::typed_error(
-            "invalid_input",
+            crate::output::ErrorKind::InvalidInput,
             format!("unsupported auth type `{other}`"),
         )),
     }
@@ -448,8 +457,9 @@ pub fn run_login(input: LoginInput) -> Result<ResolvedProfile> {
         }
     }
 
-    let domain =
-        domain.ok_or_else(|| crate::output::typed_error("invalid_input", "domain is required"))?;
+    let domain = domain.ok_or_else(|| {
+        crate::output::typed_error(crate::output::ErrorKind::InvalidInput, "domain is required")
+    })?;
     let provider = provider.unwrap_or_else(|| detect_provider(&domain));
     let api_path = api_path.unwrap_or_else(|| default_api_path(provider).to_string());
     let auth_type = auth_type.unwrap_or_else(|| {
@@ -459,18 +469,20 @@ pub fn run_login(input: LoginInput) -> Result<ResolvedProfile> {
             "bearer".to_string()
         }
     });
-    let token = token.ok_or_else(|| crate::output::typed_error("auth", "token is required"))?;
+    let token = token.ok_or_else(|| {
+        crate::output::typed_error(crate::output::ErrorKind::Auth, "token is required")
+    })?;
     let read_only = read_only.unwrap_or(false);
 
     if !matches!(token_kind.as_str(), "classic" | "scoped") {
         return Err(crate::output::typed_error(
-            "invalid_input",
+            crate::output::ErrorKind::InvalidInput,
             format!("unsupported token kind `{token_kind}`; expected classic or scoped"),
         ));
     }
     if token_kind == "scoped" && cloud_id.as_deref().unwrap_or_default().is_empty() {
         return Err(crate::output::typed_error_with_hint(
-            "auth",
+            crate::output::ErrorKind::Auth,
             "scoped Cloud token requires a Cloud ID",
             "run `confluence auth login`",
         ));
@@ -583,10 +595,15 @@ pub fn logout(profile_override: Option<&str>) -> Result<String> {
     let profile_name = profile_override
         .map(ToOwned::to_owned)
         .or_else(|| config.active_profile.clone())
-        .ok_or_else(|| crate::output::typed_error("auth", "no active profile configured"))?;
+        .ok_or_else(|| {
+            crate::output::typed_error(
+                crate::output::ErrorKind::Auth,
+                "no active profile configured",
+            )
+        })?;
     let Some(profile) = config.profiles.get_mut(&profile_name) else {
         return Err(crate::output::typed_error(
-            "not_found",
+            crate::output::ErrorKind::NotFound,
             format!("profile `{profile_name}` not found"),
         ));
     };
@@ -615,23 +632,28 @@ pub fn migrate_credential(profile_override: Option<&str>) -> Result<String> {
     let profile_name = profile_override
         .map(ToOwned::to_owned)
         .or_else(|| config.active_profile.clone())
-        .ok_or_else(|| crate::output::typed_error("auth", "no active profile configured"))?;
+        .ok_or_else(|| {
+            crate::output::typed_error(
+                crate::output::ErrorKind::Auth,
+                "no active profile configured",
+            )
+        })?;
     let Some(profile) = config.profiles.get_mut(&profile_name) else {
         return Err(crate::output::typed_error(
-            "not_found",
+            crate::output::ErrorKind::NotFound,
             format!("profile `{profile_name}` not found"),
         ));
     };
     if profile.credential_store.as_deref() == Some("keyring") {
         return Err(crate::output::typed_error(
-            "conflict",
+            crate::output::ErrorKind::Conflict,
             format!("profile `{profile_name}` already uses the operating-system keychain"),
         ));
     }
     let token = auth_token(&profile.auth).to_string();
     if token.is_empty() {
         return Err(crate::output::typed_error(
-            "not_found",
+            crate::output::ErrorKind::NotFound,
             format!("profile `{profile_name}` does not contain an inline token to migrate"),
         ));
     }
@@ -698,7 +720,7 @@ impl EnvOverride {
                     Ok(ProviderKind::DataCenter)
                 }
                 other => Err(crate::output::typed_error(
-                    "invalid_input",
+                    crate::output::ErrorKind::InvalidInput,
                     format!("unsupported CONFLUENCE_PROVIDER `{other}`"),
                 )),
             })
@@ -843,7 +865,7 @@ pub async fn init(output: OutputFormat) -> Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return Err(crate::output::typed_error_with_hint(
-            "tty_required",
+            crate::output::ErrorKind::TtyRequired,
             "interactive setup requires a terminal; use `confluence auth login --non-interactive` for unattended setup",
             "run `confluence init --output json` for setup instructions, or use `confluence auth login --non-interactive` with CONFLUENCE_* environment variables",
         ));
@@ -961,7 +983,7 @@ async fn init_interactive() -> Result<()> {
     };
     if raw_url.is_empty() {
         return Err(crate::output::typed_error(
-            "invalid_input",
+            crate::output::ErrorKind::InvalidInput,
             "Confluence URL is required",
         ));
     }
@@ -1013,7 +1035,7 @@ async fn init_interactive() -> Result<()> {
             let email = prompt("Email", "", Some(default_email))?;
             if email.is_empty() {
                 return Err(crate::output::typed_error(
-                    "invalid_input",
+                    crate::output::ErrorKind::InvalidInput,
                     "email is required for Confluence Cloud",
                 ));
             }
@@ -1059,9 +1081,9 @@ async fn init_interactive() -> Result<()> {
             )?;
             let kept_existing = raw.is_empty();
             let token = if kept_existing {
-                existing_token
-                    .clone()
-                    .ok_or_else(|| crate::output::typed_error("auth", "token is required"))?
+                existing_token.clone().ok_or_else(|| {
+                    crate::output::typed_error(crate::output::ErrorKind::Auth, "token is required")
+                })?
             } else {
                 raw
             };
@@ -1402,7 +1424,7 @@ async fn discover_cloud_id(base_url: &str) -> Result<String> {
         .await?;
     if info.cloud_id.trim().is_empty() {
         return Err(crate::output::typed_error(
-            "api_error",
+            crate::output::ErrorKind::Api,
             "Atlassian returned an empty Cloud ID",
         ));
     }
@@ -1445,7 +1467,7 @@ async fn create_data_center_pat(
         .map(str::to_owned)
         .ok_or_else(|| {
             crate::output::typed_error(
-                "api_error",
+                crate::output::ErrorKind::Api,
                 "PAT creation response did not contain the one-time token",
             )
         })

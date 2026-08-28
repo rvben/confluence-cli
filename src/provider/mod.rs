@@ -55,7 +55,6 @@ pub trait ConfluenceProvider: Send + Sync {
         &self,
         kind: ContentKind,
         space_key_or_id: &str,
-        recursive: bool,
     ) -> Result<Vec<ContentItem>>;
     async fn create_content(&self, request: &CreateContentRequest) -> Result<ContentItem>;
     async fn update_content(&self, request: &UpdateContentRequest) -> Result<ContentItem>;
@@ -224,13 +223,6 @@ impl HttpClient {
         self.send_with_retry(request, url)
             .await
             .with_context(|| format!("request failed for {url}"))
-            .map_err(|err| {
-                if err.downcast_ref::<reqwest::Error>().is_some() {
-                    anyhow!("request failed for {url}: {err}")
-                } else {
-                    err
-                }
-            })
     }
 
     pub fn raw_client(&self) -> &reqwest::Client {
@@ -286,10 +278,7 @@ impl HttpClient {
 }
 
 fn request_supports_retry(method: &Method) -> bool {
-    matches!(
-        *method,
-        Method::GET | Method::HEAD | Method::OPTIONS | Method::PUT | Method::DELETE
-    )
+    matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
 fn should_retry_status(status: StatusCode) -> bool {
@@ -680,7 +669,7 @@ pub async fn resolve_reference_via_url_or_search(
             }
         }
         return Err(crate::output::typed_error(
-            "invalid_input",
+            crate::output::ErrorKind::InvalidInput,
             format!("could not extract a Confluence page ID from {reference}"),
         ));
     }
@@ -696,18 +685,18 @@ pub async fn resolve_reference_via_url_or_search(
             .await?;
         match results.results.len() {
             0 => Err(crate::output::typed_error(
-                "not_found",
+                crate::output::ErrorKind::NotFound,
                 format!("no page found for {reference}"),
             )),
             1 => Ok(results.results[0].id.clone()),
             _ => Err(crate::output::typed_error(
-                "conflict",
+                crate::output::ErrorKind::Conflict,
                 format!("multiple pages matched {reference}"),
             )),
         }
     } else {
         Err(crate::output::typed_error_with_hint(
-            "invalid_input",
+            crate::output::ErrorKind::InvalidInput,
             format!("unsupported page reference `{reference}`"),
             "use a numeric ID, Confluence URL, or SPACE:Title",
         ))
@@ -715,12 +704,45 @@ pub async fn resolve_reference_via_url_or_search(
 }
 
 pub fn build_search_cql(query: &str, cql: bool) -> String {
+    let content_filter = "(type = page OR type = blogpost)";
     if cql {
-        query.to_string()
+        if let Some(order_index) = cql_order_by_index(query) {
+            format!(
+                "{content_filter} AND ({}){}",
+                query[..order_index].trim(),
+                &query[order_index..]
+            )
+        } else {
+            format!("{content_filter} AND ({query})")
+        }
     } else {
         let escaped = escape_cql_literal(query);
-        format!("text ~ \"{escaped}\" order by lastmodified desc")
+        format!("{content_filter} AND text ~ \"{escaped}\" order by lastmodified desc")
     }
+}
+
+fn cql_order_by_index(query: &str) -> Option<usize> {
+    let lowercase = query.to_ascii_lowercase();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, character) in query.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quotes && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if !in_quotes && lowercase[index..].starts_with(" order by ") {
+            return Some(index);
+        }
+    }
+    None
 }
 
 pub fn escape_cql_literal(value: &str) -> String {
@@ -732,6 +754,120 @@ pub fn normalize_properties(properties: Vec<ContentProperty>) -> BTreeMap<String
         .into_iter()
         .map(|property| (property.key, property.value))
         .collect()
+}
+
+pub async fn add_content_metadata<P>(
+    provider: &P,
+    content_id: &str,
+    labels: &[String],
+    properties: &BTreeMap<String, Value>,
+) -> Result<()>
+where
+    P: ConfluenceProvider + ?Sized,
+{
+    for label in labels {
+        provider
+            .add_label(content_id, label)
+            .await
+            .with_context(|| format!("failed to add label `{label}` to content {content_id}"))?;
+    }
+    for (key, value) in properties {
+        provider
+            .set_property(content_id, key, value.clone())
+            .await
+            .with_context(|| format!("failed to set property `{key}` on content {content_id}"))?;
+    }
+    Ok(())
+}
+
+pub async fn sync_content_metadata<P>(
+    provider: &P,
+    content_id: &str,
+    labels: &[String],
+    properties: &BTreeMap<String, Value>,
+) -> Result<()>
+where
+    P: ConfluenceProvider + ?Sized,
+{
+    let current_labels = provider
+        .list_labels(content_id)
+        .await
+        .with_context(|| format!("failed to list labels on content {content_id}"))?;
+    for label in current_labels
+        .iter()
+        .filter(|label| !labels.contains(*label))
+    {
+        provider
+            .remove_label(content_id, label)
+            .await
+            .with_context(|| {
+                format!("failed to remove label `{label}` from content {content_id}")
+            })?;
+    }
+    for label in labels
+        .iter()
+        .filter(|label| !current_labels.contains(*label))
+    {
+        provider
+            .add_label(content_id, label)
+            .await
+            .with_context(|| format!("failed to add label `{label}` to content {content_id}"))?;
+    }
+
+    let current_properties = provider
+        .list_properties(content_id)
+        .await
+        .with_context(|| format!("failed to list properties on content {content_id}"))?;
+    let current_map: BTreeMap<_, _> = current_properties
+        .into_iter()
+        .map(|property| (property.key, property.value))
+        .collect();
+    for (key, value) in properties {
+        if current_map.get(key) != Some(value) {
+            provider
+                .set_property(content_id, key, value.clone())
+                .await
+                .with_context(|| {
+                    format!("failed to set property `{key}` on content {content_id}")
+                })?;
+        }
+    }
+    for key in current_map
+        .keys()
+        .filter(|key| !properties.contains_key(*key))
+    {
+        provider
+            .delete_property(content_id, key)
+            .await
+            .with_context(|| {
+                format!("failed to delete property `{key}` from content {content_id}")
+            })?;
+    }
+    Ok(())
+}
+
+pub fn partial_remote_mutation_error(
+    error: anyhow::Error,
+    operation: &str,
+    content_id: &str,
+    completed_stage: &str,
+    failed_stage: &str,
+) -> anyhow::Error {
+    let (kind, hint) = crate::output::classify_anyhow(&error);
+    crate::output::typed_error_with_details(
+        kind,
+        format!(
+            "{operation} partially completed for content {content_id}; {failed_stage} failed after {completed_stage}: {error:#}"
+        ),
+        hint,
+        json!({
+            "operation": operation,
+            "content_id": content_id,
+            "partial_success": true,
+            "completed_stage": completed_stage,
+            "failed_stage": failed_stage,
+        }),
+    )
 }
 
 pub fn property_payload(key: &str, value: Value, version: Option<u64>) -> Value {
@@ -757,7 +893,7 @@ fn extract_error_message(raw: &str) -> String {
 pub fn ensure_writable(profile: &ResolvedProfile) -> Result<()> {
     if profile.read_only {
         return Err(crate::output::typed_error_with_hint(
-            "read_only",
+            crate::output::ErrorKind::ReadOnly,
             format!(
                 "profile `{}` is read-only; refusing to perform a write operation",
                 profile.name
@@ -869,25 +1005,68 @@ mod tests {
     #[test]
     fn search_cql_plain_text_wraps_in_text_match() {
         let cql = build_search_cql("hello world", false);
-        assert_eq!(cql, r#"text ~ "hello world" order by lastmodified desc"#);
+        assert_eq!(
+            cql,
+            r#"(type = page OR type = blogpost) AND text ~ "hello world" order by lastmodified desc"#
+        );
     }
 
     #[test]
     fn search_cql_plain_text_escapes_quotes() {
         let cql = build_search_cql(r#"say "hi""#, false);
-        assert_eq!(cql, r#"text ~ "say \"hi\"" order by lastmodified desc"#);
+        assert_eq!(
+            cql,
+            r#"(type = page OR type = blogpost) AND text ~ "say \"hi\"" order by lastmodified desc"#
+        );
     }
 
     #[test]
     fn search_cql_plain_text_escapes_backslashes() {
         let cql = build_search_cql(r"docs\draft", false);
-        assert_eq!(cql, r#"text ~ "docs\\draft" order by lastmodified desc"#);
+        assert_eq!(
+            cql,
+            r#"(type = page OR type = blogpost) AND text ~ "docs\\draft" order by lastmodified desc"#
+        );
     }
 
     #[test]
-    fn search_cql_passthrough_when_cql_flag_set() {
+    fn search_cql_scopes_raw_cql_to_supported_content_types() {
         let query = r#"space = "PROJ" AND type = page"#;
-        assert_eq!(build_search_cql(query, true), query);
+        assert_eq!(
+            build_search_cql(query, true),
+            r#"(type = page OR type = blogpost) AND (space = "PROJ" AND type = page)"#
+        );
+    }
+
+    #[test]
+    fn search_cql_preserves_raw_order_by_clause() {
+        let query = r#"space = "PROJ" order by title asc"#;
+        assert_eq!(
+            build_search_cql(query, true),
+            r#"(type = page OR type = blogpost) AND (space = "PROJ") order by title asc"#
+        );
+    }
+
+    #[test]
+    fn search_cql_does_not_split_order_by_inside_a_literal() {
+        let query = r#"text ~ "order by migration" order by title asc"#;
+        assert_eq!(
+            build_search_cql(query, true),
+            r#"(type = page OR type = blogpost) AND (text ~ "order by migration") order by title asc"#
+        );
+    }
+
+    #[test]
+    fn automatic_retries_are_limited_to_safe_read_methods() {
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(request_supports_retry(&method), "{method} should retry");
+        }
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(
+                !request_supports_retry(&method),
+                "{method} could duplicate a mutation"
+            );
+        }
     }
 
     // ── extract_error_message ─────────────────────────────────────────────────

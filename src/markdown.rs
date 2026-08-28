@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -66,6 +67,9 @@ pub struct Sidecar {
     /// SHA-256 of the JSON-serialised properties map as of the last pull/apply.
     #[serde(default)]
     pub last_pulled_properties_hash: Option<String>,
+    /// Markdown body as of the last pull/apply, used to render a real plan diff.
+    #[serde(default)]
+    pub last_pulled_body_markdown: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3283,7 +3287,7 @@ pub fn safe_slug(value: &str) -> String {
 
 pub fn document_dir_name(title: &str, content_id: Option<&str>) -> String {
     match content_id {
-        Some(content_id) => format!("{}--{}", safe_slug(title), content_id),
+        Some(content_id) => format!("{}--{}", safe_slug(title), safe_slug(content_id)),
         None => safe_slug(title),
     }
 }
@@ -3317,29 +3321,48 @@ pub fn save_document(doc: &LocalDocument) -> Result<()> {
     ensure_parent_dir(&doc.sidecar_path)?;
     fs::create_dir_all(&doc.directory)
         .with_context(|| format!("failed to create {}", doc.directory.display()))?;
-    fs::write(
+    atomic_write(
         &doc.markdown_path,
-        render_document(&doc.frontmatter, &doc.body_markdown)?,
-    )
-    .with_context(|| format!("failed to write {}", doc.markdown_path.display()))?;
-    fs::write(
+        render_document(&doc.frontmatter, &doc.body_markdown)?.as_bytes(),
+    )?;
+    atomic_write(
         &doc.sidecar_path,
-        serde_json::to_string_pretty(&doc.sidecar)?,
-    )
-    .with_context(|| format!("failed to write {}", doc.sidecar_path.display()))?;
+        serde_json::to_string_pretty(&doc.sidecar)?.as_bytes(),
+    )?;
+    Ok(())
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path {} has no parent directory", path.display()))?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".confluence-write-")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to stage write for {}", path.display()))?;
+    temporary
+        .write_all(contents)
+        .with_context(|| format!("failed to write staged file for {}", path.display()))?;
+    temporary
+        .flush()
+        .with_context(|| format!("failed to flush staged file for {}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to install {}", path.display()))?;
     Ok(())
 }
 
 pub fn scan_local_documents(root: &Path) -> Result<Vec<LocalContentIndex>> {
     if !root.exists() {
         return Err(crate::output::typed_error(
-            "not_found",
+            crate::output::ErrorKind::NotFound,
             format!("sync path `{}` does not exist", root.display()),
         ));
     }
     if !root.is_dir() {
         return Err(crate::output::typed_error(
-            "invalid_input",
+            crate::output::ErrorKind::InvalidInput,
             format!("sync path `{}` is not a directory", root.display()),
         ));
     }
@@ -3372,6 +3395,14 @@ pub fn scan_local_documents(root: &Path) -> Result<Vec<LocalContentIndex>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_content_ids_cannot_escape_document_directory_names() {
+        let directory = document_dir_name("Title", Some("../../../outside"));
+        assert_eq!(Path::new(&directory).components().count(), 1);
+        assert!(!directory.contains('/'));
+        assert!(!directory.contains(".."));
+    }
 
     #[test]
     fn storage_macro_round_trips_through_sentinel_block() {

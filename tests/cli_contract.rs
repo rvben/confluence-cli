@@ -2,10 +2,14 @@ use std::process::{Command, Output};
 
 fn confluence(args: &[&str]) -> Output {
     let temp = tempfile::tempdir().expect("temporary config directory");
+    confluence_with_home(temp.path(), args)
+}
+
+fn confluence_with_home(home: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_confluence"))
         .args(args)
-        .env("HOME", temp.path())
-        .env("XDG_CONFIG_HOME", temp.path())
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home)
         .env_remove("CONFLUENCE_PROFILE")
         .env_remove("CONFLUENCE_DOMAIN")
         .env_remove("CONFLUENCE_API_TOKEN")
@@ -118,11 +122,57 @@ fn short_output_flag_controls_parse_error_rendering() {
 
 #[test]
 fn destructive_commands_require_explicit_noninteractive_confirmation() {
+    let home = tempfile::tempdir().expect("temporary config directory");
+    let init = confluence_with_home(home.path(), &["--output", "json", "init"]);
+    let instructions: serde_json::Value =
+        serde_json::from_slice(&init.stdout).expect("init instructions");
+    let config_path = std::path::PathBuf::from(
+        instructions["configPath"]
+            .as_str()
+            .expect("configuration path"),
+    );
+    std::fs::create_dir_all(config_path.parent().unwrap()).expect("config directory");
+    std::fs::write(
+        &config_path,
+        r#"{
+          "active_profile": "work",
+          "profiles": {
+            "work": {
+              "provider": "cloud",
+              "base_url": "https://example.atlassian.net",
+              "api_path": "/wiki/rest/api",
+              "auth": {"type": "basic", "username": "user@example.test", "token": "test"},
+              "credential_store": "config",
+              "token_kind": "classic",
+              "read_only": false
+            }
+          }
+        }"#,
+    )
+    .expect("write config");
+
+    let sync_root = home.path().join("docs");
+    let page = sync_root.join("page--123");
+    std::fs::create_dir_all(&page).expect("sync page directory");
+    std::fs::write(
+        page.join("index.md"),
+        "---\ntitle: Test\ntype: page\nlabels: []\nstatus: current\nproperties: {}\n---\n\nBody\n",
+    )
+    .expect("write markdown");
+    std::fs::write(page.join(".confluence.json"), "{}").expect("write sidecar");
+
+    let sync_path = sync_root.to_string_lossy().into_owned();
     for args in [
-        ["--output", "json", "profile", "remove", "work"].as_slice(),
-        ["--output", "json", "apply", "/tmp/docs", "--delete-remote"].as_slice(),
+        vec!["--output", "json", "profile", "remove", "work"],
+        vec![
+            "--output",
+            "json",
+            "apply",
+            sync_path.as_str(),
+            "--delete-remote",
+        ],
     ] {
-        let output = confluence(args);
+        let output = confluence_with_home(home.path(), &args);
         assert_eq!(
             output.status.code(),
             Some(2),
@@ -132,6 +182,27 @@ fn destructive_commands_require_explicit_noninteractive_confirmation() {
             serde_json::from_slice(&output.stderr).expect("confirmation JSON error");
         assert_eq!(error["error"]["kind"], "confirmation_required");
     }
+}
+
+#[test]
+fn destructive_commands_validate_targets_before_prompting() {
+    let missing_profile = confluence(&["--output", "json", "profile", "remove", "missing"]);
+    assert_eq!(missing_profile.status.code(), Some(4));
+    let error: serde_json::Value =
+        serde_json::from_slice(&missing_profile.stderr).expect("not-found JSON error");
+    assert_eq!(error["error"]["kind"], "not_found");
+
+    let missing_path = confluence(&[
+        "--output",
+        "json",
+        "apply",
+        "/tmp/confluence-cli-contract-missing-apply-path",
+        "--delete-remote",
+    ]);
+    assert_eq!(missing_path.status.code(), Some(4));
+    let error: serde_json::Value =
+        serde_json::from_slice(&missing_path.stderr).expect("not-found JSON error");
+    assert_eq!(error["error"]["kind"], "not_found");
 }
 
 #[test]

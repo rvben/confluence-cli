@@ -14,17 +14,25 @@ All notable changes to this project will be documented in this file.
 
 - Complete human-readable help for every command and public argument.
 - Executable CLI contract tests for help, parser errors, sync paths, output modes, and schemas.
+- Scheduled PyPI installation smoke tests and Linux ARM release artifacts.
 
 ### Changed
 
 - Make pagination, JSON success output, destructive confirmations, and agent schemas consistent.
 - Use typed runtime errors instead of classifying failures from English substrings.
+- Stage pulls as complete local snapshots, preflight whole-tree applies before writing, and retry only safe read requests.
+- Return fully hydrated list and tree content, including labels and properties.
 
 ### Fixed
 
 - Prevent body-writing commands from panicking on a Clap argument-ID collision.
 - Reject missing or unreadable sync paths instead of reporting a successful no-op plan.
 - Correct E2E binary discovery, auth table columns, schema output fields, and short output flags.
+- Refuse dirty pull destinations unless `--force` is explicit, reject unsafe attachment names, and propagate attachment failures.
+- Paginate labels, properties, attachments, comments, and `pull space --since` results beyond 200 items.
+- Preserve transport error types, avoid replaying mutations, scope searches server-side, and report partial mutations structurally.
+- Compute real plan diffs, validate destructive targets before prompting, and remove page-only parenting options from blog commands.
+- Harden release ordering, GitHub SSH host verification, Homebrew metadata, and PyPI installation monitoring.
 
 ## [0.1.19](https://github.com/rvben/confluence-cli/compare/v0.1.18...v0.1.19) - 2026-08-28
 
