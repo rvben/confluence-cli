@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.22](https://github.com/rvben/confluence-cli/compare/v0.1.21...v0.1.22) - 2026-08-28
+
+### Fixed
+
+- prevent silent synchronization drift ([6c54f31](https://github.com/rvben/confluence-cli/commit/6c54f31cd6562cafb0190384408bb3b79b7b5aec))
+
 ## [0.1.21](https://github.com/rvben/confluence-cli/compare/v0.1.20...v0.1.21) - 2026-08-28
 
 ### Fixed
