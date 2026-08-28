@@ -230,6 +230,8 @@ Supported environment overrides:
 - `CONFLUENCE_AUTH_TYPE`
 - `CONFLUENCE_EMAIL` or `CONFLUENCE_USERNAME`
 - `CONFLUENCE_API_TOKEN`, `CONFLUENCE_TOKEN`, `CONFLUENCE_PASSWORD`, or `CONFLUENCE_BEARER_TOKEN`
+- `CONFLUENCE_TOKEN_KIND` (`classic` or `scoped`)
+- `CONFLUENCE_CLOUD_ID` (required for scoped Cloud tokens)
 - `CONFLUENCE_READ_ONLY`
 
 `CONFLUENCE_PROVIDER` must be `cloud` or `data-center`. `CONFLUENCE_AUTH_TYPE` must be `basic` or `bearer`.
@@ -241,6 +243,18 @@ confluence completions bash > /usr/local/etc/bash_completion.d/confluence
 confluence completions zsh > ~/.zsh/completions/_confluence
 confluence completions fish > ~/.config/fish/completions/confluence.fish
 ```
+
+## Testing
+
+`make test` runs unit tests and stateful process-level simulator tests. The simulator drives the compiled CLI through the same complete lifecycle for Cloud and Data Center: pages, blogs, hierarchy, labels, properties, comments, attachments, Markdown pull/plan/apply, macros, cleanup, and authentication failures. It binds only to localhost and never needs credentials.
+
+Live provider checks remain separate:
+
+- `e2e_cli_canary` is a small create/get/pull/plan/apply/delete smoke test.
+- `e2e_cli_lifecycle` is the complete live provider suite.
+- `.github/workflows/cloud-e2e.yml` runs the canary Monday through Saturday, the complete suite on Sunday, and either suite on demand through a protected GitHub Environment.
+
+See [docs/testing.md](docs/testing.md) for the confidence model and Cloud automation setup.
 
 ## Local Data Center
 
@@ -284,6 +298,8 @@ CONFLUENCE_E2E_PROVIDER=data-center \
 CONFLUENCE_E2E_SPACE=TEST \
 make test-e2e
 ```
+
+Env-driven Cloud tests also accept `CONFLUENCE_E2E_TOKEN_KIND` and, for scoped tokens, `CONFLUENCE_E2E_CLOUD_ID`.
 
 ## Release And CI
 
@@ -332,7 +348,7 @@ When a construct is unsupported or would be lossy, `confluence-cli` preserves th
 ## Known Limits
 
 - Storage fidelity is strongest for supported built-in macros and generic resource-aware macro fallback. Unknown provider-specific macro behavior can still vary between Cloud and Data Center.
-- CI does not run live tenant e2e by default. Use `make test-e2e` against a real instance for provider validation.
+- Pull requests use the stateful simulator; live tenant checks run on the protected schedule and can also be dispatched manually.
 - `apply` refuses remote version drift unless `--force` is used.
 
 ## License

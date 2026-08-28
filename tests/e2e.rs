@@ -9,6 +9,11 @@ use tempfile::TempDir;
 use url::Url;
 use walkdir::WalkDir;
 
+#[path = "support/confluence_simulator.rs"]
+mod confluence_simulator;
+
+use confluence_simulator::ConfluenceSimulator;
+
 #[derive(Clone, Debug)]
 struct E2eConfig {
     bin: PathBuf,
@@ -137,6 +142,14 @@ fn e2e_config() -> Option<E2eConfig> {
     let provider =
         env::var("CONFLUENCE_E2E_PROVIDER").unwrap_or_else(|_| "data-center".to_string());
     let api_path = env::var("CONFLUENCE_E2E_API_PATH").unwrap_or_else(|_| "/rest/api".to_string());
+    let optional_e2e_env = |key| {
+        env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let token_kind = optional_e2e_env("CONFLUENCE_E2E_TOKEN_KIND");
+    let cloud_id = optional_e2e_env("CONFLUENCE_E2E_CLOUD_ID");
 
     let mut envs = vec![
         ("CONFLUENCE_PROFILE".to_string(), "__e2e_env__".to_string()),
@@ -148,6 +161,12 @@ fn e2e_config() -> Option<E2eConfig> {
         ("CONFLUENCE_AUTH_TYPE".to_string(), auth_type.clone()),
         ("CONFLUENCE_API_PATH".to_string(), api_path),
     ];
+    if let Some(token_kind) = token_kind {
+        envs.push(("CONFLUENCE_TOKEN_KIND".to_string(), token_kind));
+    }
+    if let Some(cloud_id) = cloud_id {
+        envs.push(("CONFLUENCE_CLOUD_ID".to_string(), cloud_id));
+    }
 
     match auth_type.as_str() {
         "basic" => {
@@ -274,6 +293,169 @@ fn binary_discovery_finds_the_declared_confluence_executable() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simulated_cloud_user_can_manage_a_page() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let created = cfg.run_json(&[
+            "page",
+            "create",
+            "Simulator page",
+            "TEST",
+            "--body",
+            "Initial body",
+        ]);
+        let page_id = string_field(first_item(&created, "page create"), "id").to_string();
+
+        let fetched = cfg.run_json(&["page", "get", &page_id, "--show-body"]);
+        assert_eq!(
+            string_field(first_item(&fetched, "page get"), "body_storage"),
+            "<p>Initial body</p>"
+        );
+
+        let updated = cfg.run_json(&[
+            "page",
+            "update",
+            &page_id,
+            "--title",
+            "Updated simulator page",
+            "--body",
+            "Updated body",
+        ]);
+        assert_eq!(
+            string_field(first_item(&updated, "page update"), "title"),
+            "Updated simulator page"
+        );
+
+        cfg.run(&["--yes", "page", "delete", &page_id]);
+    })
+    .await
+    .expect("simulated lifecycle task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simulated_cloud_supports_the_live_canary_contract() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        run_cli_canary(cfg);
+    })
+    .await
+    .expect("simulated canary task");
+}
+
+fn simulated_cloud_config(simulator: &ConfluenceSimulator, config_home: &TempDir) -> E2eConfig {
+    let config_home_path = config_home.path().to_string_lossy().into_owned();
+    E2eConfig {
+        bin: find_binary_path(),
+        profile: None,
+        envs: vec![
+            ("CONFLUENCE_DOMAIN".to_string(), simulator.base_url()),
+            ("CONFLUENCE_PROVIDER".to_string(), "cloud".to_string()),
+            ("CONFLUENCE_AUTH_TYPE".to_string(), "basic".to_string()),
+            (
+                "CONFLUENCE_API_PATH".to_string(),
+                "/wiki/rest/api".to_string(),
+            ),
+            ("CONFLUENCE_TOKEN_KIND".to_string(), "classic".to_string()),
+            (
+                "CONFLUENCE_USERNAME".to_string(),
+                "simulator@example.test".to_string(),
+            ),
+            (
+                "CONFLUENCE_API_TOKEN".to_string(),
+                "simulated-token".to_string(),
+            ),
+            ("HOME".to_string(), config_home_path.clone()),
+            ("XDG_CONFIG_HOME".to_string(), config_home_path),
+        ],
+        space: "TEST".to_string(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simulated_cloud_supports_the_complete_cli_lifecycle() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        run_cli_lifecycle(cfg);
+    })
+    .await
+    .expect("complete simulated lifecycle task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simulated_cloud_rejects_invalid_credentials_through_the_cli() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let mut cfg = simulated_cloud_config(&simulator, &config_home);
+    let token = cfg
+        .envs
+        .iter_mut()
+        .find(|(key, _)| key == "CONFLUENCE_API_TOKEN")
+        .expect("simulated API token");
+    token.1 = "invalid-token".to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let output = cfg
+            .command()
+            .args(["--json", "auth", "status"])
+            .output()
+            .expect("auth status command to run");
+        assert!(
+            !output.status.success(),
+            "invalid credentials were accepted"
+        );
+        let error: Value = serde_json::from_slice(&output.stderr)
+            .unwrap_or_else(|err| panic!("invalid JSON error: {err}"));
+        assert_eq!(error.pointer("/error/kind"), Some(&Value::from("auth")));
+    })
+    .await
+    .expect("invalid-credentials task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simulated_data_center_supports_the_complete_cli_lifecycle() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let config_home_path = config_home.path().to_string_lossy().into_owned();
+    let cfg = E2eConfig {
+        bin: find_binary_path(),
+        profile: None,
+        envs: vec![
+            ("CONFLUENCE_DOMAIN".to_string(), simulator.base_url()),
+            ("CONFLUENCE_PROVIDER".to_string(), "data-center".to_string()),
+            ("CONFLUENCE_AUTH_TYPE".to_string(), "bearer".to_string()),
+            ("CONFLUENCE_API_PATH".to_string(), "/rest/api".to_string()),
+            (
+                "CONFLUENCE_BEARER_TOKEN".to_string(),
+                "simulated-token".to_string(),
+            ),
+            ("HOME".to_string(), config_home_path.clone()),
+            ("XDG_CONFIG_HOME".to_string(), config_home_path),
+        ],
+        space: "TEST".to_string(),
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        run_cli_lifecycle(cfg);
+    })
+    .await
+    .expect("complete simulated Data Center lifecycle task");
+}
+
 fn first_item<'a>(value: &'a Value, context: &str) -> &'a Value {
     value
         .as_array()
@@ -343,6 +525,87 @@ fn find_index_md_by_title(root: &PathBuf, title: &str) -> PathBuf {
 
 #[test]
 #[ignore = "requires a real Confluence instance"]
+fn e2e_cli_canary() {
+    let Some(cfg) = e2e_config() else {
+        eprintln!(
+            "Skipping e2e_cli_canary: set CONFLUENCE_E2E_PROFILE or CONFLUENCE_E2E_BASE_URL / CONFLUENCE_E2E_TOKEN"
+        );
+        return;
+    };
+
+    run_cli_canary(cfg);
+}
+
+fn run_cli_canary(cfg: E2eConfig) {
+    let temp = TempDir::new().expect("canary tempdir");
+    let pull_dir = temp.path().join("pull");
+    let title = unique_name("Confluence CLI Canary");
+    let mut cleanup = Cleanup::new(cfg.clone());
+
+    let auth = cfg.run_json(&["auth", "status"]);
+    assert!(
+        auth.get("current_user").is_some_and(|user| !user.is_null()),
+        "canary authentication did not resolve a current user: {auth}"
+    );
+
+    let spaces = cfg.run_json(&["space", "list"]);
+    assert!(
+        list_items(&spaces, "canary space list")
+            .iter()
+            .any(|space| space.get("key").and_then(Value::as_str) == Some(cfg.space.as_str())),
+        "canary space is unavailable: {spaces}"
+    );
+
+    let created = cfg.run_json(&[
+        "page",
+        "create",
+        &title,
+        cfg.space.as_str(),
+        "--body",
+        "Confluence CLI automated canary.",
+    ]);
+    let page_id = string_field(first_item(&created, "canary page create"), "id").to_string();
+    cleanup.page_id = Some(page_id.clone());
+
+    let fetched = cfg.run_json(&["page", "get", &page_id, "--show-body"]);
+    assert_eq!(
+        string_field(first_item(&fetched, "canary page get"), "id"),
+        page_id
+    );
+
+    let pull_arg = pull_dir.to_string_lossy().into_owned();
+    cfg.run(&["pull", "page", &page_id, &pull_arg]);
+    let index_md = find_index_md(&pull_dir);
+    let markdown = fs::read_to_string(&index_md).expect("read canary markdown");
+    fs::write(
+        &index_md,
+        format!("{markdown}\nUpdated by the automated canary.\n"),
+    )
+    .expect("update canary markdown");
+
+    let plan = cfg.run_json(&["plan", &pull_arg]);
+    assert!(
+        list_items(&plan, "canary plan")
+            .iter()
+            .any(|item| { item.get("action").and_then(Value::as_str) == Some("update_content") }),
+        "canary plan did not detect the local update: {plan}"
+    );
+    cfg.run_json(&["apply", &pull_arg]);
+
+    let clean_plan = cfg.run_json(&["plan", &pull_arg]);
+    assert!(
+        list_items(&clean_plan, "clean canary plan")
+            .iter()
+            .all(|item| item.get("action").and_then(Value::as_str) == Some("noop")),
+        "canary did not converge after apply: {clean_plan}"
+    );
+
+    cfg.run(&["--yes", "page", "delete", &page_id]);
+    cleanup.page_id = None;
+}
+
+#[test]
+#[ignore = "requires a real Confluence instance"]
 fn e2e_cli_lifecycle() {
     let Some(cfg) = e2e_config() else {
         eprintln!(
@@ -351,6 +614,10 @@ fn e2e_cli_lifecycle() {
         return;
     };
 
+    run_cli_lifecycle(cfg);
+}
+
+fn run_cli_lifecycle(cfg: E2eConfig) {
     let temp = TempDir::new().expect("tempdir");
     let page_body_1 = temp.path().join("page-body-1.md");
     let page_body_2 = temp.path().join("page-body-2.md");

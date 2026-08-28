@@ -19,6 +19,7 @@ test:
 #   CONFLUENCE_E2E_PROFILE
 #   CONFLUENCE_E2E_SPACE
 #   CONFLUENCE_E2E_BASE_URL / CONFLUENCE_E2E_TOKEN / CONFLUENCE_E2E_PROVIDER / CONFLUENCE_E2E_API_PATH
+#   CONFLUENCE_E2E_TOKEN_KIND / CONFLUENCE_E2E_CLOUD_ID (for scoped Cloud tokens)
 # Set CONFLUENCE_E2E_PROFILE= to force env-driven mode instead of profile mode.
 test-e2e:
 	cargo build --locked

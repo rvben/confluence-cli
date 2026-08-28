@@ -1,0 +1,113 @@
+name: Confluence Cloud E2E
+
+on:
+  schedule:
+    - cron: "17 4 * * 1-6"
+    - cron: "43 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Live suite to run
+        required: true
+        default: canary
+        type: choice
+        options:
+          - canary
+          - full
+
+permissions:
+  contents: read
+
+concurrency:
+  group: confluence-cloud-e2e
+  cancel-in-progress: false
+
+jobs:
+  cloud-e2e:
+    name: ${{ inputs.suite || (github.event.schedule == '43 4 * * 0' && 'Full lifecycle') || 'Canary' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: confluence-cloud-e2e
+    env:
+      CONFLUENCE_E2E_PROFILE: ""
+      CONFLUENCE_E2E_BASE_URL: ${{ secrets.CONFLUENCE_BASE_URL }}
+      CONFLUENCE_E2E_USERNAME: ${{ secrets.CONFLUENCE_USERNAME }}
+      CONFLUENCE_E2E_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+      CONFLUENCE_E2E_CLOUD_ID: ${{ secrets.CONFLUENCE_CLOUD_ID }}
+      CONFLUENCE_E2E_TOKEN_KIND: ${{ vars.CONFLUENCE_TOKEN_KIND }}
+      CONFLUENCE_E2E_SPACE: ${{ vars.CONFLUENCE_SPACE }}
+      CONFLUENCE_E2E_PROVIDER: cloud
+      CONFLUENCE_E2E_AUTH_TYPE: basic
+      CONFLUENCE_E2E_API_PATH: /wiki/rest/api
+      CONFLUENCE_TOKEN_EXPIRES_AT: ${{ vars.CONFLUENCE_TOKEN_EXPIRES_AT }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.96.0
+
+      - name: Validate protected environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            CONFLUENCE_E2E_BASE_URL
+            CONFLUENCE_E2E_USERNAME
+            CONFLUENCE_E2E_TOKEN
+            CONFLUENCE_E2E_SPACE
+            CONFLUENCE_E2E_TOKEN_KIND
+            CONFLUENCE_TOKEN_EXPIRES_AT
+          )
+          for name in "${required[@]}"; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing required confluence-cloud-e2e setting: ${name}"
+              exit 1
+            fi
+          done
+          if [ "$CONFLUENCE_E2E_TOKEN_KIND" = "scoped" ] && [ -z "${CONFLUENCE_E2E_CLOUD_ID:-}" ]; then
+            echo "::error::CONFLUENCE_E2E_CLOUD_ID is required for a scoped token"
+            exit 1
+          fi
+          case "$CONFLUENCE_E2E_TOKEN_KIND" in
+            classic|scoped) ;;
+            *)
+              echo "::error::CONFLUENCE_E2E_TOKEN_KIND must be classic or scoped"
+              exit 1
+              ;;
+          esac
+
+      - name: Check token lifetime
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! expires_epoch=$(date -u -d "${CONFLUENCE_TOKEN_EXPIRES_AT}T00:00:00Z" +%s); then
+            echo "::error::CONFLUENCE_TOKEN_EXPIRES_AT must use YYYY-MM-DD"
+            exit 1
+          fi
+          now_epoch=$(date -u +%s)
+          if [ "$expires_epoch" -le "$now_epoch" ]; then
+            echo "::error::The Confluence automation token has expired"
+            exit 1
+          fi
+          days_left=$(( (expires_epoch - now_epoch) / 86400 ))
+          if [ "$days_left" -le 30 ]; then
+            echo "::warning::The Confluence automation token expires in ${days_left} days"
+          fi
+          echo "Confluence automation token: ${days_left} days remaining" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run Cloud canary
+        timeout-minutes: 10
+        if: >-
+          (github.event_name == 'schedule' && github.event.schedule == '17 4 * * 1-6') ||
+          (github.event_name == 'workflow_dispatch' && inputs.suite == 'canary')
+        run: cargo test --locked --test e2e e2e_cli_canary -- --ignored --exact
+
+      - name: Run complete Cloud lifecycle
+        timeout-minutes: 30
+        if: >-
+          (github.event_name == 'schedule' && github.event.schedule == '43 4 * * 0') ||
+          (github.event_name == 'workflow_dispatch' && inputs.suite == 'full')
+        run: cargo test --locked --test e2e e2e_cli_lifecycle -- --ignored --exact
