@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.28](https://github.com/rvben/confluence-cli/compare/v0.1.27...v0.1.28) - 2026-08-29
+
+### Fixed
+
+- **readme**: replace broken Proof Desk screenshot ([d0ff262](https://github.com/rvben/confluence-cli/commit/d0ff262293f1cf9b8c3868b8bfaabc1e6155df1e))
+
 ## [0.1.27](https://github.com/rvben/confluence-cli/compare/v0.1.26...v0.1.27) - 2026-08-29
 
 ### Added
