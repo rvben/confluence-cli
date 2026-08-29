@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" role="img" aria-labelledby="title description">
+  <title id="title">confluence-cli — Confluence, readable and scriptable</title>
+  <desc id="description">A Prompt Leaf mark beside the confluence-cli name, its slogan, and a terminal reading command on a flat editorial proof sheet.</desc>
+
+  <rect width="1280" height="640" fill="#F1F3EF"/>
+  <rect width="410" height="640" fill="#18201D"/>
+  <rect x="410" width="12" height="640" fill="#2E4F9B"/>
+
+  <g transform="translate(80 82) scale(1.55)">
+    <path d="M34 18h63l29 29v95H34Z" fill="#FBFCF8" stroke="#F1F3EF" stroke-width="8" stroke-linejoin="round"/>
+    <path d="M97 18v29h29" fill="#DCE5FA" stroke="#F1F3EF" stroke-width="8" stroke-linejoin="round"/>
+    <path d="m54 72 18 14-18 14" fill="none" stroke="#2E4F9B" stroke-width="10" stroke-linecap="square" stroke-linejoin="miter"/>
+    <rect x="80" y="96" width="28" height="9" fill="#18201D"/>
+  </g>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace">
+    <text x="80" y="390" fill="#969E98" font-size="18" font-weight="700" letter-spacing="2">PROMPT LEAF / 001</text>
+    <line x1="80" y1="420" x2="330" y2="420" stroke="#505B56" stroke-width="2"/>
+    <text x="80" y="466" fill="#F1F3EF" font-size="22"><tspan fill="#7DA0F2" font-weight="700">$</tspan> confluence tui</text>
+    <text x="80" y="504" fill="#D9DED9" font-size="18">Open the knowledge base.</text>
+    <text x="80" y="558" fill="#68B68E" font-size="16" font-weight="700">CLOUD + DATA CENTER</text>
+
+    <text x="492" y="120" fill="#2E4F9B" font-size="18" font-weight="700" letter-spacing="3">TERMINAL-NATIVE CONFLUENCE</text>
+    <line x1="492" y1="150" x2="1198" y2="150" stroke="#969E98" stroke-width="2"/>
+
+    <text x="492" y="255" fill="#18201D" font-size="68" font-weight="700" letter-spacing="-3">confluence-cli</text>
+    <text x="492" y="332" fill="#18201D" font-size="36" font-weight="700">Confluence, readable</text>
+    <text x="492" y="378" fill="#18201D" font-size="36" font-weight="700">and scriptable.</text>
+
+    <text x="492" y="452" fill="#505B56" font-size="22">Read · search · browse · automate · edit</text>
+    <text x="492" y="488" fill="#505B56" font-size="22">for humans, scripts, and agents.</text>
+
+    <line x1="492" y1="540" x2="1198" y2="540" stroke="#969E98" stroke-width="2"/>
+    <text x="492" y="578" fill="#1F6848" font-size="17" font-weight="700">✓ KNOWLEDGE READY AT THE PROMPT</text>
+    <text x="1198" y="578" text-anchor="end" fill="#969E98" font-size="17">github.com/rvben/confluence-cli</text>
+  </g>
+</svg>
