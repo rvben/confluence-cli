@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.27](https://github.com/rvben/confluence-cli/compare/v0.1.26...v0.1.27) - 2026-08-29
+
+### Added
+
+- **tui**: add Proof Desk workspace ([b3a8181](https://github.com/rvben/confluence-cli/commit/b3a8181d1cfad5b5b926fa34a914e753ee90035c))
+
 ## [0.1.26](https://github.com/rvben/confluence-cli/compare/v0.1.25...v0.1.26) - 2026-08-29
 
 ### Fixed
