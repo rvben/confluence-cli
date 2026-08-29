@@ -56,7 +56,7 @@ fn arg_to_json(arg: &clap::Arg) -> Value {
 }
 
 fn is_mutating(path: &str) -> bool {
-    if path.starts_with("pull ") {
+    if path.starts_with("pull ") || path == "attachment download" {
         return true;
     }
     let mutating_verbs = [
@@ -68,15 +68,12 @@ fn is_mutating(path: &str) -> bool {
 }
 
 fn effect_kind(path: &str) -> &'static str {
-    if matches!(
-        path,
-        "pull page" | "pull tree" | "pull space" | "attachment download"
-    ) {
-        "local_write"
-    } else if is_mutating(path) {
-        "remote_or_config_write"
-    } else {
+    if !is_mutating(path) {
         "read_only"
+    } else if is_idempotent(path) {
+        "idempotent"
+    } else {
+        "non_idempotent"
     }
 }
 
@@ -107,18 +104,18 @@ fn output_fields_for(path: &str) -> Vec<Value> {
         vec![
             json!({"name": "id", "type": "string"}),
             json!({"name": "kind", "type": "string"}),
-            json!({"name": "space_id", "type": "string|null"}),
-            json!({"name": "space_key", "type": "string|null"}),
+            json!({"name": "space_id", "type": "string", "nullable": true}),
+            json!({"name": "space_key", "type": "string", "nullable": true}),
             json!({"name": "title", "type": "string"}),
             json!({"name": "status", "type": "string"}),
-            json!({"name": "version", "type": "integer|null"}),
-            json!({"name": "parent_id", "type": "string|null"}),
-            json!({"name": "body_storage", "type": "string|null"}),
-            json!({"name": "labels", "type": "array"}),
+            json!({"name": "version", "type": "integer", "nullable": true}),
+            json!({"name": "parent_id", "type": "string", "nullable": true}),
+            json!({"name": "body_storage", "type": "string", "nullable": true}),
+            json!({"name": "labels", "type": "array", "items": {"type": "string"}}),
             json!({"name": "properties", "type": "object"}),
-            json!({"name": "web_url", "type": "string|null"}),
-            json!({"name": "created_at", "type": "string|null"}),
-            json!({"name": "updated_at", "type": "string|null"}),
+            json!({"name": "web_url", "type": "string", "nullable": true}),
+            json!({"name": "created_at", "type": "string", "nullable": true}),
+            json!({"name": "updated_at", "type": "string", "nullable": true}),
         ]
     };
 
@@ -157,42 +154,42 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "id", "type": "string"}),
             json!({"name": "key", "type": "string"}),
             json!({"name": "name", "type": "string"}),
-            json!({"name": "space_type", "type": "string|null"}),
-            json!({"name": "homepage_id", "type": "string|null"}),
-            json!({"name": "web_url", "type": "string|null"}),
+            json!({"name": "space_type", "type": "string", "nullable": true}),
+            json!({"name": "homepage_id", "type": "string", "nullable": true}),
+            json!({"name": "web_url", "type": "string", "nullable": true}),
         ],
 
         "search" => vec![
             json!({"name": "id", "type": "string"}),
             json!({"name": "kind", "type": "string"}),
-            json!({"name": "space_key", "type": "string|null"}),
+            json!({"name": "space_key", "type": "string", "nullable": true}),
             json!({"name": "title", "type": "string"}),
-            json!({"name": "excerpt", "type": "string|null"}),
-            json!({"name": "web_url", "type": "string|null"}),
+            json!({"name": "excerpt", "type": "string", "nullable": true}),
+            json!({"name": "web_url", "type": "string", "nullable": true}),
         ],
 
         "attachment list" | "attachment upload" => vec![
             json!({"name": "id", "type": "string"}),
             json!({"name": "title", "type": "string"}),
-            json!({"name": "media_type", "type": "string|null"}),
-            json!({"name": "file_size", "type": "integer|null"}),
-            json!({"name": "download_url", "type": "string|null"}),
-            json!({"name": "comment", "type": "string|null"}),
+            json!({"name": "media_type", "type": "string", "nullable": true}),
+            json!({"name": "file_size", "type": "integer", "nullable": true}),
+            json!({"name": "download_url", "type": "string", "nullable": true}),
+            json!({"name": "comment", "type": "string", "nullable": true}),
         ],
 
         "comment list" | "comment add" | "comment update" => vec![
             json!({"name": "id", "type": "string"}),
-            json!({"name": "author", "type": "string|null"}),
-            json!({"name": "created_at", "type": "string|null"}),
+            json!({"name": "author", "type": "string", "nullable": true}),
+            json!({"name": "created_at", "type": "string", "nullable": true}),
             json!({"name": "body_storage", "type": "string"}),
-            json!({"name": "version", "type": "integer|null"}),
+            json!({"name": "version", "type": "integer", "nullable": true}),
         ],
 
+        // `value` is arbitrary JSON, which clispec v0.3's compact field types cannot express.
         "property list" | "property get" | "property set" => vec![
-            json!({"name": "id", "type": "string|null"}),
+            json!({"name": "id", "type": "string", "nullable": true}),
             json!({"name": "key", "type": "string"}),
-            json!({"name": "version", "type": "integer|null"}),
-            json!({"name": "value", "type": "json"}),
+            json!({"name": "version", "type": "integer", "nullable": true}),
         ],
 
         "auth login" | "profile add" => vec![
@@ -201,9 +198,9 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "base_url", "type": "string"}),
             json!({"name": "api_path", "type": "string"}),
             json!({"name": "credential_store", "type": "string"}),
-            json!({"name": "cloud_id", "type": "string|null"}),
+            json!({"name": "cloud_id", "type": "string", "nullable": true}),
             json!({"name": "token_kind", "type": "string"}),
-            json!({"name": "expires_at", "type": "string|null"}),
+            json!({"name": "expires_at", "type": "string", "nullable": true}),
             json!({"name": "read_only", "type": "boolean"}),
         ],
 
@@ -213,12 +210,12 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "base_url", "type": "string"}),
             json!({"name": "api_path", "type": "string"}),
             json!({"name": "credential_store", "type": "string"}),
-            json!({"name": "cloud_id", "type": "string|null"}),
+            json!({"name": "cloud_id", "type": "string", "nullable": true}),
             json!({"name": "token_kind", "type": "string"}),
-            json!({"name": "expires_at", "type": "string|null"}),
+            json!({"name": "expires_at", "type": "string", "nullable": true}),
             json!({"name": "expiration_status", "type": "string"}),
             json!({"name": "read_only", "type": "boolean"}),
-            json!({"name": "current_user", "type": "object|null"}),
+            json!({"name": "current_user", "type": "object", "nullable": true}),
         ],
 
         "auth logout" => vec![
@@ -248,7 +245,7 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "api_path", "type": "string"}),
             json!({"name": "credential_store", "type": "string"}),
             json!({"name": "token_kind", "type": "string"}),
-            json!({"name": "expires_at", "type": "string|null"}),
+            json!({"name": "expires_at", "type": "string", "nullable": true}),
             json!({"name": "read_only", "type": "boolean"}),
             json!({"name": "active", "type": "boolean"}),
         ],
@@ -268,10 +265,10 @@ fn output_fields_for(path: &str) -> Vec<Value> {
         "doctor" => vec![
             json!({"name": "config_path", "type": "string"}),
             json!({"name": "config_exists", "type": "boolean"}),
-            json!({"name": "active_profile", "type": "string|null"}),
+            json!({"name": "active_profile", "type": "string", "nullable": true}),
             json!({"name": "stored_profiles", "type": "integer"}),
-            json!({"name": "resolved_profile", "type": "object|null"}),
-            json!({"name": "checks", "type": "array"}),
+            json!({"name": "resolved_profile", "type": "object", "nullable": true}),
+            json!({"name": "checks", "type": "array", "items": {"type": "object"}}),
             json!({"name": "summary", "type": "object"}),
         ],
 
@@ -292,7 +289,7 @@ fn output_fields_for(path: &str) -> Vec<Value> {
         "apply" => vec![
             json!({"name": "action", "type": "string"}),
             json!({"name": "title", "type": "string"}),
-            json!({"name": "content_id", "type": "string|null"}),
+            json!({"name": "content_id", "type": "string", "nullable": true}),
             json!({"name": "path", "type": "string"}),
             json!({"name": "details", "type": "string"}),
         ],
@@ -300,7 +297,7 @@ fn output_fields_for(path: &str) -> Vec<Value> {
         "plan" => vec![
             json!({"name": "action", "type": "string"}),
             json!({"name": "title", "type": "string"}),
-            json!({"name": "content_id", "type": "string|null"}),
+            json!({"name": "content_id", "type": "string", "nullable": true}),
             json!({"name": "path", "type": "string"}),
             json!({"name": "details", "type": "string"}),
             json!({"name": "diff", "type": "string", "optional": true}),
@@ -693,6 +690,65 @@ mod tests {
                 "command {} missing mutating field",
                 cmd["name"]
             );
+        }
+    }
+
+    #[test]
+    fn schema_effects_conform_to_clispec_v03_and_agree_with_mutating() {
+        let schema = generate(&test_cmd());
+        let commands = schema["commands"].as_array().unwrap();
+        for command in commands {
+            let effects = command["effects"].as_str().unwrap_or_default();
+            assert!(
+                matches!(effects, "read_only" | "idempotent" | "non_idempotent"),
+                "command {} has invalid effects value {effects}",
+                command["name"]
+            );
+            assert_eq!(
+                command["mutating"],
+                json!(effects != "read_only"),
+                "command {} has contradictory mutating and effects declarations",
+                command["name"]
+            );
+        }
+
+        let command = |name: &str| {
+            commands
+                .iter()
+                .find(|command| command["name"] == name)
+                .unwrap()
+        };
+        assert_eq!(command("page get")["effects"], "read_only");
+        assert_eq!(command("profile use")["effects"], "idempotent");
+        assert_eq!(command("page create")["effects"], "non_idempotent");
+        assert_eq!(command("pull page")["effects"], "non_idempotent");
+        assert_eq!(command("attachment download")["effects"], "non_idempotent");
+    }
+
+    #[test]
+    fn schema_output_field_types_conform_to_clispec_v03() {
+        let schema = generate(&test_cmd());
+        for command in schema["commands"].as_array().unwrap() {
+            for field in command["output_fields"].as_array().into_iter().flatten() {
+                let field_type = field["type"].as_str().unwrap_or_default();
+                assert!(
+                    matches!(
+                        field_type,
+                        "string" | "integer" | "number" | "boolean" | "object" | "array"
+                    ),
+                    "field {} on command {} has invalid type {field_type}",
+                    field["name"],
+                    command["name"]
+                );
+                if field_type == "array" {
+                    assert!(
+                        field.get("items").is_some(),
+                        "array field {} on command {} is missing items",
+                        field["name"],
+                        command["name"]
+                    );
+                }
+            }
         }
     }
 
