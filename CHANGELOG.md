@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.29](https://github.com/rvben/confluence-cli/compare/v0.1.28...v0.1.29) - 2026-08-29
+
+### Fixed
+
+- **schema**: conform to clispec v0.3 ([883f55c](https://github.com/rvben/confluence-cli/commit/883f55c149086cfc633e82d2d19f1b794f1b19b2))
+
 ## [0.1.28](https://github.com/rvben/confluence-cli/compare/v0.1.27...v0.1.28) - 2026-08-29
 
 ### Fixed
