@@ -1,0 +1,1101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="impeccable-form-seed" content="eb72d688">
+  <title>confluence-cli — Ten Logo Proofs</title>
+  <style>
+    :root {
+      --stock: #f1f3ef;
+      --paper: #fbfcf8;
+      --ink: #18201d;
+      --muted: #505b56;
+      --rule: #969e98;
+      --blue: #2e4f9b;
+      --blue-soft: #dce5fa;
+      --magenta: #a92a43;
+      --amber: #855300;
+      --green: #1f6848;
+      --green-soft: #dceadf;
+      --proof-size: 220px;
+      --measure: 72ch;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+      background: var(--stock);
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--stock);
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      line-height: 1.55;
+      text-rendering: optimizeLegibility;
+    }
+
+    ::selection {
+      color: var(--paper);
+      background: var(--blue);
+    }
+
+    :focus-visible {
+      outline: 3px solid var(--blue);
+      outline-offset: 4px;
+    }
+
+    a {
+      color: var(--blue);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 0.2em;
+    }
+
+    button {
+      color: inherit;
+      font: inherit;
+    }
+
+    .symbol-library {
+      position: absolute;
+      width: 0;
+      height: 0;
+      overflow: hidden;
+    }
+
+    .sheet {
+      width: min(100% - 40px, 1320px);
+      margin: 20px auto 72px;
+      background: var(--paper);
+      border: 1px solid var(--rule);
+    }
+
+    .masthead {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 24px;
+      align-items: center;
+      min-height: 54px;
+      padding: 8px 20px;
+      border-bottom: 1px solid var(--rule);
+      font-size: 0.76rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .brand-stamp {
+      padding: 6px 9px;
+      color: var(--paper);
+      background: var(--blue);
+    }
+
+    .masthead-center {
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .folio {
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .cover {
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.55fr);
+      min-height: 680px;
+      border-bottom: 1px solid var(--rule);
+    }
+
+    .cover-copy {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: clamp(40px, 7vw, 96px);
+      border-right: 1px solid var(--rule);
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+
+    h1 {
+      max-width: 9ch;
+      margin-bottom: 32px;
+      font-size: clamp(3.4rem, 8vw, 6rem);
+      line-height: 0.88;
+      letter-spacing: -0.04em;
+      text-wrap: balance;
+    }
+
+    .lede {
+      max-width: 62ch;
+      margin-bottom: 64px;
+      color: var(--muted);
+      font-size: clamp(1rem, 1.5vw, 1.25rem);
+    }
+
+    .brief-line {
+      display: grid;
+      grid-template-columns: 10ch 1fr;
+      gap: 16px;
+      max-width: 68ch;
+      padding-top: 14px;
+      border-top: 1px solid var(--rule);
+      font-size: 0.88rem;
+    }
+
+    .brief-line strong {
+      color: var(--blue);
+      text-transform: uppercase;
+    }
+
+    .cover-verdict {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 28px;
+      color: var(--paper);
+      background: var(--ink);
+    }
+
+    .cover-verdict .label,
+    .winner-label {
+      font-size: 0.76rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .cover-mark {
+      display: grid;
+      place-items: center;
+      min-height: 330px;
+    }
+
+    .cover-mark svg {
+      width: min(100%, 320px);
+      height: auto;
+    }
+
+    .cover-verdict h2 {
+      margin-bottom: 12px;
+      font-size: clamp(1.9rem, 3vw, 3rem);
+      line-height: 1;
+      letter-spacing: -0.03em;
+    }
+
+    .cover-verdict p {
+      max-width: 36ch;
+      margin-bottom: 0;
+      color: var(--stock);
+    }
+
+    .method {
+      display: grid;
+      grid-template-columns: minmax(220px, 0.35fr) minmax(0, 1fr);
+      border-bottom: 1px solid var(--rule);
+    }
+
+    .method-title {
+      padding: 48px 32px;
+      border-right: 1px solid var(--rule);
+    }
+
+    .method-title h2 {
+      margin-bottom: 10px;
+      font-size: clamp(1.8rem, 3vw, 3.1rem);
+      line-height: 1;
+      letter-spacing: -0.03em;
+    }
+
+    .method-title p {
+      max-width: 28ch;
+      margin-bottom: 0;
+      color: var(--muted);
+    }
+
+    .criteria {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      margin: 0;
+    }
+
+    .criteria div {
+      min-height: 180px;
+      padding: 24px 18px;
+      border-right: 1px solid var(--rule);
+    }
+
+    .criteria div:last-child { border-right: 0; }
+
+    .criteria dt {
+      margin-bottom: 12px;
+      color: var(--blue);
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .criteria dd {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    .proof-controls {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 20px;
+      align-items: center;
+      min-height: 62px;
+      padding: 10px 18px;
+      background: rgba(241, 243, 239, 0.97);
+      border-bottom: 1px solid var(--rule);
+    }
+
+    .proof-controls strong {
+      font-size: 0.78rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .control-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: center;
+    }
+
+    .control-button,
+    .download-button {
+      min-height: 36px;
+      padding: 7px 11px;
+      border: 1px solid var(--rule);
+      border-radius: 0;
+      color: var(--ink);
+      background: var(--paper);
+      cursor: pointer;
+    }
+
+    .control-button:hover,
+    .download-button:hover {
+      border-color: var(--blue);
+      color: var(--blue);
+    }
+
+    .control-button[aria-pressed="true"] {
+      color: var(--paper);
+      background: var(--blue);
+      border-color: var(--blue);
+    }
+
+    .concept-index {
+      display: grid;
+      grid-template-columns: repeat(10, minmax(0, 1fr));
+      border-bottom: 1px solid var(--rule);
+    }
+
+    .concept-index a {
+      display: grid;
+      place-items: center;
+      min-height: 70px;
+      border-right: 1px solid var(--rule);
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-weight: 700;
+      text-decoration: none;
+    }
+
+    .concept-index a:last-child { border-right: 0; }
+
+    .concept-index a:hover,
+    .concept-index a:focus-visible {
+      color: var(--paper);
+      background: var(--blue);
+    }
+
+    .concept-index a[aria-current="true"] {
+      color: var(--paper);
+      background: var(--green);
+    }
+
+    .candidate {
+      display: grid;
+      grid-template-columns: minmax(320px, 0.9fr) minmax(0, 1.1fr);
+      min-height: 560px;
+      border-bottom: 1px solid var(--rule);
+      scroll-margin-top: 62px;
+    }
+
+    .candidate:nth-child(even) .specimen { order: 2; border-right: 0; border-left: 1px solid var(--rule); }
+    .candidate:nth-child(even) .analysis { order: 1; }
+
+    .candidate.winner {
+      background: var(--green-soft);
+      border-top: 5px solid var(--green);
+    }
+
+    .specimen {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-width: 0;
+      padding: clamp(28px, 5vw, 64px);
+      border-right: 1px solid var(--rule);
+      background: var(--stock);
+    }
+
+    .specimen-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 32px;
+      font-size: 0.76rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .rank {
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .logo-stage {
+      display: grid;
+      place-items: center;
+      min-height: 290px;
+      overflow: hidden;
+    }
+
+    .primary-logo {
+      width: min(var(--proof-size), 100%);
+      height: auto;
+    }
+
+    .size-strip {
+      display: flex;
+      align-items: end;
+      gap: 20px;
+      min-height: 76px;
+      margin-top: 28px;
+      padding-top: 18px;
+      border-top: 1px solid var(--rule);
+    }
+
+    .size-sample {
+      display: grid;
+      gap: 7px;
+      justify-items: center;
+      color: var(--muted);
+      font-size: 0.66rem;
+    }
+
+    .size-sample svg { display: block; }
+
+    .analysis {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: clamp(36px, 6vw, 80px);
+    }
+
+    .analysis h2 {
+      margin-bottom: 14px;
+      font-size: clamp(2.2rem, 5vw, 4.8rem);
+      line-height: 0.94;
+      letter-spacing: -0.04em;
+    }
+
+    .thesis {
+      max-width: var(--measure);
+      margin-bottom: 28px;
+      color: var(--muted);
+      font-size: 1.04rem;
+    }
+
+    .verdict-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 22px;
+      max-width: 72ch;
+      margin-bottom: 28px;
+    }
+
+    .verdict-grid h3 {
+      margin-bottom: 7px;
+      color: var(--blue);
+      font-size: 0.76rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .verdict-grid p {
+      margin-bottom: 0;
+      font-size: 0.88rem;
+    }
+
+    .score-line {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      max-width: 72ch;
+      padding-top: 16px;
+      border-top: 1px solid var(--rule);
+    }
+
+    .score {
+      font-size: 1.35rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .winner .score { color: var(--green); }
+
+    .comparison {
+      padding: clamp(40px, 7vw, 92px);
+      border-bottom: 1px solid var(--rule);
+    }
+
+    .comparison h2,
+    .recommendation h2 {
+      max-width: 12ch;
+      margin-bottom: 22px;
+      font-size: clamp(2.6rem, 6vw, 6rem);
+      line-height: 0.9;
+      letter-spacing: -0.04em;
+    }
+
+    .comparison > p {
+      max-width: var(--measure);
+      margin-bottom: 42px;
+      color: var(--muted);
+    }
+
+    .table-wrap { overflow-x: auto; }
+
+    table {
+      width: 100%;
+      min-width: 820px;
+      border-collapse: collapse;
+      font-size: 0.82rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    th, td {
+      padding: 13px 10px;
+      border-bottom: 1px solid var(--rule);
+      text-align: left;
+    }
+
+    th {
+      color: var(--blue);
+      font-size: 0.7rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    td:not(:nth-child(2)), th:not(:nth-child(2)) { text-align: center; }
+    td:nth-child(2), th:nth-child(2) { text-align: left; }
+    tr.best { color: var(--green); font-weight: 700; background: var(--green-soft); }
+
+    .recommendation {
+      display: grid;
+      grid-template-columns: minmax(280px, 0.8fr) minmax(0, 1.2fr);
+      background: var(--ink);
+      color: var(--paper);
+    }
+
+    .recommendation-mark {
+      display: grid;
+      place-items: center;
+      min-height: 560px;
+      padding: 60px;
+      border-right: 1px solid var(--muted);
+    }
+
+    .recommendation-mark svg {
+      width: min(100%, 420px);
+      height: auto;
+    }
+
+    .recommendation-copy {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: clamp(44px, 7vw, 96px);
+    }
+
+    .recommendation-copy p {
+      max-width: 65ch;
+      color: var(--stock);
+    }
+
+    .winner-reasons {
+      margin: 20px 0 32px;
+      padding: 0;
+      list-style: none;
+      counter-reset: reasons;
+    }
+
+    .winner-reasons li {
+      display: grid;
+      grid-template-columns: 2.3rem 1fr;
+      gap: 12px;
+      padding: 13px 0;
+      border-top: 1px solid var(--muted);
+      counter-increment: reasons;
+    }
+
+    .winner-reasons li::before {
+      content: counter(reasons, decimal-leading-zero);
+      color: var(--green-soft);
+    }
+
+    .risk {
+      padding: 18px;
+      color: var(--paper) !important;
+      background: var(--muted);
+      border: 1px solid var(--rule);
+    }
+
+    footer {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 24px;
+      padding: 24px;
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+
+    .mono .blue,
+    .mono .green,
+    .mono .amber,
+    .mono .magenta { fill: var(--ink) !important; stroke: var(--ink) !important; }
+    .mono .paper { fill: var(--paper) !important; stroke: var(--paper) !important; }
+    .mono .soft { fill: var(--rule) !important; stroke: var(--rule) !important; }
+
+    @media (max-width: 900px) {
+      .sheet { width: min(100% - 20px, 760px); margin-top: 10px; }
+      .masthead { grid-template-columns: auto 1fr; }
+      .masthead-center { display: none; }
+      .folio { text-align: right; }
+      .cover { grid-template-columns: 1fr; }
+      .cover-copy { min-height: 620px; border-right: 0; border-bottom: 1px solid var(--rule); }
+      .cover-verdict { min-height: 620px; }
+      .method { grid-template-columns: 1fr; }
+      .method-title { border-right: 0; border-bottom: 1px solid var(--rule); }
+      .criteria { grid-template-columns: 1fr 1fr; }
+      .criteria div { min-height: 140px; border-bottom: 1px solid var(--rule); }
+      .criteria div:nth-child(even) { border-right: 0; }
+      .criteria div:last-child { grid-column: 1 / -1; }
+      .proof-controls { grid-template-columns: 1fr; position: static; }
+      .proof-controls > strong { text-align: center; }
+      .concept-index { grid-template-columns: repeat(5, 1fr); }
+      .concept-index a:nth-child(5) { border-right: 0; }
+      .concept-index a:nth-child(-n+5) { border-bottom: 1px solid var(--rule); }
+      .candidate,
+      .candidate:nth-child(even) { grid-template-columns: 1fr; }
+      .candidate .specimen,
+      .candidate:nth-child(even) .specimen { order: 1; border: 0; border-bottom: 1px solid var(--rule); }
+      .candidate .analysis,
+      .candidate:nth-child(even) .analysis { order: 2; }
+      .recommendation { grid-template-columns: 1fr; }
+      .recommendation-mark { min-height: 420px; border-right: 0; border-bottom: 1px solid var(--muted); }
+    }
+
+    @media (max-width: 560px) {
+      .sheet { width: 100%; margin: 0; border-left: 0; border-right: 0; }
+      .cover-copy { display: contents; }
+      .cover-intro { order: 1; padding: 42px 22px 28px; border-bottom: 1px solid var(--rule); }
+      .cover-brief { order: 3; padding: 34px 22px; }
+      .cover-verdict {
+        order: 2;
+        display: grid;
+        grid-template-columns: 126px 1fr;
+        gap: 18px;
+        min-height: 252px;
+        padding: 22px;
+      }
+      .cover-verdict > .label { grid-column: 1 / -1; }
+      .cover-mark { min-height: 142px; }
+      .cover-mark svg { width: 126px; }
+      .cover-verdict h2 { font-size: 1.8rem; }
+      .cover-verdict p { font-size: 0.82rem; }
+      h1 { font-size: clamp(3.2rem, 19vw, 5rem); }
+      .brief-line { grid-template-columns: 1fr; gap: 4px; }
+      .criteria { grid-template-columns: 1fr; }
+      .criteria div, .criteria div:last-child { grid-column: auto; border-right: 0; }
+      .candidate { min-height: 0; }
+      .specimen, .analysis, .comparison, .recommendation-copy { padding: 34px 22px; }
+      .logo-stage { min-height: 220px; }
+      .verdict-grid { grid-template-columns: 1fr; }
+      .score-line { align-items: flex-start; flex-direction: column; }
+      footer { grid-template-columns: 1fr; }
+    }
+
+    @media print {
+      html, body { background: white; }
+      .sheet { width: 100%; margin: 0; border: 0; }
+      .proof-controls { display: none; }
+      .candidate { break-inside: avoid; min-height: 0; }
+      .primary-logo { width: 170px; }
+      .cover { min-height: 0; }
+      .cover-copy, .cover-verdict { min-height: 620px; }
+    }
+  </style>
+</head>
+<body>
+  <svg class="symbol-library" aria-hidden="true" focusable="false">
+    <defs>
+      <symbol id="mark-1" viewBox="0 0 160 160">
+        <rect class="blue" x="8" y="8" width="144" height="144" rx="30" fill="#2e4f9b"/>
+        <rect class="soft" x="43" y="25" width="80" height="98" rx="11" fill="#aebde0"/>
+        <rect class="paper" x="32" y="35" width="88" height="100" rx="12" fill="#fbfcf8"/>
+        <path class="soft" d="M94 35h13a13 13 0 0 1 13 13v13h-13a13 13 0 0 1-13-13V35Z" fill="#dce5fa"/>
+        <circle class="blue" cx="52" cy="67" r="4" fill="#2e4f9b"/>
+        <rect class="blue" x="63" y="63" width="34" height="8" rx="4" fill="#2e4f9b"/>
+        <circle class="blue" cx="52" cy="87" r="4" fill="#2e4f9b" opacity=".64"/>
+        <rect class="soft" x="63" y="83" width="27" height="8" rx="4" fill="#aebde0"/>
+        <circle cx="110" cy="116" r="22" fill="#18201d" stroke="#fbfcf8" stroke-width="4"/>
+        <path d="m99 116 7 7 15-16" fill="none" stroke="#fbfcf8" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+      </symbol>
+
+      <symbol id="mark-2" viewBox="0 0 160 160">
+        <path class="paper" d="M34 18h63l29 29v95H34Z" fill="#fbfcf8" stroke="#18201d" stroke-width="8" stroke-linejoin="round"/>
+        <path class="soft" d="M97 18v29h29" fill="#dce5fa" stroke="#18201d" stroke-width="8" stroke-linejoin="round"/>
+        <path class="blue" d="m54 72 18 14-18 14" fill="none" stroke="#2e4f9b" stroke-width="10" stroke-linecap="square" stroke-linejoin="miter"/>
+        <rect x="80" y="96" width="28" height="9" fill="#18201d"/>
+      </symbol>
+
+      <symbol id="mark-3" viewBox="0 0 160 160">
+        <path class="blue" d="M18 30 74 57v79l-56-27Z" fill="#2e4f9b"/>
+        <path d="m142 30-56 27v79l56-27Z" fill="#18201d"/>
+        <path class="paper" d="M35 66 59 77v8L35 74Zm0 19 24 11v8L35 93Z" fill="#fbfcf8"/>
+        <path class="paper" d="m108 72 14 13-14 13" fill="none" stroke="#fbfcf8" stroke-width="8" stroke-linecap="square" stroke-linejoin="miter"/>
+        <rect class="paper" x="96" y="101" width="27" height="7" fill="#fbfcf8"/>
+        <path class="green" d="M74 57h12v79H74Z" fill="#1f6848"/>
+      </symbol>
+
+      <symbol id="mark-4" viewBox="0 0 160 160">
+        <path d="M37 38v84M37 60h37M37 101h37" fill="none" stroke="#18201d" stroke-width="8" stroke-linecap="square"/>
+        <rect class="blue" x="20" y="21" width="34" height="34" fill="#2e4f9b"/>
+        <path class="paper" d="M29 32h16v4H29Zm0 9h12v4H29Z" fill="#fbfcf8"/>
+        <path class="paper" d="M75 39h48l17 17v42H75Z" fill="#fbfcf8" stroke="#18201d" stroke-width="7" stroke-linejoin="round"/>
+        <path class="soft" d="M123 39v17h17" fill="#dce5fa" stroke="#18201d" stroke-width="7"/>
+        <path class="paper" d="M75 81h48l17 17v42H75Z" fill="#fbfcf8" stroke="#18201d" stroke-width="7" stroke-linejoin="round"/>
+        <path class="green" d="M123 81v17h17" fill="#1f6848" stroke="#18201d" stroke-width="7"/>
+      </symbol>
+
+      <symbol id="mark-5" viewBox="0 0 160 160">
+        <path class="paper" d="M53 46h54v68H53Z" fill="#fbfcf8" stroke="#18201d" stroke-width="8"/>
+        <path class="blue" d="M39 60a53 53 0 0 1 85-13l9 9" fill="none" stroke="#2e4f9b" stroke-width="10"/>
+        <path class="blue" d="m116 56 18 1-2-18" fill="none" stroke="#2e4f9b" stroke-width="10"/>
+        <path class="green" d="M121 101a53 53 0 0 1-84 12l-9-9" fill="none" stroke="#1f6848" stroke-width="10"/>
+        <path class="green" d="m45 104-18-1 2 18" fill="none" stroke="#1f6848" stroke-width="10"/>
+        <path d="M67 67h27v7H67Zm0 16h27v7H67Zm0 16h19v7H67Z" fill="#18201d"/>
+      </symbol>
+
+      <symbol id="mark-6" viewBox="0 0 160 160">
+        <path class="blue" d="M56 23c-17 0-26 9-26 26v17c0 10-5 15-15 15 10 0 15 5 15 15v17c0 17 9 26 26 26v-14c-8 0-12-4-12-12V95c0-9-4-14-12-14 8 0 12-5 12-14V49c0-8 4-12 12-12Z" fill="#2e4f9b"/>
+        <path d="M104 23c17 0 26 9 26 26v17c0 10 5 15 15 15-10 0-15 5-15 15v17c0 17-9 26-26 26v-14c8 0 12-4 12-12V95c0-9 4-14 12-14-8 0-12-5-12-14V49c0-8-4-12-12-12Z" fill="#18201d"/>
+        <path class="paper" d="M59 43h42v76H59Z" fill="#fbfcf8" stroke="#18201d" stroke-width="6"/>
+        <path class="green" d="M69 63h22v6H69Zm0 14h22v6H69Zm0 14h15v6H69Z" fill="#1f6848"/>
+      </symbol>
+
+      <symbol id="mark-7" viewBox="0 0 160 160">
+        <path class="blue" d="M127 43A58 58 0 1 0 127 117l-18-20a32 32 0 1 1 0-34Z" fill="#2e4f9b"/>
+        <path d="m77 55 24 25-24 25-11-11 13-14-13-14Z" fill="#18201d"/>
+        <rect class="green" x="96" y="99" width="28" height="10" fill="#1f6848"/>
+      </symbol>
+
+      <symbol id="mark-8" viewBox="0 0 160 160">
+        <rect class="paper" x="16" y="24" width="128" height="112" fill="#fbfcf8" stroke="#18201d" stroke-width="8"/>
+        <path d="M56 28v104M113 28v104" fill="none" stroke="#18201d" stroke-width="6"/>
+        <rect class="blue" x="26" y="42" width="20" height="7" fill="#2e4f9b"/>
+        <rect class="blue" x="26" y="60" width="20" height="7" fill="#2e4f9b"/>
+        <rect class="blue" x="26" y="78" width="20" height="7" fill="#2e4f9b"/>
+        <path d="M68 47h33v7H68Zm0 18h33v7H68Zm0 18h23v7H68Zm0 18h30v7H68Z" fill="#18201d"/>
+        <circle class="green" cx="128" cy="49" r="7" fill="#1f6848"/>
+        <path class="green" d="M122 70h12v7h-12Zm0 18h12v7h-12Zm0 18h12v7h-12Z" fill="#1f6848"/>
+      </symbol>
+
+      <symbol id="mark-9" viewBox="0 0 160 160">
+        <path class="paper" d="M52 32h56v96H52Z" fill="#fbfcf8" stroke="#18201d" stroke-width="8"/>
+        <path class="blue" d="M43 52 17 80l26 28" fill="none" stroke="#2e4f9b" stroke-width="11" stroke-linejoin="miter"/>
+        <path class="green" d="m117 52 26 28-26 28" fill="none" stroke="#1f6848" stroke-width="11" stroke-linejoin="miter"/>
+        <path d="M65 57h30v7H65Zm0 18h30v7H65Zm0 18h21v7H65Z" fill="#18201d"/>
+      </symbol>
+
+      <symbol id="mark-10" viewBox="0 0 160 160">
+        <path class="soft" d="M50 20h77v94H50Z" fill="#dce5fa" stroke="#18201d" stroke-width="7"/>
+        <path class="paper" d="M34 36h83v101H34Z" fill="#fbfcf8" stroke="#18201d" stroke-width="8"/>
+        <rect class="blue" x="34" y="36" width="83" height="24" fill="#2e4f9b"/>
+        <circle class="paper" cx="47" cy="48" r="4" fill="#fbfcf8"/>
+        <circle class="paper" cx="59" cy="48" r="4" fill="#fbfcf8" opacity=".7"/>
+        <path d="m51 79 15 12-15 12" fill="none" stroke="#18201d" stroke-width="8" stroke-linejoin="miter"/>
+        <rect class="green" x="72" y="99" width="27" height="8" fill="#1f6848"/>
+      </symbol>
+    </defs>
+  </svg>
+
+  <main class="sheet">
+    <header class="masthead">
+      <span class="brand-stamp">Confluence CLI</span>
+      <span class="masthead-center">Identity proof / ten candidate marks</span>
+      <span class="folio">29·08·2026</span>
+    </header>
+
+    <section class="cover" aria-labelledby="report-title">
+      <div class="cover-copy">
+        <div class="cover-intro">
+          <h1 id="report-title">Ten logo proofs.</h1>
+          <p class="lede">A deliberately varied identity study for a product with two equal jobs: make Confluence readable for humans and scriptable for agents.</p>
+        </div>
+        <div class="cover-brief">
+          <p class="brief-line"><strong>Position</strong><span>Confluence, readable and scriptable.</span></p>
+          <p class="brief-line"><strong>Constraint</strong><span>The mark must not collapse the product into sync, verification, or generic “AI.”</span></p>
+          <p class="brief-line"><strong>Use</strong><span>README masthead, terminal-adjacent docs, package listings, favicon, and future application icon.</span></p>
+        </div>
+      </div>
+      <aside class="cover-verdict" aria-label="Recommended logo">
+        <span class="label">Recommended mark / 02</span>
+        <div class="cover-mark">
+          <svg viewBox="0 0 160 160" role="img" aria-label="Prompt Leaf logo"><use href="#mark-2"/></svg>
+        </div>
+        <div>
+          <h2>Prompt Leaf</h2>
+          <p>A readable page made directly addressable from the command line—clear to humans, agents, and developers at a glance.</p>
+        </div>
+      </aside>
+    </section>
+
+    <section class="method" aria-labelledby="method-title">
+      <div class="method-title">
+        <h2 id="method-title">The test.</h2>
+        <p>Scores are design judgments, not user research. Each criterion is weighted equally to keep the argument inspectable.</p>
+      </div>
+      <dl class="criteria">
+        <div><dt>Product breadth</dt><dd>Signals reading and scripting without reducing the CLI to one workflow.</dd></div>
+        <div><dt>Small-size clarity</dt><dd>Survives at 16–32 px without depending on tiny decorative detail.</dd></div>
+        <div><dt>Distinctiveness</dt><dd>Ownable enough to recall without borrowing Atlassian's visual language.</dd></div>
+        <div><dt>Monochrome</dt><dd>Retains its idea in one ink for terminals, stamps, and restricted contexts.</dd></div>
+        <div><dt>System potential</dt><dd>Can extend into a wordmark, motion, documentation, and product surfaces.</dd></div>
+      </dl>
+    </section>
+
+    <nav class="proof-controls" aria-label="Logo proof controls">
+      <strong>Proof controls</strong>
+      <div class="control-group" aria-label="Preview size">
+        <button class="control-button size-control" type="button" data-size="96" aria-pressed="false">96 px</button>
+        <button class="control-button size-control" type="button" data-size="160" aria-pressed="false">160 px</button>
+        <button class="control-button size-control" type="button" data-size="220" aria-pressed="true">220 px</button>
+      </div>
+      <button id="mono-toggle" class="control-button" type="button" aria-pressed="false">Monochrome off</button>
+    </nav>
+
+    <nav class="concept-index" aria-label="Logo concepts">
+      <a href="#concept-1">01</a><a href="#concept-2" aria-current="true">02</a><a href="#concept-3">03</a><a href="#concept-4">04</a><a href="#concept-5">05</a>
+      <a href="#concept-6">06</a><a href="#concept-7">07</a><a href="#concept-8">08</a><a href="#concept-9">09</a><a href="#concept-10">10</a>
+    </nav>
+
+    <section aria-label="Ten logo candidates">
+      <article class="candidate" id="concept-1">
+        <div class="specimen">
+          <div class="specimen-heading"><span>Incumbent direction</span><span class="rank">Rank 08=</span></div>
+          <div class="logo-stage"><svg class="primary-logo" viewBox="0 0 160 160" role="img" aria-label="Proof Stack logo"><use href="#mark-1"/></svg></div>
+          <div class="size-strip" aria-label="Proof Stack at small sizes">
+            <span class="size-sample"><svg width="16" height="16" viewBox="0 0 160 160"><use href="#mark-1"/></svg>16</span>
+            <span class="size-sample"><svg width="24" height="24" viewBox="0 0 160 160"><use href="#mark-1"/></svg>24</span>
+            <span class="size-sample"><svg width="32" height="32" viewBox="0 0 160 160"><use href="#mark-1"/></svg>32</span>
+          </div>
+        </div>
+        <div class="analysis">
+          <h2>Proof Stack</h2>
+          <p class="thesis">A polished translation of the current page-and-check idea: content is layered, reviewed, and approved.</p>
+          <div class="verdict-grid">
+            <div><h3>What works</h3><p>Friendly, immediately legible, and already aligned with the safe apply workflow. The check survives surprisingly well at small sizes.</p></div>
+            <div><h3>What limits it</h3><p>The check dominates the story. It reads as validation software before it reads as a tool for searching, reading, and operating Confluence.</p></div>
+          </div>
+          <div class="score-line"><span class="score">72 / 100</span><button class="download-button" type="button" data-symbol="mark-1" data-name="proof-stack" aria-label="Download Proof Stack SVG">Download SVG</button></div>
+        </div>
+      </article>
+
+      <article class="candidate winner" id="concept-2">
+        <div class="specimen">
+          <div class="specimen-heading"><span class="winner-label">Recommended</span><span class="rank">Rank 01</span></div>
+          <div class="logo-stage"><svg class="primary-logo" viewBox="0 0 160 160" role="img" aria-label="Prompt Leaf logo"><use href="#mark-2"/></svg></div>
+          <div class="size-strip" aria-label="Prompt Leaf at small sizes">
+            <span class="size-sample"><svg width="16" height="16" viewBox="0 0 160 160"><use href="#mark-2"/></svg>16</span>
+            <span class="size-sample"><svg width="24" height="24" viewBox="0 0 160 160"><use href="#mark-2"/></svg>24</span>
+            <span class="size-sample"><svg width="32" height="32" viewBox="0 0 160 160"><use href="#mark-2"/></svg>32</span>
+          </div>
+        </div>
+        <div class="analysis">
+          <h2>Prompt Leaf</h2>
+          <p class="thesis">A document becomes a command line: the most direct possible combination of Confluence content and CLI access.</p>
+          <div class="verdict-grid">
+            <div><h3>What works</h3><p>It tells the product story in one beat: a page that can be read or addressed as a command. The mark has excellent favicon clarity, simple geometry, and effortless monochrome reproduction.</p></div>
+            <div><h3>Honest risk</h3><p>Document-and-prompt marks exist elsewhere. Distinction must come from protecting this exact leaf silhouette, the unusually deep fold, and the compact prompt rhythm.</p></div>
+          </div>
+          <div class="score-line"><span class="score">96 / 100</span><button class="download-button" type="button" data-symbol="mark-2" data-name="prompt-leaf" aria-label="Download Prompt Leaf SVG">Download SVG</button></div>
+        </div>
+      </article>
+
+      <article class="candidate" id="concept-3">
+        <div class="specimen">
+          <div class="specimen-heading"><span>Human + agent access</span><span class="rank">Rank 02</span></div>
+          <div class="logo-stage"><svg class="primary-logo" viewBox="0 0 160 160" role="img" aria-label="Open Channel logo"><use href="#mark-3"/></svg></div>
+          <div class="size-strip" aria-label="Open Channel at small sizes">
+            <span class="size-sample"><svg width="16" height="16" viewBox="0 0 160 160"><use href="#mark-3"/></svg>16</span>
+            <span class="size-sample"><svg width="24" height="24" viewBox="0 0 160 160"><use href="#mark-3"/></svg>24</span>
+            <span class="size-sample"><svg width="32" height="32" viewBox="0 0 160 160"><use href="#mark-3"/></svg>32</span>
+          </div>
+        </div>
+        <div class="analysis">
+          <h2>Open Channel</h2>
+          <p class="thesis">Two leaves form one open surface: prose on the left, a command prompt on the right, and a narrow green spine joining human and machine use.</p>
+          <div class="verdict-grid">
+            <div><h3>What works</h3><p>The silhouette reads first as open content, then rewards a closer look with the scripting cue. It is broad, compact, ownable, and not dependent on a safety metaphor.</p></div>
+            <div><h3>Honest risk</h3><p>Without the wordmark it can suggest technical publishing or developer documentation. Its custom proportions and split-color spine need consistent protection.</p></div>
+          </div>
+          <div class="score-line"><span class="score">92 / 100</span><button class="download-button" type="button" data-symbol="mark-3" data-name="open-channel" aria-label="Download Open Channel SVG">Download SVG</button></div>
+        </div>
+      </article>
+
+      <article class="candidate" id="concept-4">
+        <div class="specimen">
+          <div class="specimen-heading"><span>Information architecture</span><span class="rank">Rank 03=</span></div>
+          <div class="logo-stage"><svg class="primary-logo" viewBox="0 0 160 160" role="img" aria-label="Folio Tree logo"><use href="#mark-4"/></svg></div>
+          <div class="size-strip" aria-label="Folio Tree at small sizes">
+            <span class="size-sample"><svg width="16" height="16" viewBox="0 0 160 160"><use href="#mark-4"/></svg>16</span>
+            <span class="size-sample"><svg width="24" height="24" viewBox="0 0 160 160"><use href="#mark-4"/></svg>24</span>
+            <span class="size-sample"><svg width="32" height="32" viewBox="0 0 160 160"><use href="#mark-4"/></svg>32</span>
+          </div>
+        </div>
+        <div class="analysis">
+          <h2>Folio Tree</h2>
+          <p class="thesis">A page hierarchy rendered as an editorial tree, tying Confluence's spatial structure directly to the CLI's browsing strength.</p>
+          <div class="verdict-grid">
+            <div><h3>What works</h3><p>Specific to this product rather than the CLI category. It communicates spaces, parent-child pages, and navigation with unusual precision.</p></div>
+            <div><h3>What limits it</h3><p>The structure becomes busy below 24 px, and scripting is implied rather than visible. Better as a feature symbol than the primary identity.</p></div>
+          </div>
+          <div class="score-line"><span class="score">88 / 100</span><button class="download-button" type="button" data-symbol="mark-4" data-name="folio-tree" aria-label="Download Folio Tree SVG">Download SVG</button></div>
+        </div>
+      </article>
+
+      <article class="candidate" id="concept-5">
+        <div class="specimen">
+          <div class="specimen-heading"><span>Round trip</span><span class="rank">Rank 10</span></div>
+          <div class="logo-stage"><svg class="primary-logo" viewBox="0 0 160 160" role="img" aria-label="Read Loop logo"><use href="#mark-5"/></svg></div>
+          <div class="size-strip" aria-label="Read Loop at small sizes">
+            <span class="size-sample"><svg width="16" height="16" viewBox="0 0 160 160"><use href="#mark-5"/></svg>16</span>
+            <span class="size-sample"><svg width="24" height="24" viewBox="0 0 160 160"><use href="#mark-5"/></svg>24</span>
+            <span class="size-sample"><svg width="32" height="32" viewBox="0 0 160 160"><use href="#mark-5"/></svg>32</span>
+          </div>
+        </div>
+        <div class="analysis">
+          <h2>Read Loop</h2>
+          <p class="thesis">A document sits inside a bidirectional loop, emphasizing pull, apply, and faithful round trips.</p>
+          <div class="verdict-grid">
+            <div><h3>What works</h3><p>Explains synchronization instantly and carries useful motion potential for loading or transfer states.</p></div>
+            <div><h3>What limits it</h3><p>It repeats the original positioning problem: the product becomes “sync software.” Circular arrows are also crowded visual territory.</p></div>
+          </div>
+          <div class="score-line"><span class="score">68 / 100</span><button class="download-button" type="button" data-symbol="mark-5" data-name="read-loop" aria-label="Download Read Loop SVG">Download SVG</button></div>
+        </div>
+      </article>
+
+      <article class="candidate" id="concept-6">
+        <div class="specimen">
+          <div class="specimen-heading"><span>Structured content</span><span class="rank">Rank 03=</span></div>
+          <div class="logo-stage"><svg class="primary-logo" viewBox="0 0 160 160" role="img" aria-label="Braced Page logo"><use href="#mark-6"/></svg></div>
+          <div class="size-strip" aria-label="Braced Page at small sizes">
+            <span class="size-sample"><svg width="16" height="16" viewBox="0 0 160 160"><use href="#mark-6"/></svg>16</span>
+            <span class="size-sample"><svg width="24" height="24" viewBox="0 0 160 160"><use href="#mark-6"/></svg>24</span>
+            <span class="size-sample"><svg width="32" height="32" viewBox="0 0 160 160"><use href="#mark-6"/></svg>32</span>
+          </div>
+        </div>
+        <div class="analysis">
+          <h2>Braced Page</h2>
+          <p class="thesis">A readable document held inside JSON braces: Confluence content transformed into an automation-ready contract.</p>
+          <div class="verdict-grid">
+            <div><h3>What works</h3><p>Nearly perfect semantic coverage for agents while preserving the document at center. It is confident in monochrome and feels technical without using an “AI” symbol.</p></div>
+            <div><h3>What limits it</h3><p>Curly braces can imply developer-only tooling, and their fine shape softens at favicon size. Human browsing feels secondary to structured data.</p></div>
+          </div>
+          <div class="score-line"><span class="score">88 / 100</span><button class="download-button" type="button" data-symbol="mark-6" data-name="braced-page" aria-label="Download Braced Page SVG">Download SVG</button></div>
+        </div>
+      </article>
+
+      <article class="candidate" id="concept-7">
+        <div class="specimen">
+          <div class="specimen-heading"><span>Monogram</span><span class="rank">Rank 05</span></div>
+          <div class="logo-stage"><svg class="primary-logo" viewBox="0 0 160 160" role="img" aria-label="Command C logo"><use href="#mark-7"/></svg></div>
+          <div class="size-strip" aria-label="Command C at small sizes">
+            <span class="size-sample"><svg width="16" height="16" viewBox="0 0 160 160"><use href="#mark-7"/></svg>16</span>
+            <span class="size-sample"><svg width="24" height="24" viewBox="0 0 160 160"><use href="#mark-7"/></svg>24</span>
+            <span class="size-sample"><svg width="32" height="32" viewBox="0 0 160 160"><use href="#mark-7"/></svg>32</span>
+          </div>
+        </div>
+        <div class="analysis">
+          <h2>Command C</h2>
+          <p class="thesis">A compact “C” monogram interrupted by a command chevron and cursor—the product name compressed into terminal grammar.</p>
+          <div class="verdict-grid">
+            <div><h3>What works</h3><p>The strongest pure app icon in the set. It is bold, recognizable at 16 px, and easy to reproduce on terminals, badges, or package pages.</p></div>
+            <div><h3>What limits it</h3><p>It says confluence-cli only after explanation. Reading, pages, search, and structured content are absent from the first impression.</p></div>
+          </div>
+          <div class="score-line"><span class="score">84 / 100</span><button class="download-button" type="button" data-symbol="mark-7" data-name="command-c" aria-label="Download Command C SVG">Download SVG</button></div>
+        </div>
+      </article>
+
+      <article class="candidate" id="concept-8">
+        <div class="specimen">
+          <div class="specimen-heading"><span>Product-native</span><span class="rank">Rank 06</span></div>
+          <div class="logo-stage"><svg class="primary-logo" viewBox="0 0 160 160" role="img" aria-label="Proof Desk logo"><use href="#mark-8"/></svg></div>
+          <div class="size-strip" aria-label="Proof Desk at small sizes">
+            <span class="size-sample"><svg width="16" height="16" viewBox="0 0 160 160"><use href="#mark-8"/></svg>16</span>
+            <span class="size-sample"><svg width="24" height="24" viewBox="0 0 160 160"><use href="#mark-8"/></svg>24</span>
+            <span class="size-sample"><svg width="32" height="32" viewBox="0 0 160 160"><use href="#mark-8"/></svg>32</span>
+          </div>
+        </div>
+        <div class="analysis">
+          <h2>Proof Desk</h2>
+          <p class="thesis">The TUI itself becomes the mark: contents folio, reading galley, and evidence margin in one precise frame.</p>
+          <div class="verdict-grid">
+            <div><h3>What works</h3><p>No competitor can claim this exact structure. It connects the identity to a real product surface and can become a rich motion system.</p></div>
+            <div><h3>What limits it</h3><p>At small sizes the three panes become generic interface chrome. It promotes the TUI above the broader CLI rather than representing both equally.</p></div>
+          </div>
+          <div class="score-line"><span class="score">80 / 100</span><button class="download-button" type="button" data-symbol="mark-8" data-name="proof-desk" aria-label="Download Proof Desk SVG">Download SVG</button></div>
+        </div>
+      </article>
+
+      <article class="candidate" id="concept-9">
+        <div class="specimen">
+          <div class="specimen-heading"><span>Bidirectional access</span><span class="rank">Rank 08=</span></div>
+          <div class="logo-stage"><svg class="primary-logo" viewBox="0 0 160 160" role="img" aria-label="Content Gateway logo"><use href="#mark-9"/></svg></div>
+          <div class="size-strip" aria-label="Content Gateway at small sizes">
+            <span class="size-sample"><svg width="16" height="16" viewBox="0 0 160 160"><use href="#mark-9"/></svg>16</span>
+            <span class="size-sample"><svg width="24" height="24" viewBox="0 0 160 160"><use href="#mark-9"/></svg>24</span>
+            <span class="size-sample"><svg width="32" height="32" viewBox="0 0 160 160"><use href="#mark-9"/></svg>32</span>
+          </div>
+        </div>
+        <div class="analysis">
+          <h2>Content Gateway</h2>
+          <p class="thesis">A page between inbound and outbound chevrons: read from Confluence, write back when needed.</p>
+          <div class="verdict-grid">
+            <div><h3>What works</h3><p>Broadens the sync loop into explicit read and write paths. The silhouette stays clear and its two colors can encode direction.</p></div>
+            <div><h3>What limits it</h3><p>Arrows imply transfer more than comprehension. It could belong to any import/export utility and has limited emotional character.</p></div>
+          </div>
+          <div class="score-line"><span class="score">72 / 100</span><button class="download-button" type="button" data-symbol="mark-9" data-name="content-gateway" aria-label="Download Content Gateway SVG">Download SVG</button></div>
+        </div>
+      </article>
+
+      <article class="candidate" id="concept-10">
+        <div class="specimen">
+          <div class="specimen-heading"><span>Terminal window</span><span class="rank">Rank 07</span></div>
+          <div class="logo-stage"><svg class="primary-logo" viewBox="0 0 160 160" role="img" aria-label="Terminal Folio logo"><use href="#mark-10"/></svg></div>
+          <div class="size-strip" aria-label="Terminal Folio at small sizes">
+            <span class="size-sample"><svg width="16" height="16" viewBox="0 0 160 160"><use href="#mark-10"/></svg>16</span>
+            <span class="size-sample"><svg width="24" height="24" viewBox="0 0 160 160"><use href="#mark-10"/></svg>24</span>
+            <span class="size-sample"><svg width="32" height="32" viewBox="0 0 160 160"><use href="#mark-10"/></svg>32</span>
+          </div>
+        </div>
+        <div class="analysis">
+          <h2>Terminal Folio</h2>
+          <p class="thesis">A terminal window laid over stacked pages, connecting command-line access to a deeper body of content.</p>
+          <div class="verdict-grid">
+            <div><h3>What works</h3><p>Balanced and familiar, with enough document depth to feel more content-focused than a generic terminal icon.</p></div>
+            <div><h3>What limits it</h3><p>Window controls and stacked sheets are conventional software-logo ingredients. It is competent but difficult to own.</p></div>
+          </div>
+          <div class="score-line"><span class="score">76 / 100</span><button class="download-button" type="button" data-symbol="mark-10" data-name="terminal-folio" aria-label="Download Terminal Folio SVG">Download SVG</button></div>
+        </div>
+      </article>
+    </section>
+
+    <section class="comparison" aria-labelledby="comparison-title">
+      <h2 id="comparison-title">The field, scored.</h2>
+      <p>Five points per criterion, converted to a 100-point total. Prompt Leaf wins because immediate product recognition matters most here: it makes a Confluence page and command-line access inseparable, while remaining exceptionally clear at package-icon and terminal sizes.</p>
+      <div class="table-wrap" tabindex="0" aria-label="Scrollable logo score table">
+        <table>
+          <thead><tr><th>Rank</th><th>Concept</th><th>Breadth</th><th>Small size</th><th>Distinct</th><th>Mono</th><th>System</th><th>Total</th></tr></thead>
+          <tbody>
+            <tr class="best"><td>1</td><td>Prompt Leaf</td><td>5</td><td>5</td><td>4</td><td>5</td><td>5</td><td>96</td></tr>
+            <tr><td>2</td><td>Open Channel</td><td>5</td><td>5</td><td>4</td><td>5</td><td>4</td><td>92</td></tr>
+            <tr><td>3=</td><td>Braced Page</td><td>5</td><td>4</td><td>4</td><td>5</td><td>4</td><td>88</td></tr>
+            <tr><td>3=</td><td>Folio Tree</td><td>4</td><td>4</td><td>5</td><td>5</td><td>4</td><td>88</td></tr>
+            <tr><td>5</td><td>Command C</td><td>4</td><td>5</td><td>3</td><td>5</td><td>4</td><td>84</td></tr>
+            <tr><td>6</td><td>Proof Desk</td><td>4</td><td>3</td><td>5</td><td>4</td><td>4</td><td>80</td></tr>
+            <tr><td>7</td><td>Terminal Folio</td><td>4</td><td>4</td><td>3</td><td>4</td><td>4</td><td>76</td></tr>
+            <tr><td>8=</td><td>Content Gateway</td><td>3</td><td>4</td><td>3</td><td>4</td><td>4</td><td>72</td></tr>
+            <tr><td>8=</td><td>Proof Stack</td><td>3</td><td>4</td><td>3</td><td>4</td><td>4</td><td>72</td></tr>
+            <tr><td>10</td><td>Read Loop</td><td>3</td><td>4</td><td>3</td><td>4</td><td>3</td><td>68</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="recommendation" aria-labelledby="recommendation-title">
+      <div class="recommendation-mark">
+        <svg viewBox="0 0 160 160" role="img" aria-label="Prompt Leaf recommended logo"><use href="#mark-2"/></svg>
+      </div>
+      <div class="recommendation-copy">
+        <h2 id="recommendation-title">Choose Prompt Leaf.</h2>
+        <p>It compresses the complete product proposition into the fastest-reading mark in the set: Confluence content, made directly available at the command line. That clarity serves first-time users without sacrificing the compactness developers expect.</p>
+        <ol class="winner-reasons">
+          <li><span><strong>It explains the product immediately.</strong> The page says human-readable knowledge; the prompt says scriptable access for people and agents.</span></li>
+          <li><span><strong>It avoids the verification trap.</strong> There is no checkmark, shield, or sync loop. The emphasis is access to content—not policing it.</span></li>
+          <li><span><strong>It survives reality.</strong> The strong outer silhouette and short prompt remain coherent at 16 px, in one color, and without the wordmark.</span></li>
+          <li><span><strong>It fits the voice.</strong> “Confluence, readable and scriptable.” maps cleanly onto the two ingredients inside the mark.</span></li>
+        </ol>
+        <p class="risk"><strong>Watch-out:</strong> resist making the page generic. Preserve the deep folded corner, the slightly compressed proportions, and the exact prompt placement; those details turn a familiar vocabulary into a recognizable signature.</p>
+        <button class="download-button" type="button" data-symbol="mark-2" data-name="prompt-leaf" aria-label="Download recommended Prompt Leaf SVG">Download recommended SVG</button>
+      </div>
+    </section>
+
+    <footer>
+      <span>Prepared as a visual identity exploration for confluence-cli.</span>
+      <span>All marks are original inline SVG studies.</span>
+    </footer>
+  </main>
+
+  <script>
+    const root = document.documentElement;
+    const monoToggle = document.querySelector('#mono-toggle');
+    const sizeControls = [...document.querySelectorAll('.size-control')];
+
+    sizeControls.forEach((button) => {
+      button.addEventListener('click', () => {
+        root.style.setProperty('--proof-size', `${button.dataset.size}px`);
+        sizeControls.forEach((control) => control.setAttribute('aria-pressed', String(control === button)));
+      });
+    });
+
+    monoToggle.addEventListener('click', () => {
+      const active = document.body.classList.toggle('mono');
+      monoToggle.setAttribute('aria-pressed', String(active));
+      monoToggle.textContent = active ? 'Monochrome on' : 'Monochrome off';
+    });
+
+    document.querySelectorAll('.download-button').forEach((button) => {
+      button.addEventListener('click', () => {
+        const symbol = document.querySelector(`#${button.dataset.symbol}`);
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160">${symbol.innerHTML}</svg>`;
+        const blob = new Blob([svg], { type: 'image/svg+xml' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `confluence-cli-${button.dataset.name}.svg`;
+        link.click();
+        URL.revokeObjectURL(link.href);
+      });
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" role="img" aria-labelledby="title description">
+  <title id="title">confluence-cli Prompt Leaf logo</title>
+  <desc id="description">A folded document containing a command prompt, representing readable Confluence pages and scriptable command-line access.</desc>
+
+  <path d="M34 18h63l29 29v95H34Z" fill="#FBFCF8" stroke="#18201D" stroke-width="8" stroke-linejoin="round"/>
+  <path d="M97 18v29h29" fill="#DCE5FA" stroke="#18201D" stroke-width="8" stroke-linejoin="round"/>
+  <path d="m54 72 18 14-18 14" fill="none" stroke="#2E4F9B" stroke-width="10" stroke-linecap="square" stroke-linejoin="miter"/>
+  <rect x="80" y="96" width="28" height="9" fill="#18201D"/>
+</svg>
