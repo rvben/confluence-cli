@@ -26,7 +26,7 @@ use crate::sync;
 #[command(
     name = "confluence",
     version,
-    about = "Fast, safe Confluence workflows for humans and agents",
+    about = "Read, search, sync, and safely change Confluence",
     after_help = "Get started:\n  confluence init                 Configure an account\n  confluence doctor               Check configuration and access\n  confluence search 'release'     Find content\n  confluence schema --command 'page get'\n                                  Inspect one command for automation",
     arg_required_else_help = true
 )]

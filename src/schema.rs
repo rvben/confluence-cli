@@ -403,7 +403,7 @@ pub fn generate(cmd: &clap::Command) -> Value {
         "response_contract": "1",
         "name": "confluence",
         "version": env!("CARGO_PKG_VERSION"),
-        "description": "Markdown-sync-first Confluence CLI in Rust",
+        "description": "A CLI for reading, searching, syncing, and automating Confluence",
         "output": {"tty": "text", "piped": "json"},
         "global_args": [
             {
