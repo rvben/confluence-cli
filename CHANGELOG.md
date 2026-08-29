@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.25](https://github.com/rvben/confluence-cli/compare/v0.1.24...v0.1.25) - 2026-08-29
+
+### Fixed
+
+- **ci**: make Cloud E2E environment-driven ([3c61f71](https://github.com/rvben/confluence-cli/commit/3c61f71e6b64a622568edb27526a5dbbe28da90f))
+- **http**: bound stalled Confluence requests ([59d2e3e](https://github.com/rvben/confluence-cli/commit/59d2e3e62f4c27c862e055d266a452b55e17b86b))
+
 ## [0.1.24](https://github.com/rvben/confluence-cli/compare/v0.1.23...v0.1.24) - 2026-08-28
 
 ### Fixed
