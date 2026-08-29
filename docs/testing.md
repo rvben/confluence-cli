@@ -36,6 +36,45 @@ make test-e2e
 
 The cleanup guard deletes created content after success and performs best-effort cleanup during failures. Cloud page deletion can still leave items in the space trash, so use a dedicated automation space.
 
+## Local Data Center
+
+The repository includes a local Confluence Data Center stack for integration
+testing:
+
+```bash
+make confluence-start
+make confluence-wait
+make test-e2e
+```
+
+The default end-to-end path targets the local `local-dc` profile and the `TEST`
+space. Use `make confluence-logs` to inspect the service. Backup, restore, and
+reset helpers are also available:
+
+```bash
+make confluence-backup
+make confluence-restore
+make confluence-reset
+```
+
+Backups are written to `docker/backup/confluence-data.tar.gz` and
+`docker/backup/postgres-data.tar.gz`. The first boot after a restore can take
+several minutes before HTTP responds; run `make confluence-wait` before testing.
+
+To use another profile and space:
+
+```bash
+CONFLUENCE_E2E_PROFILE=other-profile \
+CONFLUENCE_E2E_SPACE=SPACE \
+make test-e2e
+```
+
+To run fully from environment variables, set `CONFLUENCE_E2E_PROFILE=` and
+provide `CONFLUENCE_E2E_BASE_URL`, `CONFLUENCE_E2E_TOKEN`,
+`CONFLUENCE_E2E_PROVIDER`, and `CONFLUENCE_E2E_SPACE`. Cloud tests also accept
+`CONFLUENCE_E2E_TOKEN_KIND` and, for scoped tokens,
+`CONFLUENCE_E2E_CLOUD_ID`.
+
 ## Protected Cloud automation
 
 Create a GitHub Environment named `confluence-cloud-e2e`. Give it only a dedicated automation identity and a disposable space; do not reuse a personal token or production space.

@@ -1,397 +1,284 @@
-# confluence-cli
+<div align="center">
+  <a href="https://github.com/rvben/confluence-cli">
+    <img src="https://raw.githubusercontent.com/rvben/confluence-cli/main/assets/logo.svg" width="128" alt="Prompt Leaf: a document containing a command prompt, the confluence-cli logo">
+  </a>
+  <h1>confluence-cli</h1>
+  <p><strong>Confluence, readable and scriptable.</strong></p>
+  <p>Read, search, browse, automate, and edit Confluence Cloud or Data Center—without leaving the terminal.</p>
+  <p>
+    <a href="https://github.com/rvben/confluence-cli/actions/workflows/ci.yml"><img src="https://github.com/rvben/confluence-cli/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+    <a href="https://codecov.io/gh/rvben/confluence-cli"><img src="https://codecov.io/gh/rvben/confluence-cli/graph/badge.svg" alt="Code coverage"></a>
+    <a href="https://crates.io/crates/confluence-cli"><img src="https://img.shields.io/crates/v/confluence-cli.svg" alt="crates.io version"></a>
+    <a href="https://pypi.org/project/confluence-cli-rs/"><img src="https://img.shields.io/pypi/v/confluence-cli-rs.svg" alt="PyPI version"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2e4f9b.svg" alt="MIT license"></a>
+  </p>
+  <p>
+    <a href="#install">Install</a> ·
+    <a href="#quick-start">Quick start</a> ·
+    <a href="#read-and-explore">Read and explore</a> ·
+    <a href="#proof-desk-tui">Proof Desk</a> ·
+    <a href="#command-surface">Commands</a>
+  </p>
+</div>
 
-[![codecov](https://codecov.io/gh/rvben/confluence-cli/graph/badge.svg)](https://codecov.io/gh/rvben/confluence-cli)
+`confluence-cli` makes Confluence directly useful from the shell. Read and browse without creating a local sync directory. Pipe stable JSON into scripts and agents. When content needs to change, work in Markdown and publish through an explicit plan-and-apply boundary.
 
-Markdown-sync-first Confluence CLI in Rust.
+| Job | Workflow | Result |
+| --- | --- | --- |
+| Read and browse | `space`, `search`, `page`, `blog`, `tui` | Scannable terminal output and a keyboard-first reader |
+| Query and automate | JSON output, `--fields`, `schema` | Stable, token-efficient data for scripts and agents |
+| Edit and publish | `pull → edit → plan → apply` | Reviewable Markdown changes with remote-drift protection |
 
-`confluence-cli` is built around a safe local workflow:
+## Install
 
-1. `pull` Confluence content into Markdown plus sidecar metadata.
-2. `plan` changes against the pulled sidecar state without contacting Confluence.
-3. `apply` only when the diff is correct; it rechecks remote versions before writing.
+Choose the package manager that fits your environment. Every distribution installs the `confluence` executable.
 
-It also exposes direct page, blog, search, attachment, label, comment, and property commands for non-sync use cases.
-
-## Status
-
-Early release, but already live-verified against both Confluence Cloud and Confluence Data Center.
-
-| Area | Cloud | Data Center | Notes |
-| --- | --- | --- | --- |
-| Auth, spaces, search, page/blog CRUD | Verified | Verified | Live e2e |
-| Attachments, labels, properties, comments | Verified | Verified | Live e2e |
-| `pull -> plan -> apply` sync flow | Verified | Verified | Includes drift refusal and noop checks |
-| Proof Desk TUI browse and sync review | Shared verified APIs | Shared verified APIs | Deterministic wide, medium, compact, and no-color render tests |
-| `doctor` environment/profile validation | Verified | Verified | Live checked |
-| Markdown round-trip for common built-in macros | Verified | Verified | Unsupported cases preserve storage safely |
-
-## Installation
-
-From PyPI with `uv`:
+With [`uv`](https://docs.astral.sh/uv/) from PyPI:
 
 ```bash
 uv tool install confluence-cli-rs
 ```
 
-The PyPI distribution is named `confluence-cli-rs`; it installs the
-`confluence` executable.
+With Homebrew:
 
-From crates.io:
+```bash
+brew install rvben/tap/confluence-cli
+```
+
+With Cargo:
 
 ```bash
 cargo install confluence-cli
 ```
 
-From Homebrew:
+The PyPI distribution is named `confluence-cli-rs`; the crate is named `confluence-cli`. Prebuilt macOS and Linux archives for Intel and ARM are available from [GitHub Releases](https://github.com/rvben/confluence-cli/releases).
+
+## Quick start
+
+Connect a profile and check access:
 
 ```bash
-brew tap rvben/tap
-brew install rvben/tap/confluence-cli
-```
-
-Prebuilt macOS and Linux archives for Intel and ARM are published on the [GitHub releases page](https://github.com/rvben/confluence-cli/releases).
-
-## Quick Start
-
-For guided setup, run `confluence auth login` (or `confluence init`) in a
-terminal. The wizard opens Atlassian's token page when useful, discovers the
-Cloud ID required by scoped tokens, hides credential entry, verifies access,
-and stores the token in your operating-system keychain. Existing profiles are
-offered as defaults. If no OS credential service is available, setup offers an
-explicit protected-file fallback rather than silently weakening storage.
-
-For Confluence Data Center, setup can create a dedicated PAT through the
-official API using a one-time password or existing PAT; the bootstrap secret is
-never saved. If automatic creation is unavailable, it opens
-`https://<your-host>/plugins/personalaccesstokens/usertokens.action` (also
-available under **Avatar → Settings → Personal access tokens**). Onboarding
-never consumes accidental piped input as answers.
-
-`init` is the short name for the guided `auth login` flow. Use
-`auth login --profile NAME ...` for explicit scripted login, and use
-`profile add --name NAME ...` as the explicit profile-management equivalent.
-
-Cloud profile:
-
-```bash
-CONFLUENCE_API_TOKEN="$CONFLUENCE_API_TOKEN" confluence auth login \
-  --profile cloud \
-  --provider cloud \
-  --domain your-site.atlassian.net \
-  --auth-type basic \
-  --username you@example.com \
-  --non-interactive
-
-confluence doctor --profile cloud --space SPACEKEY
-```
-
-Data Center profile:
-
-```bash
-printf '%s' "$CONFLUENCE_PAT" | confluence auth login \
-  --profile dc \
-  --provider data-center \
-  --domain http://localhost:8090 \
-  --auth-type bearer \
-  --token-stdin \
-  --non-interactive
-
-confluence doctor --profile dc --space TEST
-```
-
-Environment-driven mode also works without a stored profile:
-
-```bash
-export CONFLUENCE_DOMAIN=https://your-site.atlassian.net
-export CONFLUENCE_PROVIDER=cloud
-export CONFLUENCE_AUTH_TYPE=basic
-export CONFLUENCE_EMAIL=you@example.com
-export CONFLUENCE_TOKEN="$CONFLUENCE_API_TOKEN"
-
+confluence init
 confluence doctor --space SPACEKEY
 ```
 
-Non-interactive login stores credentials in the OS keychain by default. For a
-headless machine without a credential service, prefer environment-driven mode;
-if persistent storage is necessary, explicitly accept the protected config-file
-fallback with `--insecure-storage`. Existing inline-token profiles remain
-readable and can be moved transactionally with `confluence auth migrate`.
-
-## Markdown Sync Workflow
-
-Pull a page tree:
+Then read, search, or browse immediately—no pull required:
 
 ```bash
-confluence pull tree SPACE:ParentPage ./docs/parent-page
+confluence search 'release notes' --space DOCS
+confluence page tree 'DOCS:Handbook'
+confluence tui --space DOCS
 ```
 
-Pulls are staged beside the destination and installed as one snapshot. A pull
-refuses to replace local Markdown changes or unmanaged files; inspect and apply
-or preserve those files first. Use `--force` only when the remote snapshot
-should replace the entire destination. Attachment names are confined to their
-page's `attachments/` directory. Filtered `pull space --since ...` exports must
-use a new or empty destination, because partial results cannot safely replace a
-complete local snapshot.
-
-Inspect the planned changes:
+The same commands become structured input when piped:
 
 ```bash
-confluence plan ./docs/parent-page
+confluence search 'release notes' --space DOCS \
+  | jq '.items[] | {title, web_url}'
 ```
 
-`plan` validates the complete local tree and compares it with the sidecar state
-captured by `pull`; it does not contact Confluence. `apply` validates every local
-document and preflights every remote version before its first write. Versioned
-updates still reject drift that occurs during the apply unless `--force` is
-explicitly supplied. Partial remote mutations are reported in structured error
-details so automation can reconcile them safely.
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rvben/confluence-cli/main/assets/proof-desk.svg" width="1020" alt="Proof Desk showing a Confluence page tree, readable page galley, and metadata margin">
+</p>
+<p align="center"><sub>Proof Desk in Browse mode, rendered from the deterministic test fixture.</sub></p>
 
-Apply the diff:
+When you want to edit, pull a page tree to Markdown and inspect the local plan:
+
+```bash
+confluence pull tree 'SPACEKEY:Parent Page' ./docs/parent-page
+$EDITOR ./docs/parent-page/parent-page--123/index.md
+confluence plan ./docs/parent-page --diff
+```
+
+When the plan is correct, apply it:
 
 ```bash
 confluence apply ./docs/parent-page
 ```
 
-Local content is stored as:
+`plan` reads only the Markdown and sidecar state on disk. `apply` validates the complete local tree and checks every remote version before writing. If Confluence changed after the pull, the apply is refused unless you explicitly choose `--force`.
 
-- `<slug>/index.md`
-- `<slug>/.confluence.json`
-- `<slug>/attachments/*`
+## Read and explore
 
-The frontmatter carries editable metadata such as `title`, `type`, `labels`, `status`, and `properties`. `parent` is informational: move a page directory beneath its desired local parent to reparent it. The sidecar stores remote ids, versions, hashes, and attachment mappings used for safe sync and drift detection.
+The direct commands cover everyday Confluence retrieval without requiring a sync directory:
+
+```bash
+confluence space list
+confluence search 'on-call rotation' --space OPS
+confluence page get 'OPS:Incident handbook' --show-body
+confluence page tree 'OPS:Runbooks'
+confluence blog list ENG
+```
+
+References accept a numeric content ID, a Confluence URL, or `SPACE:Title`. Search accepts plain text by default and full Confluence Query Language with `--cql`.
+
+On a terminal, search results, lists, and page metadata are formatted for scanning. `page get --show-body` includes the canonical storage-format body for agents and transformations; Proof Desk turns that content into a readable page for humans.
+
+When stdout is piped, data commands emit one JSON document:
+
+```bash
+confluence search 'release notes' --space DOCS \
+  | jq '.items[] | {title, web_url}'
+```
+
+For an interactive reading experience, `confluence tui` opens Proof Desk on the first visible space. The `--space` option starts in a specific space, and `o` opens the selected page in Confluence.
 
 ## Proof Desk TUI
 
-Open the read-only interactive navigator on the first visible space, or choose a
-space explicitly:
+Proof Desk is a keyboard-first, read-only workspace for reading and browsing Confluence. Add a local path when you also want to review a sync plan:
 
 ```bash
 confluence tui
 confluence tui --space DOCS
+confluence tui --space DOCS --path ./docs/handbook
 ```
 
-Add an existing pulled Markdown directory to start in the sync-review workspace:
+Browse mode combines the page hierarchy, a readable Markdown proof, and an outer margin for metadata, labels, attachments, comments, and content properties. Review mode presents the local plan and unified body diffs in the same layout.
+
+The TUI never applies changes and does not contact Confluence to detect drift. `confluence apply` remains the separate, remote-aware write boundary. Passing `--delete-remote` only includes attachment deletions in the local review plan.
+
+| Key | Action |
+| --- | --- |
+| Arrow keys or `j` / `k` | Move through content |
+| `Enter` | Unfold the selected proof |
+| `Tab` | Switch between Browse and Review |
+| `1`–`4` | Change the margin evidence |
+| `s` | Choose a space |
+| `p` | Choose a local sync directory |
+| `o` | Open the selected page in Confluence |
+| `?` | Show the complete keyboard map |
+
+Wide terminals show all three regions. Compact terminals reveal complete proofs and margins on demand. Proof Desk requires interactive stdin and stdout and honors `--no-color`.
+
+## Edit and publish with Markdown
+
+### Pull
+
+Export one page, a page tree, or an entire space:
 
 ```bash
-confluence tui --space DOCS --path ./docs/parent-page
-confluence tui --path ./docs/parent-page --delete-remote
+confluence pull page 'DOCS:Getting Started' ./docs/getting-started
+confluence pull tree 'DOCS:Handbook' ./docs/handbook
+confluence pull space DOCS ./docs
 ```
 
-Browse mode presents the page hierarchy, a readable Markdown proof, and an
-outer margin for metadata, labels, attachments, comments, and content
-properties. Review mode uses the same layout for the local sync plan and real
-unified body diffs. It is intentionally local-only: it does not contact
-Confluence to detect drift and never applies changes. `confluence apply` remains
-the separate command that preflights remote versions before writing.
-Remote attachment deletions are omitted by default; `--delete-remote` includes
-them in the local Review plan without deleting anything.
+Pulls are staged beside the destination and installed as one snapshot. A pull refuses to replace local Markdown changes or unmanaged files. Use `--force` only when the remote snapshot should replace the entire destination.
 
-Use arrow keys or `j`/`k` to move, `Enter` to unfold a proof, `Tab` to switch
-between Browse and Review, `1` through `4` to change margin evidence, `s` to
-choose a space, `p` to choose a local sync directory, `o` to open the selected
-page in Confluence, and `?` for the complete keyboard map. Wide terminals show
-all three regions; compact terminals reveal complete proofs and margins on
-demand. The TUI requires interactive stdin and stdout and honors `--no-color`.
+Filtered `pull space --since ...` exports require a new or empty destination because a partial result cannot safely replace a complete snapshot. Attachment names are confined to their page's `attachments/` directory.
 
-## `doctor`
+### Edit
 
-Use `doctor` before a first sync, in CI, or when a profile behaves unexpectedly.
+Each page has a predictable local layout:
+
+```text
+<slug>--<content-id>/
+├── index.md
+├── .confluence.json
+└── attachments/
+```
+
+The Markdown frontmatter contains editable metadata such as `title`, `type`, `labels`, `status`, and `properties`. Move a page directory beneath its desired local parent to reparent it; the `parent` frontmatter field is informational.
+
+The sidecar records remote IDs, versions, hashes, and attachment mappings. It is the baseline that makes offline planning and drift detection possible.
+
+### Plan
 
 ```bash
-confluence doctor --profile cloud --space SPACEKEY --path ./docs/parent-page
+confluence plan ./docs/handbook --diff
 ```
 
-It checks:
+`plan` validates the complete tree and compares it with the state captured by `pull`. It never contacts Confluence and never writes remotely.
 
-- config loading and profile resolution
-- base URL and auth shape
-- provider reachability
-- optional space access
-- optional local sync path planning
-
-`doctor` exits non-zero on failures and supports `--json` for machine-readable checks.
-
-## Commands
-
-Top-level command groups:
-
-- `auth login|status|logout|migrate`
-- `profile add|list|use|remove`
-- `space list|get`
-- `search`
-- `page list|get|tree|move|create|update|delete`
-- `blog list|get|create|update|delete`
-- `pull page|tree|space`
-- `plan`
-- `tui`
-- `apply`
-- `attachment list|download|upload|delete`
-- `label list|add|remove`
-- `comment list|add|update|delete`
-- `property list|get|set|delete`
-- `doctor`
-- `completions`
-- `schema`
-
-All data commands accept the suite-wide `--output auto|text|json`, `--quiet`, and
-`--no-color` flags. Auto output is readable text on a terminal and JSON when
-piped; `--json` remains a hidden compatibility alias. Successful JSON-mode
-commands always emit one JSON document. `completions` intentionally emits an
-opaque shell script, while `schema` always emits JSON.
-
-List commands consistently support `--limit`, `--offset`, and JSON-only
-`--fields`. Search reports an exact `total` when Confluence supplies one and
-`null` otherwise. Errors use the shared exit-code contract (input 2, auth 3,
-not found 4, API/network 5, rate limit 6, conflict 7), and
-`confluence schema --command 'page get'` returns one token-efficient command
-contract. The response contract is versioned independently in the schema.
-
-Where a command accepts `REFERENCE`, use a numeric content ID, a Confluence URL,
-or `SPACE:Title`. Destructive operations require an interactive confirmation or
-`--yes`; conditional overwrites additionally require `--force` or `--replace`.
-For sensitive content, prefer `--body-file` or standard input over `--body`,
-because command-line arguments can be visible to other local processes.
-
-## Auth And Environment Overrides
-
-Stored profiles live under the local config directory used by `directories::ProjectDirs`.
-
-Supported environment overrides:
-
-- `CONFLUENCE_PROFILE`
-- `CONFLUENCE_DOMAIN`
-- `CONFLUENCE_PROVIDER`
-- `CONFLUENCE_API_PATH`
-- `CONFLUENCE_AUTH_TYPE`
-- `CONFLUENCE_EMAIL` or `CONFLUENCE_USERNAME`
-- `CONFLUENCE_API_TOKEN`, `CONFLUENCE_TOKEN`, `CONFLUENCE_PASSWORD`, or `CONFLUENCE_BEARER_TOKEN`
-- `CONFLUENCE_TOKEN_KIND` (`classic` or `scoped`)
-- `CONFLUENCE_CLOUD_ID` (required for scoped Cloud tokens)
-- `CONFLUENCE_READ_ONLY`
-
-`CONFLUENCE_PROVIDER` must be `cloud` or `data-center`. `CONFLUENCE_AUTH_TYPE` must be `basic` or `bearer`.
-
-## Shell Completions
+For an interactive review, open the same directory in the Proof Desk:
 
 ```bash
-confluence completions bash > /usr/local/etc/bash_completion.d/confluence
-confluence completions zsh > ~/.zsh/completions/_confluence
-confluence completions fish > ~/.config/fish/completions/confluence.fish
+confluence tui --space DOCS --path ./docs/handbook
 ```
 
-## Testing
-
-`make test` runs unit tests and stateful process-level simulator tests. The simulator drives the compiled CLI through the same complete lifecycle for Cloud and Data Center: pages, blogs, hierarchy, labels, properties, comments, attachments, Markdown pull/plan/apply, macros, cleanup, and authentication failures. It binds only to localhost and never needs credentials.
-
-Live provider checks remain separate:
-
-- `e2e_cli_canary` is a small create/get/pull/plan/apply/delete smoke test.
-- `e2e_cli_lifecycle` is the complete live provider suite.
-- `.github/workflows/cloud-e2e.yml` runs the canary Monday through Saturday, the complete suite on Sunday, and either suite on demand through a protected GitHub Environment.
-
-See [docs/testing.md](docs/testing.md) for the confidence model and Cloud automation setup.
-
-## Local Data Center
-
-The repo includes a local Confluence Data Center stack for integration testing.
+### Apply
 
 ```bash
-make confluence-start
-make confluence-wait
-make test-e2e
+confluence apply ./docs/handbook
 ```
 
-The default e2e path targets the local `local-dc` profile and the `TEST` space.
+Before its first mutation, `apply` validates every local document and preflights every remote version. Versioned updates continue to reject drift that occurs during the apply. If an API failure leaves a partial remote mutation, the CLI reports the completed actions in structured error details so automation can reconcile safely.
 
-Available helpers:
+Remote attachment deletions are opt-in with `--delete-remote`. Conditional overwrites require an explicit `--force` or `--replace` where supported.
 
-- `make confluence-backup`
-- `make confluence-restore`
-- `make confluence-reset`
-- `make confluence-logs`
+## Authentication
 
-Backups are written to:
+`confluence init` starts the guided login flow. It opens the appropriate token
+page, discovers scoped-token details, verifies access, and stores credentials in
+the operating-system keychain. Cloud and Data Center profiles share the same
+workflow.
 
-- `docker/backup/confluence-data.tar.gz`
-- `docker/backup/postgres-data.tar.gz`
+Scripts and headless machines can use explicit profiles or environment-only
+credentials. See the [authentication guide](docs/authentication.md) for Cloud,
+Data Center, CI, keychain, and environment examples.
 
-The first boot after `make confluence-restore` can take several minutes before HTTP responds.
+## Command surface
 
-To point the e2e suite at another instance:
+Reading, browsing, direct updates, and Markdown publishing are all first-class:
+
+| Area | Commands |
+| --- | --- |
+| Accounts | `auth login\|status\|logout\|migrate`, `profile add\|list\|use\|remove` |
+| Discovery | `space list\|get`, `search`, `page list\|get\|tree`, `blog list\|get` |
+| Content | `page move\|create\|update\|delete`, `blog create\|update\|delete` |
+| Page data | `attachment`, `label`, `comment`, and `property` command groups |
+| Markdown | `pull page\|tree\|space`, `plan`, `tui`, `apply` |
+| Tooling | `doctor`, `completions`, `schema` |
+
+On a terminal, `--output auto` produces readable text. When piped, data
+commands produce one JSON document. Agents can request one token-efficient,
+versioned command contract without loading the complete CLI surface:
 
 ```bash
-CONFLUENCE_E2E_PROFILE=other-profile CONFLUENCE_E2E_SPACE=SPACE make test-e2e
+confluence schema --command 'page get'
 ```
 
-Or run fully env-driven:
+See the [CLI reference](docs/cli-reference.md) for output modes, exit codes,
+shell completions, Markdown fidelity, and the complete command map.
+
+## Status and compatibility
+
+The project is an early release, live-verified against Confluence Cloud and Data
+Center.
+
+| Area | Cloud | Data Center | Evidence |
+| --- | --- | --- | --- |
+| Reading, search, and content CRUD | Verified | Verified | Live end-to-end lifecycle |
+| Attachments, labels, properties, comments | Verified | Verified | Live end-to-end lifecycle |
+| `pull → plan → apply` | Verified | Verified | Drift refusal and no-op checks |
+| Proof Desk | Shared APIs | Shared APIs | Deterministic responsive render tests |
+
+The deterministic simulator runs on every pull request. Protected live checks
+exercise real provider lifecycles. The [testing guide](docs/testing.md) explains
+the confidence model and automation.
+
+### Known limits
+
+- Unknown provider-specific macros can behave differently between Cloud and
+  Data Center; unsupported storage is preserved instead of silently flattened.
+- `apply` refuses remote-version drift unless `--force` is explicit.
+
+## Documentation
+
+- [Authentication and profiles](docs/authentication.md)
+- [CLI, output, schema, and Markdown reference](docs/cli-reference.md)
+- [Testing and live-provider confidence](docs/testing.md)
+- [Release and recovery runbook](docs/releases.md)
+
+## Development and releases
 
 ```bash
-CONFLUENCE_E2E_PROFILE= \
-CONFLUENCE_E2E_BASE_URL=http://localhost:8090 \
-CONFLUENCE_E2E_TOKEN="$CONFLUENCE_PAT" \
-CONFLUENCE_E2E_PROVIDER=data-center \
-CONFLUENCE_E2E_SPACE=TEST \
-make test-e2e
+make test           # deterministic unit, contract, and simulator tests
+make release-check  # formatting, clippy, tests, smoke checks, and packaging
 ```
 
-Env-driven Cloud tests also accept `CONFLUENCE_E2E_TOKEN_KIND` and, for scoped tokens, `CONFLUENCE_E2E_CLOUD_ID`.
-
-## Release And CI
-
-Local release gate:
-
-```bash
-make release-check
-```
-
-That runs formatting, clippy, tests, CLI smoke checks, and `cargo package`.
-
-Local versioned releases use `vership`, matching the other CLI projects:
-
-```bash
-make release-patch
-make release-minor
-make release-major
-```
-
-`vership` uses `vership.toml` in this repo so `vership preflight` runs the stricter `make release-check` gate rather than the default Rust-only lint/test commands.
-
-GitHub Actions is set up to:
-
-- run CI on pushes and pull requests
-- publish tagged releases to crates.io
-- publish native macOS and Linux wheels to PyPI as `confluence-cli-rs`
-- build tagged macOS and Linux release archives
-- attach release archives and checksum files to GitHub releases
-- update `rvben/tap` automatically on tagged releases when `HOMEBREW_TAP_TOKEN` is configured
-
-## Markdown Fidelity
-
-Remote canonical content stays in Confluence storage format. Markdown is the editable local representation.
-
-The converter already handles a large set of common Confluence constructs directly, including:
-
-- headings, lists, tables, code blocks, task lists, links, and attachments
-- page links and typed page/user/space resource parameters
-- layouts, panels, expand blocks, status, TOC-family macros, and search/navigation macros
-- excerpt, excerpt-include, include-page, page-tree, page-tree-search, and page-index
-- label/reporting/content-property/report-table/task-report families
-- attachment preview and other common built-in macros
-
-When a construct is unsupported or would be lossy, `confluence-cli` preserves the Confluence storage fragment instead of flattening the whole page.
-
-## Known Limits
-
-- Storage fidelity is strongest for supported built-in macros and generic resource-aware macro fallback. Unknown provider-specific macro behavior can still vary between Cloud and Data Center.
-- Pull requests use the stateful simulator; live tenant checks run on the protected schedule and can also be dispatched manually.
-- `apply` refuses remote version drift unless `--force` is used.
-- TUI sync review is deliberately local-only; remote drift remains an `apply` preflight responsibility.
+Live-provider tests and the local Data Center stack are documented in the
+[testing guide](docs/testing.md).
 
 ## License
 
-MIT
-
-## Releasing
-
-Vership owns versioning, changelog generation, release commits, and tags. See
-[the release runbook](docs/releases.md) for the verified workflow and recovery policy.
+[MIT](LICENSE)

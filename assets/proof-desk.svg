@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 420" role="img" aria-labelledby="title description">
+  <title id="title">Proof Desk browsing an Engineering handbook</title>
+  <desc id="description">A deterministic confluence-cli terminal render with a page tree, readable page galley, and metadata margin.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-20%" width="120%" height="150%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#18201D" flood-opacity="0.18"/>
+    </filter>
+    <clipPath id="screen-clip">
+      <rect x="28" y="54" width="964" height="330"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1020" height="420" fill="#FBFCF8"/>
+  <g filter="url(#shadow)">
+    <rect x="20" y="20" width="980" height="372" rx="10" fill="#18201D"/>
+    <path d="M20 54h980v328a10 10 0 0 1-10 10H30a10 10 0 0 1-10-10Z" fill="#F1F3EF"/>
+  </g>
+
+  <circle cx="42" cy="37" r="5" fill="#A92A43"/>
+  <circle cx="60" cy="37" r="5" fill="#855300"/>
+  <circle cx="78" cy="37" r="5" fill="#1F6848"/>
+  <text x="510" y="41" text-anchor="middle" fill="#D9DED9" font-family="ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace" font-size="11">confluence tui --space DOCS</text>
+
+  <g clip-path="url(#screen-clip)" font-family="ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace" font-size="10.6" fill="#18201D" xml:space="preserve">
+    <rect x="34" y="64" width="82" height="15" fill="#2E4F9B"/>
+    <text x="36" y="76" fill="#F1F3EF" font-weight="700"> CONFLUENCE </text>
+    <text x="116" y="76" font-weight="700"> PROOF DESK </text>
+    <text x="202" y="76" font-weight="700"> BROWSE</text>
+    <text x="36" y="91" fill="#505B56">work  /  example.atlassian.net/wiki  /  DOCS</text>
+    <text x="36" y="106" fill="#969E98">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</text>
+    <text x="36" y="121" fill="#505B56">┌ CONTENTS  DOCS  /  3 ────────┐┌ GALLEY  001  /  Engineering handbook ────────────────────────────────────┐┌ PROOF MARGIN  /  1-4 VIEWS ──┐</text>
+    <text x="36" y="136">│&gt; 001 Engineering handbook    ││Engineering handbook                                                      ││1 META 2 FILE 3 NOTE &gt;4 PROP  │</text>
+    <text x="36" y="151">│  002   Release checklist     ││                                                                          ││                              │</text>
+    <text x="36" y="166">│  003   Runbooks              ││Everything the team needs, in one place.                                  ││1 PROPERTIES                  │</text>
+    <text x="36" y="181">│                              ││                                                                          ││                              │</text>
+    <text x="36" y="196">│                              ││Start here                                                                ││api_token  [REDACTED]         │</text>
+    <text x="36" y="211">│                              ││                                                                          ││                              │</text>
+    <text x="36" y="226">│                              ││- Find the release owner                                                  ││                              │</text>
+    <text x="36" y="241">│                              ││- Open the deployment runbook                                             ││                              │</text>
+    <text x="36" y="256">│                              ││                                                                          ││                              │</text>
+    <text x="36" y="271">│                              ││                                                                          ││                              │</text>
+    <text x="36" y="286">│                              ││                                                                          ││                              │</text>
+    <text x="36" y="301" fill="#969E98">└──────────────────────────────┘└──────────────────────────────────────────────────────────────────────────┘└──────────────────────────────┘</text>
+    <text x="36" y="316" fill="#969E98">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</text>
+    <text x="36" y="334" fill="#1F6848" font-weight="700"> Page proof and margin evidence are ready.</text>
+    <text x="36" y="354" fill="#505B56">up/down move  <tspan fill="#2E4F9B" font-weight="700">enter</tspan> unfold  <tspan fill="#2E4F9B" font-weight="700">tab</tspan> browse/review  <tspan fill="#2E4F9B" font-weight="700">s</tspan> space  <tspan fill="#2E4F9B" font-weight="700">p</tspan> path  <tspan fill="#2E4F9B" font-weight="700">m</tspan> margin  <tspan fill="#2E4F9B" font-weight="700">?</tspan> map  <tspan fill="#2E4F9B" font-weight="700">q</tspan> quit</text>
+  </g>
+</svg>

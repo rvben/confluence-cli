@@ -2868,7 +2868,7 @@ mod tests {
         app.page_state.select(Some(0));
         let mut selected = app.pages[0].item.clone();
         selected.body_storage = Some(
-            "<h1>Engineering handbook</h1><p>Everything needed to publish safely.</p><h2>Before release</h2><ul><li>Review the plan</li><li>Verify the page</li></ul>".into(),
+            "<h1>Engineering handbook</h1><p>Everything the team needs, in one place.</p><h2>Start here</h2><ul><li>Find the release owner</li><li>Open the deployment runbook</li></ul>".into(),
         );
         app.page_proof = PageProof {
             item: Some(selected.clone()),
@@ -2998,7 +2998,7 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
         let text = rendered_text(terminal.backend().buffer());
         assert!(text.contains("GALLEY"));
-        assert!(text.contains("Everything needed to publish safely"));
+        assert!(text.contains("Everything the team needs, in one place"));
     }
 
     #[test]
