@@ -8,6 +8,16 @@ The test strategy uses three layers with different jobs:
 
 The simulator is deliberately a focused compatibility boundary, not a general Confluence clone. It implements only routes the public CLI exercises and derives responses from mutable state. Unknown routes return `501 Not Implemented` with the method and path, making missing coverage explicit.
 
+The Proof Desk TUI keeps rendering tests deterministic with Ratatui's in-memory
+terminal backend. The suite verifies the wide three-region workspace, medium
+two-region workspace, compact unfold interaction, minimum-size recovery,
+local-plan diffs, no-color output, keyboard state transitions, control-character
+sanitization, and secret-like property redaction. Process-level contract tests
+also verify TTY refusal and the explicit JSON recovery path. Provider unit tests
+verify the TUI's bounded Cloud and Data Center collection requests; the shared
+underlying APIs have broader simulator and protected-tenant coverage. Terminal
+rendering itself does not need a real tenant.
+
 ## Local commands
 
 Run the deterministic suite:

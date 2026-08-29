@@ -45,6 +45,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Add the read-only Proof Desk TUI for space/page browsing, page evidence, and local sync-plan review.
 - Complete human-readable help for every command and public argument.
 - Executable CLI contract tests for help, parser errors, sync paths, output modes, and schemas.
 - Scheduled PyPI installation smoke tests and Linux ARM release artifacts.

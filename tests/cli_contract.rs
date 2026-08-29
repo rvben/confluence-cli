@@ -29,6 +29,61 @@ fn bare_invocation_prints_full_help_and_succeeds() {
 }
 
 #[test]
+fn tui_help_describes_the_read_only_workspace() {
+    let output = confluence(&["tui", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Browse Confluence and review a local Markdown sync plan"));
+    assert!(stdout.contains("The TUI is read-only"));
+    assert!(stdout.contains("--space"));
+    assert!(stdout.contains("--path"));
+    assert!(stdout.contains("--delete-remote"));
+    assert!(stdout.contains("--page-size"));
+}
+
+#[test]
+fn piped_tui_refuses_before_resolving_a_profile() {
+    let output = confluence(&["tui"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("structured tty error");
+    assert_eq!(error["error"]["kind"], "tty_required");
+    assert!(
+        error["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("launch `confluence tui` directly")
+    );
+}
+
+#[test]
+fn tui_rejects_explicit_json_with_a_scriptable_recovery() {
+    let output = confluence(&["--output", "json", "tui"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("structured invalid-input error");
+    assert_eq!(error["error"]["kind"], "invalid_input");
+    assert!(
+        error["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("confluence plan")
+    );
+}
+
+#[test]
+fn explicit_text_output_overrides_the_legacy_json_flag_for_tui() {
+    let output = confluence(&["--json", "--output", "text", "tui"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("interactive terminal"));
+    assert!(!stderr.contains("does not support JSON output"));
+}
+
+#[test]
 fn machine_parse_errors_preserve_missing_argument_and_usage() {
     let output = confluence(&["page", "get"]);
     assert_eq!(output.status.code(), Some(2));

@@ -31,6 +31,16 @@ pub struct SearchPage {
     pub total: Option<usize>,
 }
 
+/// A bounded prefix of a Confluence collection.
+///
+/// `total` is populated only when the deployment reports an exact count.
+#[derive(Debug)]
+pub struct ListWindow<T> {
+    pub items: Vec<T>,
+    pub has_more: bool,
+    pub total: Option<usize>,
+}
+
 #[async_trait]
 pub trait ConfluenceProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
@@ -40,6 +50,7 @@ pub trait ConfluenceProvider: Send + Sync {
     async fn current_user(&self) -> Result<CurrentUser>;
     async fn resolve_page_ref(&self, reference: &str) -> Result<String>;
     async fn list_spaces(&self, limit: usize) -> Result<Vec<SpaceSummary>>;
+    async fn list_spaces_window(&self, limit: usize) -> Result<ListWindow<SpaceSummary>>;
     async fn get_space(&self, key_or_id: &str) -> Result<SpaceSummary>;
     async fn search(
         &self,
@@ -60,6 +71,12 @@ pub trait ConfluenceProvider: Send + Sync {
         kind: ContentKind,
         space_key_or_id: &str,
     ) -> Result<Vec<ContentItem>>;
+    async fn list_space_content_window(
+        &self,
+        kind: ContentKind,
+        space_key: &str,
+        limit: usize,
+    ) -> Result<ListWindow<ContentItem>>;
     async fn create_content(&self, request: &CreateContentRequest) -> Result<ContentItem>;
     async fn update_content(&self, request: &UpdateContentRequest) -> Result<ContentItem>;
     async fn delete_content(&self, kind: ContentKind, id: &str) -> Result<()>;
@@ -337,6 +354,7 @@ pub struct Results<T> {
 pub struct Links {
     pub webui: Option<String>,
     pub download: Option<String>,
+    pub next: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -632,7 +650,7 @@ pub async fn fetch_all_v1<T>(client: &HttpClient, path: &str) -> Result<Vec<T>>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let mut start = 0;
+    let mut start: usize = 0;
     let mut combined = Vec::new();
     loop {
         let url = if path.contains('?') {
@@ -650,6 +668,65 @@ where
         start += page_limit;
     }
     Ok(combined)
+}
+
+pub async fn fetch_v1_window<T>(
+    client: &HttpClient,
+    path: &str,
+    limit: usize,
+) -> Result<ListWindow<T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if limit == 0 {
+        return Ok(ListWindow {
+            items: Vec::new(),
+            has_more: false,
+            total: None,
+        });
+    }
+
+    let mut start: usize = 0;
+    let mut items = Vec::with_capacity(limit.min(200));
+    let mut total = None;
+    let has_more = loop {
+        let remaining = limit - items.len();
+        let request_limit = remaining.min(200);
+        let mut url = Url::parse(&client.v1_url(path))?;
+        let retained: Vec<_> = url
+            .query_pairs()
+            .filter(|(key, _)| key != "limit" && key != "start")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(retained)
+            .append_pair("limit", &request_limit.to_string())
+            .append_pair("start", &start.to_string());
+
+        let page: Results<T> = client.json(Method::GET, url.to_string(), None).await?;
+        let count = page.results.len();
+        let page_limit = page.limit.unwrap_or(request_limit);
+        total = page.total_size.or(total);
+        let page_has_more = page._links.next.is_some()
+            || total.is_some_and(|total| start.saturating_add(count) < total)
+            || (count > 0 && count >= page_limit);
+
+        items.extend(page.results.into_iter().take(remaining));
+        if items.len() == limit {
+            break count > remaining || page_has_more;
+        }
+        if !page_has_more || count == 0 {
+            break false;
+        }
+        start = start.saturating_add(count);
+    };
+
+    Ok(ListWindow {
+        items,
+        has_more,
+        total,
+    })
 }
 
 pub async fn resolve_reference_via_url_or_search(

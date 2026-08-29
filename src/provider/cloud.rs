@@ -16,7 +16,7 @@ use crate::model::{
 use crate::provider::{
     ConfluenceProvider, HttpClient, Results, V1Attachment, V1Comment, V1Content, V1Label,
     V1Property, V1Space, V1SpaceRef, V2Page, add_content_metadata, build_search_cql,
-    ensure_writable, fetch_all_v1, normalize_properties, parse_datetime,
+    ensure_writable, fetch_all_v1, fetch_v1_window, normalize_properties, parse_datetime,
     partial_remote_mutation_error, property_payload, resolve_reference_via_url_or_search,
     sync_content_metadata, v1_content_to_item, v1_search_result, v2_page_to_item, value_to_string,
 };
@@ -213,14 +213,24 @@ impl ConfluenceProvider for CloudProvider {
     }
 
     async fn list_spaces(&self, limit: usize) -> Result<Vec<SpaceSummary>> {
-        let mut spaces: Vec<SpaceSummary> =
-            fetch_all_v1::<V1Space>(&self.http, "/space?limit=200&expand=homepage")
-                .await?
+        Ok(self.list_spaces_window(limit).await?.items)
+    }
+
+    async fn list_spaces_window(
+        &self,
+        limit: usize,
+    ) -> Result<crate::provider::ListWindow<SpaceSummary>> {
+        let window =
+            fetch_v1_window::<V1Space>(&self.http, "/space?expand=homepage", limit).await?;
+        Ok(crate::provider::ListWindow {
+            items: window
+                .items
                 .into_iter()
                 .map(|space| self.map_space(space))
-                .collect();
-        spaces.truncate(limit);
-        Ok(spaces)
+                .collect(),
+            has_more: window.has_more,
+            total: window.total,
+        })
     }
 
     async fn get_space(&self, key_or_id: &str) -> Result<SpaceSummary> {
@@ -340,6 +350,36 @@ impl ConfluenceProvider for CloudProvider {
             items.push(self.hydrate_v1_content(item).await?);
         }
         Ok(items)
+    }
+
+    async fn list_space_content_window(
+        &self,
+        kind: ContentKind,
+        space_key: &str,
+        limit: usize,
+    ) -> Result<crate::provider::ListWindow<ContentItem>> {
+        let path = format!(
+            "/content?spaceKey={}&type={}&expand=version,space,ancestors,history",
+            urlencoding::encode(space_key),
+            kind.as_str()
+        );
+        let window = fetch_v1_window::<V1Content>(&self.http, &path, limit).await?;
+        Ok(crate::provider::ListWindow {
+            items: window
+                .items
+                .into_iter()
+                .map(|item| {
+                    v1_content_to_item(
+                        &self.http.profile.base_url,
+                        item,
+                        Vec::new(),
+                        Default::default(),
+                    )
+                })
+                .collect(),
+            has_more: window.has_more,
+            total: window.total,
+        })
     }
 
     async fn create_content(&self, request: &CreateContentRequest) -> Result<ContentItem> {
@@ -831,5 +871,94 @@ impl ConfluenceProvider for CloudProvider {
                 None,
             )
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::config::AuthConfig;
+
+    fn cloud_provider(base_url: &str) -> CloudProvider {
+        CloudProvider::new(ResolvedProfile {
+            name: "test".to_string(),
+            provider: ProviderKind::Cloud,
+            base_url: base_url.to_string(),
+            api_path: "/wiki/rest/api".to_string(),
+            auth: AuthConfig::Bearer {
+                token: "test-token".to_string(),
+            },
+            credential_store: "session".to_string(),
+            cloud_id: None,
+            token_kind: "classic".to_string(),
+            expires_at: None,
+            read_only: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn list_spaces_window_requests_only_the_requested_items() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wiki/rest/api/space"))
+            .and(query_param("limit", "2"))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "key": "A", "name": "Alpha", "id": "1", "_links": {} },
+                    { "key": "B", "name": "Beta", "id": "2", "_links": {} }
+                ],
+                "limit": 2,
+                "size": 2,
+                "start": 0,
+                "_links": { "next": "/wiki/rest/api/space?start=2" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let window = cloud_provider(&server.uri())
+            .list_spaces_window(2)
+            .await
+            .unwrap();
+
+        assert_eq!(window.items.len(), 2);
+        assert!(window.has_more);
+    }
+
+    #[tokio::test]
+    async fn list_space_content_window_honors_the_requested_limit_in_one_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wiki/rest/api/content"))
+            .and(query_param("spaceKey", "DOCS"))
+            .and(query_param("type", "page"))
+            .and(query_param("limit", "1"))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "id": "1", "type": "page", "title": "One", "status": "current", "space": { "key": "DOCS" }, "_links": {} }
+                ],
+                "limit": 1,
+                "size": 1,
+                "start": 0,
+                "_links": { "next": "/wiki/rest/api/content?start=1" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let window = cloud_provider(&server.uri())
+            .list_space_content_window(ContentKind::Page, "DOCS", 1)
+            .await
+            .unwrap();
+
+        assert_eq!(window.items.len(), 1);
+        assert_eq!(window.items[0].title, "One");
+        assert!(window.has_more);
     }
 }

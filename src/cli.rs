@@ -115,6 +115,11 @@ enum Commands {
         after_help = "`plan` reads local Markdown and sidecar state only. Remote drift is checked by `apply`.\n\nExample:\n  confluence plan ./docs --diff"
     )]
     Plan(PlanArgs),
+    /// Browse Confluence and review a local Markdown sync plan interactively
+    #[command(
+        after_help = "The TUI is read-only. It can open a selected page in your browser, but never changes Confluence.\n\nExamples:\n  confluence tui\n  confluence tui --space DOCS\n  confluence tui --space DOCS --path ./docs\n  confluence tui --path ./docs --delete-remote"
+    )]
+    Tui(TuiArgs),
     /// Apply local changes with remote-version drift protection
     #[command(
         after_help = "Run `confluence plan PATH` first. Apply refuses remote-version drift unless --force is passed."
@@ -394,6 +399,22 @@ struct PlanArgs {
     /// Include unified body diffs in text output
     #[arg(long)]
     diff: bool,
+}
+
+#[derive(Args, Debug)]
+struct TuiArgs {
+    /// Space key or ID to open instead of the first visible space
+    #[arg(long)]
+    space: Option<String>,
+    /// Local Markdown sync directory to open in the review workspace
+    #[arg(long)]
+    path: Option<PathBuf>,
+    /// Include planned remote attachment deletions in Review; never applies them
+    #[arg(long)]
+    delete_remote: bool,
+    /// Maximum number of spaces and pages loaded into the navigator
+    #[arg(long, default_value_t = 200, value_parser = validate_tui_page_size)]
+    page_size: usize,
 }
 
 #[derive(Args, Debug)]
@@ -839,6 +860,17 @@ fn validate_since(value: &str) -> std::result::Result<String, String> {
     }
 }
 
+fn validate_tui_page_size(value: &str) -> std::result::Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|_| "expected an integer from 5 through 500".to_string())?;
+    if (5..=500).contains(&value) {
+        Ok(value)
+    } else {
+        Err("expected an integer from 5 through 500".to_string())
+    }
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ProviderArg {
     Cloud,
@@ -934,6 +966,8 @@ pub async fn run() -> Result<()> {
     } else {
         OutputFormat::from_arg(cli.output)
     };
+    let explicit_json =
+        cli.output == OutputArg::Json || (cli.json && cli.output == OutputArg::Auto);
     crate::output::configure(cli.quiet, cli.no_color, output.is_json());
     let yes = cli.yes;
 
@@ -975,6 +1009,37 @@ pub async fn run() -> Result<()> {
             let plan =
                 sync::plan_path(&args.path, args.allow_lossy, args.delete_remote, show_diff)?;
             render_plan(&plan, output, show_diff)
+        }
+        Commands::Tui(args) => {
+            if explicit_json {
+                return Err(crate::output::typed_error_with_hint(
+                    crate::output::ErrorKind::InvalidInput,
+                    "the interactive TUI does not support JSON output",
+                    "omit --output json, or use `confluence page`, `confluence search`, and `confluence plan` for machine-readable output",
+                ));
+            }
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                return Err(crate::output::typed_error_with_hint(
+                    crate::output::ErrorKind::TtyRequired,
+                    "the TUI requires an interactive terminal on stdin and stdout",
+                    "run `confluence --help` for scriptable commands, or launch `confluence tui` directly from a terminal",
+                ));
+            }
+            let profile = resolved_profile(cli.profile.as_deref())?;
+            let provider = build_provider(profile.clone());
+            crate::tui::run(
+                &*provider,
+                crate::tui::TuiOptions {
+                    profile: profile.name,
+                    site: profile.base_url,
+                    initial_space: args.space,
+                    review_path: args.path,
+                    delete_remote: args.delete_remote,
+                    page_size: args.page_size,
+                    color: !cli.no_color,
+                },
+            )
+            .await
         }
         Commands::Apply(args) => {
             sync::validate_sync_path(&args.path)?;

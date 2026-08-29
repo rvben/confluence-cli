@@ -21,6 +21,7 @@ Early release, but already live-verified against both Confluence Cloud and Confl
 | Auth, spaces, search, page/blog CRUD | Verified | Verified | Live e2e |
 | Attachments, labels, properties, comments | Verified | Verified | Live e2e |
 | `pull -> plan -> apply` sync flow | Verified | Verified | Includes drift refusal and noop checks |
+| Proof Desk TUI browse and sync review | Shared verified APIs | Shared verified APIs | Deterministic wide, medium, compact, and no-color render tests |
 | `doctor` environment/profile validation | Verified | Verified | Live checked |
 | Markdown round-trip for common built-in macros | Verified | Verified | Unsupported cases preserve storage safely |
 
@@ -159,6 +160,39 @@ Local content is stored as:
 
 The frontmatter carries editable metadata such as `title`, `type`, `labels`, `status`, and `properties`. `parent` is informational: move a page directory beneath its desired local parent to reparent it. The sidecar stores remote ids, versions, hashes, and attachment mappings used for safe sync and drift detection.
 
+## Proof Desk TUI
+
+Open the read-only interactive navigator on the first visible space, or choose a
+space explicitly:
+
+```bash
+confluence tui
+confluence tui --space DOCS
+```
+
+Add an existing pulled Markdown directory to start in the sync-review workspace:
+
+```bash
+confluence tui --space DOCS --path ./docs/parent-page
+confluence tui --path ./docs/parent-page --delete-remote
+```
+
+Browse mode presents the page hierarchy, a readable Markdown proof, and an
+outer margin for metadata, labels, attachments, comments, and content
+properties. Review mode uses the same layout for the local sync plan and real
+unified body diffs. It is intentionally local-only: it does not contact
+Confluence to detect drift and never applies changes. `confluence apply` remains
+the separate command that preflights remote versions before writing.
+Remote attachment deletions are omitted by default; `--delete-remote` includes
+them in the local Review plan without deleting anything.
+
+Use arrow keys or `j`/`k` to move, `Enter` to unfold a proof, `Tab` to switch
+between Browse and Review, `1` through `4` to change margin evidence, `s` to
+choose a space, `p` to choose a local sync directory, `o` to open the selected
+page in Confluence, and `?` for the complete keyboard map. Wide terminals show
+all three regions; compact terminals reveal complete proofs and margins on
+demand. The TUI requires interactive stdin and stdout and honors `--no-color`.
+
 ## `doctor`
 
 Use `doctor` before a first sync, in CI, or when a profile behaves unexpectedly.
@@ -189,6 +223,7 @@ Top-level command groups:
 - `blog list|get|create|update|delete`
 - `pull page|tree|space`
 - `plan`
+- `tui`
 - `apply`
 - `attachment list|download|upload|delete`
 - `label list|add|remove`
@@ -350,6 +385,7 @@ When a construct is unsupported or would be lossy, `confluence-cli` preserves th
 - Storage fidelity is strongest for supported built-in macros and generic resource-aware macro fallback. Unknown provider-specific macro behavior can still vary between Cloud and Data Center.
 - Pull requests use the stateful simulator; live tenant checks run on the protected schedule and can also be dispatched manually.
 - `apply` refuses remote version drift unless `--force` is used.
+- TUI sync review is deliberately local-only; remote drift remains an `apply` preflight responsibility.
 
 ## License
 

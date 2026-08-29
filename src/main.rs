@@ -7,6 +7,7 @@ mod output;
 mod provider;
 mod schema;
 mod sync;
+mod tui;
 
 use std::io::IsTerminal;
 

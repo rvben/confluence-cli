@@ -16,9 +16,9 @@ use crate::model::{
 use crate::provider::{
     ConfluenceProvider, HttpClient, Results, V1Attachment, V1Comment, V1Content, V1Label,
     V1Property, V1Space, V1SpaceRef, add_content_metadata, build_search_cql, ensure_writable,
-    fetch_all_v1, normalize_properties, parse_datetime, partial_remote_mutation_error,
-    property_payload, resolve_reference_via_url_or_search, sync_content_metadata,
-    v1_content_to_item, v1_search_result, value_to_string,
+    fetch_all_v1, fetch_v1_window, normalize_properties, parse_datetime,
+    partial_remote_mutation_error, property_payload, resolve_reference_via_url_or_search,
+    sync_content_metadata, v1_content_to_item, v1_search_result, value_to_string,
 };
 
 pub struct DataCenterProvider {
@@ -209,14 +209,24 @@ impl ConfluenceProvider for DataCenterProvider {
     }
 
     async fn list_spaces(&self, limit: usize) -> Result<Vec<SpaceSummary>> {
-        let mut spaces: Vec<SpaceSummary> =
-            fetch_all_v1::<V1Space>(&self.http, "/space?limit=200&expand=homepage")
-                .await?
+        Ok(self.list_spaces_window(limit).await?.items)
+    }
+
+    async fn list_spaces_window(
+        &self,
+        limit: usize,
+    ) -> Result<crate::provider::ListWindow<SpaceSummary>> {
+        let window =
+            fetch_v1_window::<V1Space>(&self.http, "/space?expand=homepage", limit).await?;
+        Ok(crate::provider::ListWindow {
+            items: window
+                .items
                 .into_iter()
                 .map(|space| self.map_space(space))
-                .collect();
-        spaces.truncate(limit);
-        Ok(spaces)
+                .collect(),
+            has_more: window.has_more,
+            total: window.total,
+        })
     }
 
     async fn get_space(&self, key_or_id: &str) -> Result<SpaceSummary> {
@@ -309,6 +319,37 @@ impl ConfluenceProvider for DataCenterProvider {
             items.push(self.hydrate_v1_content(item).await?);
         }
         Ok(items)
+    }
+
+    async fn list_space_content_window(
+        &self,
+        kind: ContentKind,
+        space_key: &str,
+        limit: usize,
+    ) -> Result<crate::provider::ListWindow<ContentItem>> {
+        let path = format!(
+            "/content?spaceKey={}&type={}&expand={}",
+            urlencoding::encode(space_key),
+            kind.as_str(),
+            Self::content_expand(false)
+        );
+        let window = fetch_v1_window::<V1Content>(&self.http, &path, limit).await?;
+        Ok(crate::provider::ListWindow {
+            items: window
+                .items
+                .into_iter()
+                .map(|item| {
+                    v1_content_to_item(
+                        &self.http.profile.base_url,
+                        item,
+                        Vec::new(),
+                        Default::default(),
+                    )
+                })
+                .collect(),
+            has_more: window.has_more,
+            total: window.total,
+        })
     }
 
     async fn create_content(&self, request: &CreateContentRequest) -> Result<ContentItem> {
@@ -802,12 +843,14 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/rest/api/space"))
+            .and(query_param("limit", "3"))
             .and(query_param("start", "0"))
             .respond_with(ResponseTemplate::new(200).set_body_json(space_page(
                 &["A", "B", "C", "D", "E"],
                 200,
                 0,
             )))
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -816,6 +859,92 @@ mod tests {
         assert_eq!(spaces.len(), 3);
         assert_eq!(spaces[0].key, "A");
         assert_eq!(spaces[2].key, "C");
+    }
+
+    #[tokio::test]
+    async fn list_spaces_window_requests_only_the_requested_items() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(query_param("limit", "3"))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "key": "A", "name": "A", "id": "A", "_links": {} },
+                    { "key": "B", "name": "B", "id": "B", "_links": {} }
+                ],
+                "limit": 2,
+                "size": 2,
+                "start": 0,
+                "totalSize": 4,
+                "_links": { "next": "/rest/api/space?start=2" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(query_param("limit", "1"))
+            .and(query_param("start", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "key": "C", "name": "C", "id": "C", "_links": {} }
+                ],
+                "limit": 1,
+                "size": 1,
+                "start": 2,
+                "totalSize": 4,
+                "_links": { "next": "/rest/api/space?start=3" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = dc_provider(&server.uri());
+        let window = provider.list_spaces_window(3).await.unwrap();
+
+        assert_eq!(window.items.len(), 3);
+        assert_eq!(window.items[2].key, "C");
+        assert_eq!(window.total, Some(4));
+        assert!(window.has_more);
+    }
+
+    #[tokio::test]
+    async fn list_space_content_window_skips_space_scan_and_row_hydration() {
+        let server = MockServer::start().await;
+        let results = json!([
+            { "id": "1", "type": "page", "title": "One", "status": "current", "space": { "key": "DOCS" }, "_links": {} },
+            { "id": "2", "type": "page", "title": "Two", "status": "current", "space": { "key": "DOCS" }, "_links": {} }
+        ]);
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/content"))
+            .and(query_param("spaceKey", "DOCS"))
+            .and(query_param("type", "page"))
+            .and(query_param("limit", "2"))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": results,
+                "limit": 2,
+                "size": 2,
+                "start": 0,
+                "_links": { "next": "/rest/api/content?start=2" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = dc_provider(&server.uri());
+        let window = provider
+            .list_space_content_window(ContentKind::Page, "DOCS", 2)
+            .await
+            .unwrap();
+
+        assert_eq!(window.items.len(), 2);
+        assert_eq!(window.items[0].title, "One");
+        assert!(window.has_more);
     }
 
     #[tokio::test]
