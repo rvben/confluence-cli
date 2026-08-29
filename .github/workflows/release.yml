@@ -96,7 +96,54 @@ jobs:
 
       - name: Publish to crates.io
         if: ${{ inputs.dry_run != true && inputs.skip_crates_io != true }}
-        run: cargo publish --locked
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          version=$(grep '^version = "' Cargo.toml | head -1 | cut -d'"' -f2)
+          registry_url="https://crates.io/api/v1/crates/confluence-cli/${version}"
+
+          registry_has_version() {
+            curl --silent --fail \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --retry 3 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --user-agent 'confluence-cli-release-workflow/1.0' \
+              "$registry_url" |
+              EXPECTED_VERSION="$version" python3 -c '
+          import json
+          import os
+          import sys
+
+          published = json.load(sys.stdin)["version"]["num"]
+          sys.exit(published != os.environ["EXPECTED_VERSION"])
+          '
+          }
+
+          if registry_has_version; then
+            echo "confluence-cli ${version} is already available on crates.io"
+            exit 0
+          fi
+
+          if cargo publish --locked; then
+            exit 0
+          else
+            publish_status=$?
+          fi
+
+          echo "::warning::cargo publish exited with status ${publish_status}; checking whether crates.io accepted the upload"
+          for attempt in 1 2 3 4 5 6; do
+            if registry_has_version; then
+              echo "confluence-cli ${version} is available on crates.io"
+              exit 0
+            fi
+            echo "crates.io visibility check ${attempt}/6 has not found version ${version} yet"
+            sleep 10
+          done
+
+          exit "$publish_status"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
