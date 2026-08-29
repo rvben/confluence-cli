@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.26](https://github.com/rvben/confluence-cli/compare/v0.1.25...v0.1.26) - 2026-08-29
+
+### Fixed
+
+- **release**: tolerate crates.io visibility timeouts ([6c9f764](https://github.com/rvben/confluence-cli/commit/6c9f764c9c70e83c41086ed60ff0de9677824b81))
+
 ## [0.1.25](https://github.com/rvben/confluence-cli/compare/v0.1.24...v0.1.25) - 2026-08-29
 
 ### Fixed
