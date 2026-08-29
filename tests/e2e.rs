@@ -22,6 +22,18 @@ struct E2eConfig {
     space: String,
 }
 
+#[derive(Debug)]
+struct EnvironmentE2eSettings {
+    base_url: String,
+    token: String,
+    auth_type: String,
+    provider: String,
+    api_path: String,
+    token_kind: Option<String>,
+    cloud_id: Option<String>,
+    username: Option<String>,
+}
+
 impl E2eConfig {
     fn command(&self) -> Command {
         let mut command = Command::new(&self.bin);
@@ -151,50 +163,71 @@ fn e2e_config() -> Option<E2eConfig> {
     let token_kind = optional_e2e_env("CONFLUENCE_E2E_TOKEN_KIND");
     let cloud_id = optional_e2e_env("CONFLUENCE_E2E_CLOUD_ID");
 
-    let mut envs = vec![
-        ("CONFLUENCE_PROFILE".to_string(), "__e2e_env__".to_string()),
-        (
-            "CONFLUENCE_DOMAIN".to_string(),
-            base_url.expect("base url present"),
-        ),
-        ("CONFLUENCE_PROVIDER".to_string(), provider),
-        ("CONFLUENCE_AUTH_TYPE".to_string(), auth_type.clone()),
-        ("CONFLUENCE_API_PATH".to_string(), api_path),
-    ];
-    if let Some(token_kind) = token_kind {
-        envs.push(("CONFLUENCE_TOKEN_KIND".to_string(), token_kind));
-    }
-    if let Some(cloud_id) = cloud_id {
-        envs.push(("CONFLUENCE_CLOUD_ID".to_string(), cloud_id));
-    }
-
-    match auth_type.as_str() {
-        "basic" => {
-            let username = env::var("CONFLUENCE_E2E_USERNAME")
+    let username = match auth_type.as_str() {
+        "basic" => Some(
+            env::var("CONFLUENCE_E2E_USERNAME")
                 .or_else(|_| env::var("CONFLUENCE_E2E_EMAIL"))
                 .expect(
                     "basic auth e2e mode requires CONFLUENCE_E2E_USERNAME or CONFLUENCE_E2E_EMAIL",
-                );
-            envs.push(("CONFLUENCE_USERNAME".to_string(), username));
-            envs.push((
-                "CONFLUENCE_API_TOKEN".to_string(),
-                token.expect("token present"),
-            ));
-        }
-        _ => {
-            envs.push((
-                "CONFLUENCE_BEARER_TOKEN".to_string(),
-                token.expect("token present"),
-            ));
-        }
+                ),
+        ),
+        _ => None,
+    };
+
+    Some(environment_e2e_config(
+        bin,
+        space,
+        EnvironmentE2eSettings {
+            base_url: base_url.expect("base url present"),
+            token: token.expect("token present"),
+            auth_type,
+            provider,
+            api_path,
+            token_kind,
+            cloud_id,
+            username,
+        },
+    ))
+}
+
+fn environment_e2e_config(
+    bin: PathBuf,
+    space: String,
+    settings: EnvironmentE2eSettings,
+) -> E2eConfig {
+    let mut envs = vec![
+        ("CONFLUENCE_DOMAIN".to_string(), settings.base_url),
+        ("CONFLUENCE_PROVIDER".to_string(), settings.provider),
+        (
+            "CONFLUENCE_AUTH_TYPE".to_string(),
+            settings.auth_type.clone(),
+        ),
+        ("CONFLUENCE_API_PATH".to_string(), settings.api_path),
+    ];
+    if let Some(token_kind) = settings.token_kind {
+        envs.push(("CONFLUENCE_TOKEN_KIND".to_string(), token_kind));
+    }
+    if let Some(cloud_id) = settings.cloud_id {
+        envs.push(("CONFLUENCE_CLOUD_ID".to_string(), cloud_id));
+    }
+    if settings.auth_type == "basic" {
+        envs.push((
+            "CONFLUENCE_USERNAME".to_string(),
+            settings
+                .username
+                .expect("basic auth e2e settings require a username"),
+        ));
+        envs.push(("CONFLUENCE_API_TOKEN".to_string(), settings.token));
+    } else {
+        envs.push(("CONFLUENCE_BEARER_TOKEN".to_string(), settings.token));
     }
 
-    Some(E2eConfig {
+    E2eConfig {
         bin,
         profile: None,
         envs,
         space,
-    })
+    }
 }
 
 fn current_user_placeholder(cfg: &E2eConfig) -> String {
@@ -378,6 +411,46 @@ fn simulated_cloud_config(simulator: &ConfluenceSimulator, config_home: &TempDir
         ],
         space: "TEST".to_string(),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn environment_driven_e2e_does_not_require_a_saved_profile() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("empty e2e config home");
+    let config_home_path = config_home.path().to_string_lossy().into_owned();
+    let mut cfg = environment_e2e_config(
+        find_binary_path(),
+        "TEST".to_string(),
+        EnvironmentE2eSettings {
+            base_url: simulator.base_url(),
+            token: "simulated-token".to_string(),
+            auth_type: "basic".to_string(),
+            provider: "cloud".to_string(),
+            api_path: "/wiki/rest/api".to_string(),
+            token_kind: Some("classic".to_string()),
+            cloud_id: None,
+            username: Some("simulator@example.test".to_string()),
+        },
+    );
+    cfg.envs.extend([
+        ("HOME".to_string(), config_home_path.clone()),
+        ("XDG_CONFIG_HOME".to_string(), config_home_path),
+    ]);
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        assert!(
+            cfg.envs.iter().all(|(key, _)| key != "CONFLUENCE_PROFILE"),
+            "environment-driven E2E must not select a saved profile"
+        );
+        let status = cfg.run_json(&["auth", "status"]);
+        assert_eq!(
+            status.pointer("/current_user/account_id"),
+            Some(&Value::from("simulator-account-id"))
+        );
+    })
+    .await
+    .expect("environment-driven auth task");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
