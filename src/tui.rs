@@ -2976,6 +2976,9 @@ mod tests {
         let mut app = app();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let text = rendered_text(terminal.backend().buffer());
+        if std::env::var_os("CONFLUENCE_TUI_SNAPSHOT").is_some() {
+            eprintln!("\n{text}");
+        }
         assert!(text.contains("CONTENTS"));
         assert!(text.contains("GALLEY"));
         assert!(!text.contains("PROOF MARGIN"));

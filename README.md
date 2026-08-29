@@ -78,9 +78,11 @@ confluence search 'release notes' --space DOCS \
 ```
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/rvben/confluence-cli/main/assets/proof-desk.svg" width="1020" alt="Proof Desk showing a Confluence page tree, readable page galley, and metadata margin">
+  <a href="https://raw.githubusercontent.com/rvben/confluence-cli/main/assets/proof-desk.png">
+    <img src="https://raw.githubusercontent.com/rvben/confluence-cli/main/assets/proof-desk.png" width="1020" alt="Proof Desk showing a Confluence page tree beside a readable page galley">
+  </a>
 </p>
-<p align="center"><sub>Proof Desk in Browse mode, rendered from the deterministic test fixture.</sub></p>
+<p align="center"><sub>Proof Desk in its medium-width Browse layout, rendered from the deterministic test fixture. <a href="https://raw.githubusercontent.com/rvben/confluence-cli/main/assets/proof-desk.png">Open full resolution.</a></sub></p>
 
 When you want to edit, pull a page tree to Markdown and inspect the local plan:
 
