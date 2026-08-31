@@ -1,6 +1,6 @@
 [package]
 name = "confluence-cli"
-version = "0.1.29"
+version = "0.1.30"
 edition = "2024"
 rust-version = "1.90"
 description = "A CLI for reading, searching, syncing, and automating Confluence"

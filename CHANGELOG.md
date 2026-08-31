@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.30](https://github.com/rvben/confluence-cli/compare/v0.1.29...v0.1.30) - 2026-08-31
+
+### Fixed
+
+- **auth**: smooth guided setup and restore terminal state ([b21817e](https://github.com/rvben/confluence-cli/commit/b21817e4fe98d81525484153d51eb86f2ce9bc76))
+
 ## [0.1.29](https://github.com/rvben/confluence-cli/compare/v0.1.28...v0.1.29) - 2026-08-29
 
 ### Fixed
