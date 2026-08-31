@@ -209,10 +209,11 @@ Remote attachment deletions are opt-in with `--delete-remote`. Conditional overw
 
 ## Authentication
 
-`confluence init` starts the guided login flow. It opens the appropriate token
+`confluence init` starts the guided login flow. It links to the appropriate token
 page, discovers scoped-token details, verifies access, and stores credentials in
-the operating-system keychain. Cloud and Data Center profiles share the same
-workflow.
+the operating-system keychain. New profiles start read-only unless you explicitly
+enable commands that change Confluence. Cloud and Data Center profiles share the
+same workflow.
 
 Scripts and headless machines can use explicit profiles or environment-only
 credentials. See the [authentication guide](docs/authentication.md) for Cloud,

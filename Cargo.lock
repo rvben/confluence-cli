@@ -516,6 +516,7 @@ dependencies = [
  "directories",
  "html2md",
  "keyring",
+ "libc",
  "mime_guess",
  "open",
  "owo-colors",

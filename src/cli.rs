@@ -1444,9 +1444,8 @@ async fn handle_doctor(
             ),
         ),
         _ => (
-            DoctorCheckStatus::Warn,
-            "token expiry is not recorded; renew with `confluence auth login` to enable reminders"
-                .to_string(),
+            DoctorCheckStatus::Pass,
+            "token expiry is not recorded (optional metadata)".to_string(),
         ),
     };
     if expiration_check.0 == DoctorCheckStatus::Fail {

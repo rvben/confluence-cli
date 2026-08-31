@@ -414,7 +414,7 @@ pub fn run_login(input: LoginInput) -> Result<ResolvedProfile> {
     let mut profile_name = input.profile.unwrap_or_else(|| "default".to_string());
     let mut domain = input.domain.map(|v| normalize_base_url(&v));
     let mut provider = input.provider;
-    let mut api_path = input.api_path;
+    let api_path = input.api_path;
     let mut auth_type = input.auth_type;
     let mut username = input.username;
     let mut token = input.token.or_else(token_from_env);
@@ -438,13 +438,11 @@ pub fn run_login(input: LoginInput) -> Result<ResolvedProfile> {
         if provider.is_none() {
             provider = Some(detect_provider(domain.as_deref().unwrap_or_default()));
         }
-        if api_path.is_none() {
-            let default_path = default_api_path(provider.unwrap()).to_string();
-            api_path = Some(prompt("REST API path", "", Some(&default_path))?);
-        }
         if auth_type.is_none() {
-            let idx = prompt_select("Auth type", &["basic", "bearer"], 0)?;
-            auth_type = Some(if idx == 0 { "basic" } else { "bearer" }.to_string());
+            auth_type = Some(match provider.expect("provider was inferred above") {
+                ProviderKind::Cloud => "basic".to_string(),
+                ProviderKind::DataCenter => "bearer".to_string(),
+            });
         }
         if auth_type.as_deref() == Some("basic") && username.is_none() {
             username = Some(prompt_required("Username or email", "")?);
@@ -873,6 +871,13 @@ pub async fn init(output: OutputFormat) -> Result<()> {
     init_interactive().await
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitIntent {
+    Refresh,
+    Reconfigure,
+    Add,
+}
+
 fn init_json() -> Result<()> {
     let path = AppConfig::config_path()?;
     print_json(&serde_json::json!({
@@ -928,8 +933,9 @@ async fn init_interactive() -> Result<()> {
     let path = AppConfig::config_path()?;
     let mut config = AppConfig::load()?;
 
-    // Determine intent: first run, update existing profile, or add new.
-    let (target_name, existing): (Option<String>, Option<ProfileConfig>) =
+    // Returning users usually need to renew a token. Keep that path short,
+    // while retaining explicit routes for connection changes and new profiles.
+    let (target_name, existing, intent): (Option<String>, Option<ProfileConfig>, InitIntent) =
         if !config.profiles.is_empty() {
             eprintln!("  {}", sym_dim(&format!("Config: {}", path.display())));
             eprintln!();
@@ -944,10 +950,20 @@ async fn init_interactive() -> Result<()> {
             }
             eprintln!();
 
-            let action_idx = prompt_select("Action", &["update", "add"], 0)?;
+            eprintln!(
+                "  {}",
+                sym_dim(
+                    "Refresh replaces only the credential; reconfigure changes connection settings."
+                )
+            );
+            let action_idx = prompt_select(
+                "What would you like to do?",
+                &["refresh", "reconfigure", "add"],
+                0,
+            )?;
             eprintln!();
 
-            if action_idx == 0 {
+            if action_idx < 2 {
                 let names: Vec<&str> = config.profiles.keys().map(String::as_str).collect();
                 let idx = if names.len() == 1 {
                     0
@@ -956,26 +972,44 @@ async fn init_interactive() -> Result<()> {
                 };
                 let name = names[idx].to_owned();
                 let existing_profile = config.profiles.get(&name).cloned();
-                (Some(name), existing_profile)
+                (
+                    Some(name),
+                    existing_profile,
+                    if action_idx == 0 {
+                        InitIntent::Refresh
+                    } else {
+                        InitIntent::Reconfigure
+                    },
+                )
             } else {
-                (None, None)
+                (None, None, InitIntent::Add)
             }
         } else {
             // First run — no profiles yet, use "default" silently.
-            (Some("default".to_owned()), None)
+            (Some("default".to_owned()), None, InitIntent::Add)
         };
 
     // URL
     let default_url = existing.as_ref().map(|p| p.base_url.as_str()).unwrap_or("");
-    let raw_url = prompt(
-        "URL",
-        "e.g. https://mycompany.atlassian.net",
-        if default_url.is_empty() {
-            None
-        } else {
-            Some(default_url)
-        },
-    )?;
+    if intent == InitIntent::Refresh {
+        let name = target_name.as_deref().unwrap_or("default");
+        eprintln!("  Refreshing profile `{name}`");
+        eprintln!("  {}", sym_dim(default_url));
+        eprintln!();
+    }
+    let raw_url = if intent == InitIntent::Refresh {
+        default_url.to_owned()
+    } else {
+        prompt(
+            "Confluence URL",
+            "e.g. https://mycompany.atlassian.net",
+            if default_url.is_empty() {
+                None
+            } else {
+                Some(default_url)
+            },
+        )?
+    };
     let raw_url = if raw_url.is_empty() && !default_url.is_empty() {
         default_url.to_owned()
     } else {
@@ -1004,8 +1038,10 @@ async fn init_interactive() -> Result<()> {
         ProviderKind::Cloud => "Confluence Cloud",
         ProviderKind::DataCenter => "Confluence Data Center",
     };
-    eprintln!("  {} Detected: {provider_label}", sym_ok());
-    eprintln!();
+    if intent != InitIntent::Refresh {
+        eprintln!("  {} Detected: {provider_label}", sym_ok());
+        eprintln!();
+    }
 
     // Auth
     let existing_token = match (
@@ -1022,113 +1058,126 @@ async fn init_interactive() -> Result<()> {
     };
     let has_token = existing_token.is_some();
 
-    let (auth_type, username, token, cloud_id, token_kind, expires_at) = match provider {
-        ProviderKind::Cloud => {
-            const TOKEN_URL: &str = "https://id.atlassian.com/manage-profile/security/api-tokens";
-            let default_email = existing
-                .as_ref()
-                .and_then(|profile| match &profile.auth {
-                    AuthConfig::Basic { username, .. } => Some(username.as_str()),
-                    AuthConfig::Bearer { .. } => None,
-                })
-                .unwrap_or("");
-            let email = prompt("Email", "", Some(default_email))?;
-            if email.is_empty() {
-                return Err(crate::output::typed_error(
-                    crate::output::ErrorKind::InvalidInput,
-                    "email is required for Confluence Cloud",
-                ));
-            }
-            let default_kind = existing
-                .as_ref()
-                .and_then(|profile| profile.token_kind.as_deref())
-                .unwrap_or("scoped");
-            let kind = prompt("Token type", "[scoped/classic]", Some(default_kind))?;
-            let token_kind = if kind.eq_ignore_ascii_case("classic") {
-                "classic".to_string()
+    let (auth_type, username, token, cloud_id, token_kind, expires_at) = if intent
+        == InitIntent::Refresh
+    {
+        let profile = existing
+            .as_ref()
+            .expect("refresh requires an existing profile");
+        let credential_label = match (profile.provider, &profile.auth) {
+            (ProviderKind::Cloud, _) => "New API token",
+            (ProviderKind::DataCenter, AuthConfig::Basic { .. }) => "New password",
+            (ProviderKind::DataCenter, AuthConfig::Bearer { .. }) => "New personal access token",
+        };
+        let (auth_type, username) = match &profile.auth {
+            AuthConfig::Basic { username, .. } => ("basic", Some(username.clone())),
+            AuthConfig::Bearer { .. } => ("bearer", None),
+        };
+        let raw = prompt_secret(
+            credential_label,
+            if has_token {
+                "Enter to keep the current token"
             } else {
-                "scoped".to_string()
-            };
-            let cloud_id = if token_kind == "scoped" {
-                eprint!("  Discovering Cloud ID...");
-                std::io::stderr().flush().ok();
-                let id = discover_cloud_id(&base_url).await?;
-                eprintln!(" {}", sym_ok());
-                Some(id)
+                "required; no stored token was found"
+            },
+        )?;
+        let kept_existing = raw.is_empty();
+        let token = if kept_existing {
+            existing_token.clone().ok_or_else(|| {
+                crate::output::typed_error(
+                    crate::output::ErrorKind::Auth,
+                    "token is required because no stored credential was found",
+                )
+            })?
+        } else {
+            raw
+        };
+        (
+            auth_type,
+            username,
+            token,
+            profile.cloud_id.clone(),
+            profile
+                .token_kind
+                .clone()
+                .unwrap_or_else(|| "classic".to_string()),
+            if kept_existing {
+                profile.expires_at.clone()
             } else {
                 None
-            };
-            if !has_token
-                && prompt_bool("Open Atlassian's token page now?", true)?
-                && let Err(error) = open::that(TOKEN_URL)
-            {
-                eprintln!("  {} Could not open browser: {error}", sym_fail());
-            }
-            eprintln!("  {}", sym_dim(&format!("→ {TOKEN_URL}")));
-            if token_kind == "scoped" {
+            },
+        )
+    } else {
+        match provider {
+            ProviderKind::Cloud => {
+                const TOKEN_URL: &str =
+                    "https://id.atlassian.com/manage-profile/security/api-tokens";
+                let default_email = existing
+                    .as_ref()
+                    .and_then(|profile| match &profile.auth {
+                        AuthConfig::Basic { username, .. } => Some(username.as_str()),
+                        AuthConfig::Bearer { .. } => None,
+                    })
+                    .unwrap_or("");
+                let email = prompt_required_with_default("Atlassian account email", default_email)?;
+
                 eprintln!(
                     "  {}",
-                    sym_dim("Choose Confluence scopes and the least privilege this profile needs.")
+                    sym_dim("Choose the token type shown on Atlassian's token page.")
                 );
-            }
-            let raw = prompt_secret(
-                "Token",
-                if has_token {
-                    "Enter to keep existing"
-                } else {
-                    ""
-                },
-            )?;
-            let kept_existing = raw.is_empty();
-            let token = if kept_existing {
-                existing_token.clone().ok_or_else(|| {
-                    crate::output::typed_error(crate::output::ErrorKind::Auth, "token is required")
-                })?
-            } else {
-                raw
-            };
-            let expires_at = if kept_existing {
-                existing
+                eprintln!(
+                    "  {}",
+                    sym_dim("Scoped is recommended; classic supports older API tokens.")
+                );
+                let default_kind = existing
                     .as_ref()
-                    .and_then(|profile| profile.expires_at.clone())
-            } else {
-                Some(prompt_expiration_date(90)?)
-            };
-            (
-                "basic",
-                Some(email),
-                token,
-                cloud_id,
-                token_kind,
-                expires_at,
-            )
-        }
-        ProviderKind::DataCenter => {
-            let pat_url = data_center_pat_url(&base_url);
-            let (auth_type, username, token, expires_at) = if has_token {
-                print_data_center_pat_link(&pat_url);
-                let existing_basic = matches!(
-                    existing.as_ref().map(|profile| &profile.auth),
-                    Some(AuthConfig::Basic { .. })
-                );
-                let auth_idx = prompt_select(
-                    "Auth",
-                    &["personal access token", "basic"],
-                    usize::from(existing_basic),
+                    .and_then(|profile| profile.token_kind.as_deref())
+                    .unwrap_or("scoped");
+                let kind_idx = prompt_select(
+                    "API token type",
+                    &["scoped", "classic"],
+                    usize::from(default_kind == "classic"),
                 )?;
-                let username = if auth_idx == 1 {
-                    let default = existing
-                        .as_ref()
-                        .and_then(|profile| match &profile.auth {
-                            AuthConfig::Basic { username, .. } => Some(username.as_str()),
-                            AuthConfig::Bearer { .. } => None,
-                        })
-                        .unwrap_or("");
-                    Some(prompt("Username", "", Some(default))?)
+                let token_kind = if kind_idx == 1 {
+                    "classic".to_string()
+                } else {
+                    "scoped".to_string()
+                };
+                let can_keep_token = has_token
+                    && existing.as_ref().is_some_and(|profile| {
+                        profile.provider == ProviderKind::Cloud
+                            && profile.token_kind.as_deref().unwrap_or("classic") == token_kind
+                    });
+                let cloud_id = if token_kind == "scoped" {
+                    eprint!("  Discovering Cloud ID...");
+                    std::io::stderr().flush().ok();
+                    let id = discover_cloud_id(&base_url).await?;
+                    eprintln!(" {}", sym_ok());
+                    Some(id)
                 } else {
                     None
                 };
-                let raw = prompt_secret("Token", "Enter to keep existing")?;
+
+                eprintln!(
+                    "  {}",
+                    sym_dim(if can_keep_token {
+                        "Manage or replace your API token:"
+                    } else {
+                        "Create an API token, then paste it below:"
+                    })
+                );
+                eprintln!("  {}", sym_dim(&format!("→ {TOKEN_URL}")));
+                if token_kind == "scoped" {
+                    eprintln!(
+                        "  {}",
+                        sym_dim("Grant only the Confluence scopes this profile needs.")
+                    );
+                }
+                let raw = if can_keep_token {
+                    prompt_secret("API token", "Enter to keep the current token")?
+                } else {
+                    prompt_secret_required("API token", "required")?
+                };
                 let kept_existing = raw.is_empty();
                 let token = if kept_existing {
                     existing_token.clone().expect("checked above")
@@ -1140,83 +1189,172 @@ async fn init_interactive() -> Result<()> {
                         .as_ref()
                         .and_then(|profile| profile.expires_at.clone())
                 } else {
-                    Some(prompt_expiration_date(90)?)
+                    None
                 };
                 (
-                    if auth_idx == 1 { "basic" } else { "bearer" },
-                    username,
+                    "basic",
+                    Some(email),
                     token,
+                    cloud_id,
+                    token_kind,
                     expires_at,
                 )
-            } else if prompt_bool("Create a dedicated PAT automatically?", true)? {
-                let method = prompt("Bootstrap with", "[password/pat]", Some("password"))?;
-                let use_pat = method.eq_ignore_ascii_case("pat");
-                let username = if use_pat {
-                    None
-                } else {
-                    Some(prompt_required("Bootstrap username", "")?)
-                };
-                let secret = prompt_secret(
-                    if use_pat {
-                        "Existing personal access token"
+            }
+            ProviderKind::DataCenter => {
+                let pat_url = data_center_pat_url(&base_url);
+                let has_data_center_token = has_token
+                    && existing
+                        .as_ref()
+                        .is_some_and(|profile| profile.provider == ProviderKind::DataCenter);
+                let (auth_type, username, token, expires_at) = if has_data_center_token {
+                    let existing_basic = matches!(
+                        existing.as_ref().map(|profile| &profile.auth),
+                        Some(AuthConfig::Basic { .. })
+                    );
+                    eprintln!(
+                        "  {}",
+                        sym_dim("PAT is recommended; password uses basic authentication.")
+                    );
+                    let auth_idx = prompt_select(
+                        "Authentication",
+                        &["PAT", "password"],
+                        usize::from(existing_basic),
+                    )?;
+                    let username = if auth_idx == 1 {
+                        let default = existing
+                            .as_ref()
+                            .and_then(|profile| match &profile.auth {
+                                AuthConfig::Basic { username, .. } => Some(username.as_str()),
+                                AuthConfig::Bearer { .. } => None,
+                            })
+                            .unwrap_or("");
+                        Some(prompt_required_with_default("Username", default)?)
                     } else {
-                        "Bootstrap password"
-                    },
-                    "used once and never saved",
-                )?;
-                let days = prompt_expiration_days(90)?;
-                eprint!("  Creating personal access token...");
-                std::io::stderr().flush().ok();
-                match create_data_center_pat(
-                    &base_url,
-                    username.as_deref(),
-                    &secret,
-                    target_name.as_deref().unwrap_or("confluence-cli"),
-                    days,
-                )
-                .await
-                {
-                    Ok(token) => {
-                        eprintln!(" {}", sym_ok());
-                        ("bearer", None, token, Some(expiration_date(days)))
-                    }
-                    Err(error) => {
-                        eprintln!(" {} {error}", sym_fail());
-                        eprintln!("  Falling back to browser-assisted PAT creation.");
-                        let _ = open::that(&pat_url);
+                        None
+                    };
+                    let can_keep_credential = existing_basic == (auth_idx == 1);
+                    let credential_label = if auth_idx == 1 {
+                        "Password"
+                    } else {
+                        "Personal access token"
+                    };
+                    let raw = if can_keep_credential {
+                        prompt_secret(credential_label, "Enter to keep the current credential")?
+                    } else {
+                        prompt_secret_required(
+                            credential_label,
+                            "required after changing authentication",
+                        )?
+                    };
+                    let kept_existing = raw.is_empty();
+                    let token = if kept_existing {
+                        existing_token.clone().expect("checked above")
+                    } else {
+                        raw
+                    };
+                    let expires_at = if kept_existing {
+                        existing
+                            .as_ref()
+                            .and_then(|profile| profile.expires_at.clone())
+                    } else {
+                        None
+                    };
+                    (
+                        if auth_idx == 1 { "basic" } else { "bearer" },
+                        username,
+                        token,
+                        expires_at,
+                    )
+                } else {
+                    eprintln!(
+                        "  {}",
+                        sym_dim(
+                            "Paste an existing PAT, or create a dedicated PAT through Confluence."
+                        )
+                    );
+                    let setup_idx = prompt_select("PAT setup", &["paste", "create"], 0)?;
+                    if setup_idx == 1 {
+                        let method_idx = prompt_select(
+                            "Authenticate once using",
+                            &["password", "existing PAT"],
+                            0,
+                        )?;
+                        let use_pat = method_idx == 1;
+                        let username = if use_pat {
+                            None
+                        } else {
+                            Some(prompt_required("Username", "")?)
+                        };
+                        let secret = prompt_secret(
+                            if use_pat { "Existing PAT" } else { "Password" },
+                            "used once and never stored",
+                        )?;
+                        let days = prompt_expiration_days(90)?;
+                        eprint!("  Creating dedicated PAT...");
+                        std::io::stderr().flush().ok();
+                        match create_data_center_pat(
+                            &base_url,
+                            username.as_deref(),
+                            &secret,
+                            target_name.as_deref().unwrap_or("confluence-cli"),
+                            days,
+                        )
+                        .await
+                        {
+                            Ok(token) => {
+                                eprintln!(" {}", sym_ok());
+                                ("bearer", None, token, Some(expiration_date(days)))
+                            }
+                            Err(error) => {
+                                eprintln!(" {} {error}", sym_fail());
+                                eprintln!(
+                                    "  Could not create a PAT automatically. Paste one instead."
+                                );
+                                print_data_center_pat_link(&pat_url);
+                                (
+                                    "bearer",
+                                    None,
+                                    prompt_secret_required("Personal access token", "")?,
+                                    None,
+                                )
+                            }
+                        }
+                    } else {
                         print_data_center_pat_link(&pat_url);
                         (
                             "bearer",
                             None,
                             prompt_secret_required("Personal access token", "")?,
-                            Some(prompt_expiration_date(90)?),
+                            None,
                         )
                     }
-                }
-            } else {
-                let _ = open::that(&pat_url);
-                print_data_center_pat_link(&pat_url);
+                };
                 (
-                    "bearer",
+                    auth_type,
+                    username,
+                    token,
                     None,
-                    prompt_secret_required("Personal access token", "")?,
-                    Some(prompt_expiration_date(90)?),
+                    "classic".to_string(),
+                    expires_at,
                 )
-            };
-            (
-                auth_type,
-                username,
-                token,
-                None,
-                "classic".to_string(),
-                expires_at,
-            )
+            }
         }
     };
 
-    // Read-only
-    let default_ro = existing.as_ref().map(|p| p.read_only).unwrap_or(false);
-    let read_only = prompt_bool("Read-only mode?", default_ro)?;
+    // Default new profiles to the safest useful mode. Returning profiles retain
+    // their current policy unless the user explicitly reconfigures them.
+    let read_only = if intent == InitIntent::Refresh {
+        existing.as_ref().is_some_and(|profile| profile.read_only)
+    } else {
+        let default_allow_writes = existing.as_ref().is_some_and(|profile| !profile.read_only);
+        if existing.is_none() {
+            eprintln!(
+                "  {}",
+                sym_dim("Start read-only unless this profile needs to create or change content.")
+            );
+        }
+        !prompt_bool("Allow commands to change Confluence?", default_allow_writes)?
+    };
     eprintln!();
 
     // Verify credentials
@@ -1225,6 +1363,7 @@ async fn init_interactive() -> Result<()> {
 
     let api_path = existing
         .as_ref()
+        .filter(|profile| profile.provider == provider && profile.base_url == base_url)
         .map(|p| p.api_path.clone())
         .unwrap_or_else(|| default_api_path(provider).to_string());
     let auth = build_auth(auth_type, username, token.clone())?;
@@ -1271,17 +1410,39 @@ async fn init_interactive() -> Result<()> {
         Some(name) => name,
         None => {
             eprintln!();
-            let name = prompt("Profile name", "", Some("default"))?;
-            if name.is_empty() {
-                "default".to_owned()
-            } else {
-                name
+            let mut suffix = 1;
+            let suggestion = loop {
+                let candidate = if suffix == 1 {
+                    "new".to_string()
+                } else {
+                    format!("new-{suffix}")
+                };
+                if !config.profiles.contains_key(&candidate) {
+                    break candidate;
+                }
+                suffix += 1;
+            };
+            loop {
+                let name = prompt_required_with_default("Profile name", &suggestion)?;
+                if config.profiles.contains_key(&name) {
+                    eprintln!("{} Profile `{name}` already exists", sym_fail());
+                } else {
+                    break name;
+                }
             }
         }
     };
 
     // Save
-    let file_storage = choose_credential_storage()?;
+    let file_storage = if existing
+        .as_ref()
+        .and_then(|profile| profile.credential_store.as_deref())
+        == Some("file")
+    {
+        true
+    } else {
+        choose_credential_storage()?
+    };
     let mut stored_auth = auth;
     if !file_storage {
         set_auth_token(&mut stored_auth, String::new());
@@ -1334,6 +1495,14 @@ async fn init_interactive() -> Result<()> {
             "Credential storage: operating-system keychain"
         })
     );
+    eprintln!(
+        "  {}",
+        sym_dim(if read_only {
+            "Access: read-only; commands that change Confluence are blocked"
+        } else {
+            "Access: write commands enabled"
+        })
+    );
     eprintln!();
     eprintln!("{sep}");
     eprintln!("  What's next:");
@@ -1356,8 +1525,8 @@ async fn init_interactive() -> Result<()> {
 fn prompt_expiration_days(default: u64) -> Result<u64> {
     loop {
         let value = prompt(
-            "Token expiry in days",
-            "[1-365]",
+            "Dedicated PAT lifetime",
+            "[1-365] days",
             Some(&default.to_string()),
         )?;
         match value.parse::<u64>() {
@@ -1383,10 +1552,6 @@ fn expiration_date(days: u64) -> String {
     (chrono::Utc::now() + chrono::Duration::days(days as i64))
         .date_naive()
         .to_string()
-}
-
-fn prompt_expiration_date(default: u64) -> Result<String> {
-    Ok(expiration_date(prompt_expiration_days(default)?))
 }
 
 fn choose_credential_storage() -> Result<bool> {
@@ -1507,20 +1672,26 @@ fn sym_dim(s: &str) -> String {
     }
 }
 
-/// Print `? Label  hint [default]: ` to stderr and read a line from stdin.
-/// Returns the trimmed input, or `default` if the user pressed Enter with no input.
-fn prompt(label: &str, hint: &str, default: Option<&str>) -> Result<String> {
+fn print_prompt(label: &str, hint: &str, default: Option<&str>) {
     let hint_part = if hint.is_empty() {
         String::new()
     } else {
         format!("  {}", sym_dim(hint))
     };
     let default_part = match default {
-        Some(d) if !d.is_empty() => format!(" {}", sym_dim(&format!("[{d}]"))),
+        Some(default) if !default.is_empty() => {
+            format!(" {}", sym_dim(&format!("[{default}]")))
+        }
         _ => String::new(),
     };
     eprint!("{} {label}{hint_part}{default_part}: ", sym_q());
     std::io::stderr().flush().ok();
+}
+
+/// Print `? Label  hint [default]: ` to stderr and read a line from stdin.
+/// Returns the trimmed input, or `default` if the user pressed Enter with no input.
+fn prompt(label: &str, hint: &str, default: Option<&str>) -> Result<String> {
+    print_prompt(label, hint, default);
     let mut buf = String::new();
     std::io::stdin().read_line(&mut buf)?;
     let trimmed = buf.trim().to_owned();
@@ -1542,16 +1713,28 @@ fn prompt_required(label: &str, hint: &str) -> Result<String> {
     }
 }
 
+fn prompt_required_with_default(label: &str, default: &str) -> Result<String> {
+    loop {
+        let value = prompt(
+            label,
+            "",
+            if default.is_empty() {
+                None
+            } else {
+                Some(default)
+            },
+        )?;
+        if !value.is_empty() {
+            return Ok(value);
+        }
+        eprintln!("{} {label} is required", sym_fail());
+    }
+}
+
 /// Prompt for a credential without echoing it to the terminal.
 fn prompt_secret(label: &str, hint: &str) -> Result<String> {
-    let hint_part = if hint.is_empty() {
-        String::new()
-    } else {
-        format!("  {}", sym_dim(hint))
-    };
-    eprint!("{} {label}{hint_part}: ", sym_q());
-    std::io::stderr().flush().ok();
-    Ok(rpassword::read_password()?.trim().to_owned())
+    print_prompt(label, hint, None);
+    Ok(crate::terminal::read_password()?.trim().to_owned())
 }
 
 fn prompt_secret_required(label: &str, hint: &str) -> Result<String> {
@@ -1565,28 +1748,47 @@ fn prompt_secret_required(label: &str, hint: &str) -> Result<String> {
 }
 
 /// Print a selection prompt with slash-separated options. Accepts any unambiguous prefix.
-/// Falls back to `default_idx` on unrecognised input.
 fn prompt_select(label: &str, options: &[&str], default_idx: usize) -> Result<usize> {
     let opts_str = options.join("/");
     let default_opt = options.get(default_idx).copied().unwrap_or("");
-    let raw = prompt(label, &format!("[{opts_str}]"), Some(default_opt))?;
-    for (i, opt) in options.iter().enumerate() {
-        if raw.eq_ignore_ascii_case(opt) || opt.starts_with(&raw.to_ascii_lowercase()) {
-            return Ok(i);
+    loop {
+        let raw = prompt(label, &format!("[{opts_str}]"), Some(default_opt))?;
+        if let Some(selection) = resolve_selection(&raw, options) {
+            return Ok(selection);
         }
+        eprintln!("{} Enter one of: {opts_str}", sym_fail());
     }
-    Ok(default_idx)
 }
 
-/// Print a yes/no prompt. Accepts y/yes/n/no (case-insensitive). Falls back to `default`.
+fn resolve_selection(raw: &str, options: &[&str]) -> Option<usize> {
+    if let Some(exact) = options
+        .iter()
+        .position(|option| raw.eq_ignore_ascii_case(option))
+    {
+        return Some(exact);
+    }
+    let raw = raw.to_ascii_lowercase();
+    let mut matches = options
+        .iter()
+        .enumerate()
+        .filter(|(_, option)| option.to_ascii_lowercase().starts_with(&raw));
+    match (matches.next(), matches.next()) {
+        (Some((index, _)), None) => Some(index),
+        _ => None,
+    }
+}
+
+/// Print a yes/no prompt. Accepts y/yes/n/no (case-insensitive).
 fn prompt_bool(label: &str, default: bool) -> Result<bool> {
     let default_str = if default { "y" } else { "n" };
-    let raw = prompt(label, "[y/n]", Some(default_str))?;
-    Ok(match raw.to_ascii_lowercase().as_str() {
-        "y" | "yes" | "true" | "1" => true,
-        "n" | "no" | "false" | "0" => false,
-        _ => default,
-    })
+    loop {
+        let raw = prompt(label, "[y/n]", Some(default_str))?;
+        match raw.to_ascii_lowercase().as_str() {
+            "y" | "yes" | "true" | "1" => return Ok(true),
+            "n" | "no" | "false" | "0" => return Ok(false),
+            _ => eprintln!("{} Enter yes or no", sym_fail()),
+        }
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -1664,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn data_center_pat_url_opens_personal_token_page() {
+    fn data_center_pat_url_builds_personal_token_page() {
         assert_eq!(
             data_center_pat_url("https://example.com/confluence/"),
             "https://example.com/confluence/plugins/personalaccesstokens/usertokens.action"
@@ -1703,6 +1905,15 @@ mod tests {
             detect_provider("http://localhost:8090"),
             ProviderKind::DataCenter
         );
+    }
+
+    #[test]
+    fn selection_matching_is_case_insensitive_and_requires_an_unambiguous_prefix() {
+        let options = ["PAT", "password"];
+        assert_eq!(resolve_selection("pat", &options), Some(0));
+        assert_eq!(resolve_selection("pass", &options), Some(1));
+        assert_eq!(resolve_selection("p", &options), None);
+        assert_eq!(resolve_selection("unknown", &options), None);
     }
 
     #[test]

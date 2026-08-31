@@ -5,11 +5,15 @@
 
 The wizard can:
 
-- open the appropriate Atlassian token page
+- link to the appropriate Atlassian token page without opening a browser
 - discover the Cloud ID required by scoped tokens
 - create a dedicated Data Center PAT through the official API when available
 - hide credential entry and verify access
 - store the token in the operating-system keychain
+
+New profiles start read-only. The wizard asks directly before enabling commands
+that can change Confluence. Returning users can refresh only the stored credential
+without stepping through unchanged connection settings.
 
 If no credential service is available, setup offers an explicit protected-file
 fallback instead of silently weakening storage. Onboarding never consumes
@@ -43,9 +47,9 @@ printf '%s' "$CONFLUENCE_PAT" | confluence auth login \
 confluence doctor --profile dc --space SPACEKEY
 ```
 
-When automatic PAT creation is unavailable, setup opens
-`https://<your-host>/plugins/personalaccesstokens/usertokens.action`. The same
-page is available under **Avatar → Settings → Personal access tokens**.
+When automatic PAT creation is unavailable, setup links to
+`https://<your-host>/plugins/personalaccesstokens/usertokens.action`. The same page
+is available under **Avatar → Settings → Personal access tokens**.
 
 ## Environment-driven mode
 
