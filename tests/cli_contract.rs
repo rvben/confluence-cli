@@ -176,11 +176,12 @@ fn spawn_init_in_pty() -> (tempfile::TempDir, File, libc::pid_t, libc::termios) 
     environment_pointers.push(std::ptr::null());
 
     let mut master_fd = -1;
+    let initial_ptr = std::ptr::addr_of_mut!(initial);
     let child_pid = unsafe {
         libc::forkpty(
             &mut master_fd,
             std::ptr::null_mut(),
-            &mut initial,
+            initial_ptr,
             std::ptr::null_mut(),
         )
     };
