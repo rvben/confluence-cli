@@ -82,6 +82,10 @@ jobs:
       - build-wheels
       - build-sdist
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -93,6 +97,12 @@ jobs:
           components: rustfmt, clippy
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+
+      - name: Authenticate to crates.io via Trusted Publishing
+        id: crates_io_auth
+        if: ${{ inputs.dry_run != true && inputs.skip_crates_io != true }}
+        # v1.0.5
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
 
       - name: Publish to crates.io
         if: ${{ inputs.dry_run != true && inputs.skip_crates_io != true }}
@@ -145,7 +155,7 @@ jobs:
 
           exit "$publish_status"
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
 
       - name: Test crates.io publish (dry run)
         if: ${{ inputs.dry_run == true && inputs.skip_crates_io != true }}
