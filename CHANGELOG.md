@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.31](https://github.com/rvben/confluence-cli/compare/v0.1.30...v0.1.31) - 2026-09-03
+
+### Added
+
+- **auth**: standardize authentication workflow ([aae7779](https://github.com/rvben/confluence-cli/commit/aae77797c2d2124f4368f2598aec0172b182286f))
+
 ## [0.1.30](https://github.com/rvben/confluence-cli/compare/v0.1.29...v0.1.30) - 2026-08-31
 
 ### Fixed
