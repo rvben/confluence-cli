@@ -77,6 +77,11 @@ enum Commands {
         #[command(subcommand)]
         command: ProfileCommand,
     },
+    /// Inspect resolved, secret-free configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// List spaces or inspect one space
     Space {
         #[command(subcommand)]
@@ -169,11 +174,23 @@ enum AuthCommand {
     /// Configure a profile; starts a credential-verifying guided wizard without flags
     Login(Box<AuthLoginArgs>),
     /// Verify the selected profile and display its authentication status
-    Status,
+    Status {
+        /// Inspect local credential state without contacting Confluence
+        #[arg(long)]
+        offline: bool,
+    },
     /// Remove the selected profile credential
     Logout,
     /// Move an inline legacy token into the operating-system keychain
     Migrate,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Print the resolved profile without exposing its credential
+    Show,
+    /// Print the absolute configuration file path
+    Path,
 }
 
 #[derive(Subcommand, Debug)]
@@ -441,8 +458,8 @@ struct DoctorArgs {
     #[arg(long)]
     path: Option<PathBuf>,
     /// Check local configuration without contacting Confluence
-    #[arg(long)]
-    skip_network: bool,
+    #[arg(long, alias = "skip-network")]
+    offline: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -972,11 +989,12 @@ pub async fn run() -> Result<()> {
     let yes = cli.yes;
 
     match cli.command {
-        Commands::Init => config::init(output).await,
+        Commands::Init => config::init(output, cli.profile.as_deref()).await,
         Commands::Auth { command } => {
             handle_auth(command, cli.profile.as_deref(), output, yes).await
         }
         Commands::Profile { command } => handle_profile(command, output, yes),
+        Commands::Config { command } => handle_config(command, cli.profile.as_deref(), output),
         Commands::Space { command } => {
             let provider = provider_from_profile(cli.profile.as_deref())?;
             handle_space(&*provider, command, output).await
@@ -1130,7 +1148,6 @@ async fn handle_auth(
         AuthCommand::Login(args) => {
             let args = *args;
             let guided = args.name.is_none()
-                && profile_override.is_none()
                 && args.input.provider.is_none()
                 && args.input.domain.is_none()
                 && args.input.api_path.is_none()
@@ -1152,7 +1169,7 @@ async fn handle_auth(
                         "run `confluence init --output json` for setup instructions, or pass explicit options to `confluence auth login --non-interactive`",
                     ));
                 }
-                return crate::config::init(output).await;
+                return crate::config::init(output, profile_override).await;
             }
             let name = args.name.or_else(|| profile_override.map(str::to_owned));
             let resolved = run_login(login_input(args.input, name)?)?;
@@ -1189,16 +1206,21 @@ async fn handle_auth(
                 );
             }
         }
-        AuthCommand::Status => {
+        AuthCommand::Status { offline } => {
             let profile = resolved_profile(profile_override)?;
-            let provider = build_provider(profile.clone());
-            provider.ping().await?;
-            let current_user = provider.current_user().await.ok();
+            let current_user = if offline {
+                None
+            } else {
+                let provider = build_provider(profile.clone());
+                provider.ping().await?;
+                provider.current_user().await.ok()
+            };
             if output.is_json() {
                 let mut value = serde_json::to_value(profile.redact())?;
                 value["expiration_status"] = json!(crate::config::expiration_status(
                     profile.expires_at.as_deref()
                 ));
+                value["verified"] = json!(!offline);
                 value["current_user"] = serde_json::to_value(&current_user)?;
                 print_json(&value)?;
             } else {
@@ -1244,7 +1266,7 @@ async fn handle_auth(
                             .unwrap_or_else(|| "-".to_string()),
                         crate::config::expiration_status(profile.expires_at.as_deref()).to_string(),
                         profile.read_only.to_string(),
-                        "ok".to_string(),
+                        if offline { "configured" } else { "ok" }.to_string(),
                         user,
                         account_id,
                     ]],
@@ -1296,6 +1318,53 @@ async fn handle_auth(
         }
     }
     Ok(())
+}
+
+fn handle_config(
+    command: ConfigCommand,
+    profile_override: Option<&str>,
+    output: OutputFormat,
+) -> Result<()> {
+    match command {
+        ConfigCommand::Path => {
+            let path = AppConfig::config_path()?;
+            print_status(
+                output,
+                json!({"config_path": path}),
+                &path.display().to_string(),
+            )
+        }
+        ConfigCommand::Show => {
+            let profile = resolved_profile(profile_override)?;
+            if output.is_json() {
+                print_json(&serde_json::to_value(profile.redact())?)
+            } else {
+                print_table(
+                    &[
+                        "profile",
+                        "provider",
+                        "base_url",
+                        "api_path",
+                        "credential_store",
+                        "token_kind",
+                        "expires_at",
+                        "read_only",
+                    ],
+                    &[vec![
+                        profile.name,
+                        profile.provider.to_string(),
+                        profile.base_url,
+                        profile.api_path,
+                        profile.credential_store,
+                        profile.token_kind,
+                        profile.expires_at.unwrap_or_else(|| "-".into()),
+                        profile.read_only.to_string(),
+                    ]],
+                );
+                Ok(())
+            }
+        }
+    }
 }
 
 async fn handle_doctor(
@@ -1458,7 +1527,7 @@ async fn handle_doctor(
         expiration_check.1,
     );
 
-    if args.skip_network {
+    if args.offline {
         push_doctor_check(
             &mut report,
             "connectivity",

@@ -10,7 +10,7 @@ public command surface.
 | Content | `page move\|create\|update\|delete`, `blog create\|update\|delete` |
 | Page data | `attachment`, `label`, `comment`, and `property` command groups |
 | Markdown | `pull page\|tree\|space`, `plan`, `tui`, `apply` |
-| Tooling | `doctor`, `completions`, `schema` |
+| Tooling | `config show\|path`, `doctor`, `completions`, `schema` |
 
 Where a command accepts `REFERENCE`, pass a numeric content ID, a Confluence
 URL, or `SPACE:Title`. Destructive operations require interactive confirmation

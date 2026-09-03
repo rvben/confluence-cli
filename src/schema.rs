@@ -215,6 +215,7 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "expires_at", "type": "string", "nullable": true}),
             json!({"name": "expiration_status", "type": "string"}),
             json!({"name": "read_only", "type": "boolean"}),
+            json!({"name": "verified", "type": "boolean"}),
             json!({"name": "current_user", "type": "object", "nullable": true}),
         ],
 
@@ -259,6 +260,19 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "profile", "type": "string"}),
             json!({"name": "removed", "type": "boolean"}),
         ],
+
+        "config show" => vec![
+            json!({"name": "name", "type": "string"}),
+            json!({"name": "provider", "type": "string"}),
+            json!({"name": "base_url", "type": "string"}),
+            json!({"name": "api_path", "type": "string"}),
+            json!({"name": "credential_store", "type": "string"}),
+            json!({"name": "token_kind", "type": "string"}),
+            json!({"name": "expires_at", "type": "string", "nullable": true}),
+            json!({"name": "read_only", "type": "boolean"}),
+        ],
+
+        "config path" => vec![json!({"name": "config_path", "type": "string"})],
 
         "pull page" | "pull tree" | "pull space" => vec![json!({"name": "path", "type": "string"})],
 

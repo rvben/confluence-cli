@@ -856,7 +856,7 @@ impl EnvOverride {
 /// In JSON mode: prints machine-readable setup instructions and exits.
 /// In a non-interactive terminal: prints guidance and exits.
 /// Otherwise: runs the interactive setup wizard.
-pub async fn init(output: OutputFormat) -> Result<()> {
+pub async fn init(output: OutputFormat, requested_profile: Option<&str>) -> Result<()> {
     if output.is_json() {
         return init_json();
     }
@@ -868,7 +868,7 @@ pub async fn init(output: OutputFormat) -> Result<()> {
             "run `confluence init --output json` for setup instructions, or use `confluence auth login --non-interactive` with CONFLUENCE_* environment variables",
         ));
     }
-    init_interactive().await
+    init_interactive(requested_profile).await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -924,7 +924,7 @@ fn init_json() -> Result<()> {
     Ok(())
 }
 
-async fn init_interactive() -> Result<()> {
+async fn init_interactive(requested_profile: Option<&str>) -> Result<()> {
     let sep = sym_dim("──────────────────");
     eprintln!("Confluence CLI");
     eprintln!("{sep}");
@@ -936,7 +936,15 @@ async fn init_interactive() -> Result<()> {
     // Returning users usually need to renew a token. Keep that path short,
     // while retaining explicit routes for connection changes and new profiles.
     let (target_name, existing, intent): (Option<String>, Option<ProfileConfig>, InitIntent) =
-        if !config.profiles.is_empty() {
+        if let Some(name) = requested_profile {
+            let existing = config.profiles.get(name).cloned();
+            let intent = if existing.is_some() {
+                InitIntent::Refresh
+            } else {
+                InitIntent::Add
+            };
+            (Some(name.to_owned()), existing, intent)
+        } else if !config.profiles.is_empty() {
             eprintln!("  {}", sym_dim(&format!("Config: {}", path.display())));
             eprintln!();
             eprintln!("  Profiles:");
@@ -1811,7 +1819,7 @@ mod tests {
 
     #[tokio::test]
     async fn init_text_mode_requires_a_terminal() {
-        let error = init(OutputFormat::Text).await.unwrap_err();
+        let error = init(OutputFormat::Text, None).await.unwrap_err();
         assert!(error.to_string().contains("--non-interactive"));
     }
 

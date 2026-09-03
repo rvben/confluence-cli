@@ -62,6 +62,10 @@ confluence init
 confluence doctor --space SPACEKEY
 ```
 
+For local-only diagnostics, use `confluence auth status --offline` or
+`confluence doctor --offline`. The former `doctor --skip-network` spelling
+remains available as a compatibility alias.
+
 Then read, search, or browse immediately—no pull required:
 
 ```bash
@@ -230,7 +234,7 @@ Reading, browsing, direct updates, and Markdown publishing are all first-class:
 | Content | `page move\|create\|update\|delete`, `blog create\|update\|delete` |
 | Page data | `attachment`, `label`, `comment`, and `property` command groups |
 | Markdown | `pull page\|tree\|space`, `plan`, `tui`, `apply` |
-| Tooling | `doctor`, `completions`, `schema` |
+| Tooling | `config show\|path`, `doctor`, `completions`, `schema` |
 
 On a terminal, `--output auto` produces readable text. When piped, data
 commands produce one JSON document. Agents can request one token-efficient,
