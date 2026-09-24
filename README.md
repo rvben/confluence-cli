@@ -221,7 +221,7 @@ same workflow.
 
 Scripts and headless machines can use explicit profiles or environment-only
 credentials. See the [authentication guide](docs/authentication.md) for Cloud,
-Data Center, CI, keychain, and environment examples.
+Data Center, CI, keychain, environment, and private certificate authority examples.
 
 ## Command surface
 
