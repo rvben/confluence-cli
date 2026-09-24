@@ -51,6 +51,13 @@ With Cargo:
 cargo install confluence-cli
 ```
 
+With Nix (flakes):
+
+```bash
+nix run github:rvben/confluence-cli -- --help
+nix profile install github:rvben/confluence-cli
+```
+
 The PyPI distribution is named `confluence-cli-rs`; the crate is named `confluence-cli`. Prebuilt macOS and Linux archives for Intel and ARM are available from [GitHub Releases](https://github.com/rvben/confluence-cli/releases).
 
 ## Quick start
