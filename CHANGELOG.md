@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.32](https://github.com/rvben/confluence-cli/compare/v0.1.31...v0.1.32) - 2026-09-24
+
+### Added
+
+- **nix**: add a flake for building and developing with Nix ([95dc526](https://github.com/rvben/confluence-cli/commit/95dc52699eef2b58cfb46d08fff6b209baa35c04))
+
+### Fixed
+
+- **tls**: trust the operating-system certificate store ([76d0728](https://github.com/rvben/confluence-cli/commit/76d0728a7377be3167c42606bb6c61fe8879a34f))
+
 ## [0.1.31](https://github.com/rvben/confluence-cli/compare/v0.1.30...v0.1.31) - 2026-09-03
 
 ### Added
