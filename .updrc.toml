@@ -1,0 +1,4 @@
+# dtolnay/rust-toolchain publishes no releases, only a moving `v1` tag and
+# per-toolchain branches, so no pin to it can carry an exact version. The
+# toolchain itself is chosen by each step's `toolchain:` input.
+ignore = ["dtolnay/rust-toolchain"]
