@@ -67,12 +67,6 @@ All notable changes to this project will be documented in this file.
 
 ## [0.1.20](https://github.com/rvben/confluence-cli/compare/v0.1.19...v0.1.20) - 2026-08-28
 
-### Fixed
-
-- **cli**: harden human and automation contracts ([1e6303d](https://github.com/rvben/confluence-cli/commit/1e6303d4863fef57d51f6f475c098374dfd4673a))
-
-## Unreleased
-
 ### Added
 
 - Add the read-only Proof Desk TUI for space/page browsing, page evidence, and local sync-plan review.
@@ -89,6 +83,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **cli**: harden human and automation contracts ([1e6303d](https://github.com/rvben/confluence-cli/commit/1e6303d4863fef57d51f6f475c098374dfd4673a))
 - Prevent body-writing commands from panicking on a Clap argument-ID collision.
 - Reject missing or unreadable sync paths instead of reporting a successful no-op plan.
 - Correct E2E binary discovery, auth table columns, schema output fields, and short output flags.
