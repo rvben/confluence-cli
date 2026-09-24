@@ -5,7 +5,7 @@ POSTGRES_DATA_VOLUME := confluencecli_postgres-data
 CONFLUENCE_E2E_PROFILE ?= local-dc
 CONFLUENCE_E2E_SPACE ?= TEST
 
-.PHONY: build test test-e2e fmt lint check release-check release-patch release-minor release-major confluence-start confluence-stop confluence-wait confluence-logs confluence-reset confluence-backup confluence-restore
+.PHONY: build test test-e2e fmt lint check nix-check release-check release-patch release-minor release-major confluence-start confluence-stop confluence-wait confluence-logs confluence-reset confluence-backup confluence-restore
 
 build:
 	cargo build --locked
@@ -33,6 +33,10 @@ lint:
 	cargo clippy --locked --all-targets -- -D warnings
 
 check: lint test
+
+# Build the flake package (including its test suite) for the current system.
+nix-check:
+	nix flake check --print-build-logs
 
 release-check:
 	cargo fmt --all --check

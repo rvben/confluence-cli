@@ -49,6 +49,15 @@ jobs:
       - name: Check declared MSRV
         run: cargo check --locked --all-targets
 
+  nix:
+    name: Nix flake
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Build and test the flake package
+        run: make nix-check
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
@@ -72,7 +81,7 @@ jobs:
   all-checks-passed:
     name: All checks passed
     runs-on: ubuntu-latest
-    needs: [lint, test, msrv]
+    needs: [lint, test, msrv, nix]
     if: always()
     steps:
       - name: Verify all checks passed
