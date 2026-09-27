@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.33](https://github.com/rvben/confluence-cli/compare/v0.1.32...v0.1.33) - 2026-09-27
+
+### Fixed
+
+- **deps**: update rustls to 0.23.45 for RUSTSEC-2026-0285 ([bba3916](https://github.com/rvben/confluence-cli/commit/bba3916be96430b9c1f3801eaac6e746b28f6acd))
+
 ## [0.1.32](https://github.com/rvben/confluence-cli/compare/v0.1.31...v0.1.32) - 2026-09-24
 
 ### Added
