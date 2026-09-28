@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   update:
-    uses: rvben/upd/.github/workflows/dependency-health.yml@b4e11a177cabf80ba04c99dc0efd1c69f05af493 # v0.13.1
+    uses: rvben/upd/.github/workflows/dependency-health.yml@2e5d81f51b6266cdae9ad035feb6b2ba9580b2c7 # v0.13.4
     with:
       langs: rust,actions,nix
       lock: true
