@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.35](https://github.com/rvben/confluence-cli/compare/v0.1.34...v0.1.35) - 2026-09-28
+
+### Fixed
+
+- **deps**: pin serial_test to 3.5 to keep MSRV 1.90 while dropping scc ([7ae275b](https://github.com/rvben/confluence-cli/commit/7ae275b3dc0676cf4446c17a2c59205417c88fdd))
+
 ## [0.1.34](https://github.com/rvben/confluence-cli/compare/v0.1.33...v0.1.34) - 2026-09-28
 
 ### Fixed
