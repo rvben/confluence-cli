@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.34](https://github.com/rvben/confluence-cli/compare/v0.1.33...v0.1.34) - 2026-09-28
+
+### Fixed
+
+- **deps**: bump serial_test to 4 to drop unsound scc dependency (RUSTSEC-2026-0205) ([3f48701](https://github.com/rvben/confluence-cli/commit/3f487019aaef91da65de850addd59934e6d9e568))
+
 ## [0.1.33](https://github.com/rvben/confluence-cli/compare/v0.1.32...v0.1.33) - 2026-09-27
 
 ### Fixed
