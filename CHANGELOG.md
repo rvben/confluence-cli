@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Include the bundled macro templates in the Nix source fileset so flake builds can compile the offline `template` command.
+
 ## [0.1.36](https://github.com/rvben/confluence-cli/compare/v0.1.35...v0.1.36) - 2026-10-06
 
 ### Added

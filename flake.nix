@@ -47,6 +47,7 @@
                 ./LICENSE
                 ./assets
                 ./docs
+                ./skills
                 ./src
                 ./tests
               ];
