@@ -20,6 +20,7 @@ include = [
     "assets/**",
     "docs/**",
     "src/**",
+    "skills/confluence/**",
     "tests/**",
 ]
 

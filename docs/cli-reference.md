@@ -61,11 +61,14 @@ Confluence storage XML, specify the representation explicitly:
 ```bash
 confluence page get 123 --show-body -o json
 confluence validate --format storage --body-file body.xml -o json
-confluence page update 123 --format storage --body-file body.xml -o json
+confluence page update 123 --version 7 --format storage --body-file body.xml -o json
 ```
 
 Use the returned `body_storage` as a starting point and keep a local copy before
-editing. Storage bodies are XML fragments with Confluence `ac:` and `ri:`
+editing. Replace `7` with the base version returned by that read; `--version`
+uses the current version, not the next version. A concurrent edit causes a
+conflict rather than allowing the stale candidate to overwrite it.
+Storage bodies are XML fragments with Confluence `ac:` and `ri:`
 elements. Code and noformat macros use `ac:plain-text-body`, normally containing
 CDATA; expand and panel macros use `ac:rich-text-body`. Close every element and
 CDATA section, escape text outside CDATA, and split literal `]]>` inside code
@@ -91,18 +94,50 @@ identify coordinates in the generated storage XML; they are not Markdown
 source coordinates. `--allow-lossy` never bypasses XML validation. Local sync
 `plan` and `apply` check generated storage too.
 
+Start new macro content from the built-in examples:
+
+```bash
+confluence template code > code.xml
+confluence template expand > expand.xml
+confluence template noformat > noformat.xml
+```
+
+`template` always prints raw XML, even with `-o json`. These examples are checked
+by the test suite and are available without network access.
+
+Inspect generated storage when Markdown validation fails:
+
+```bash
+confluence convert --body-file page.md --output-file generated.xml -o json
+```
+
+`convert` is offline and saves the XML atomically before checking its structure.
+On validation failure, it exits 2, prints no success document, and retains the
+artifact. Structured error details include `artifact_saved: true` and `path`,
+along with line and column. On success, JSON includes `valid`, `input_format`,
+`storage_bytes`, and `path`. Existing output files require `--force` to replace;
+input files and their symlink aliases cannot be used as the output. The output's
+parent directory must exist. Conversion errors that prevent rendering do not
+create an artifact. None of these commands bypass validation on remote writes.
+
 If Confluence still returns `Error parsing xhtml`, fix the body locally before
 retrying. Preserve full diagnostics and the CLI status; piping a write through
 `head` can hide failure and truncate the useful parser error:
 
 ```bash
-confluence page update 123 --format storage --body-file body.xml -o json >result.json 2>error.json
-write_exit_code=$?
+if confluence page update 123 --version 7 --format storage --body-file body.xml -o json >result.json 2>error.json; then
+  write_exit_code=0
+else
+  write_exit_code=$?
+fi
 # Inspect result.json and error.json; write_exit_code contains the CLI's process exit code.
 ```
 
 Use read-only commands for connectivity checks. A test body written to an
 existing page replaces its contents and creates a version.
+
+See the [agent workflow](agent-workflow.md) for upgrading, preserving a snapshot,
+and applying a version-safe body edit.
 
 ## Markdown fidelity
 

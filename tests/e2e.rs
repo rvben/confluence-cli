@@ -383,6 +383,57 @@ async fn body_validation_makes_no_requests_and_valid_stdin_reaches_the_server_un
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simulated_cloud_versioned_body_update_preserves_intervening_edits() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().unwrap();
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let snapshot = cfg.run_json(&["page", "get", "100", "--show-body"]);
+        let base_version = first_item(&snapshot, "snapshot")["version"].to_string();
+        cfg.run_json(&[
+            "page",
+            "update",
+            "100",
+            "--version",
+            &base_version,
+            "--format",
+            "storage",
+            "--body",
+            "<p>Intervening edit</p>",
+        ]);
+        let stale = cfg
+            .command()
+            .args([
+                "page",
+                "update",
+                "100",
+                "--version",
+                &base_version,
+                "--format",
+                "storage",
+                "--body",
+                "<p>Stale candidate</p>",
+                "-o",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(stale.status.code(), Some(7));
+        let error: Value = serde_json::from_slice(&stale.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "conflict");
+        let fetched = cfg.run_json(&["page", "get", "100", "--show-body"]);
+        assert_eq!(
+            string_field(first_item(&fetched, "page get"), "body_storage"),
+            "<p>Intervening edit</p>"
+        );
+        assert_eq!(first_item(&fetched, "page get")["version"], 2);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn simulated_cloud_user_can_manage_a_page() {
     let simulator = ConfluenceSimulator::start().await;
     let config_home = TempDir::new().expect("simulator config home");

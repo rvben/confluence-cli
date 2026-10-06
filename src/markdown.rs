@@ -169,6 +169,17 @@ fn storage_to_markdown_fallback(storage: &str) -> String {
 }
 
 pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<ConversionOutput> {
+    let converted = render_markdown_storage(markdown, allow_lossy)?;
+    crate::storage::validate_generated_storage(&converted.storage)?;
+    Ok(converted)
+}
+
+/// Render a diagnostic artifact even if its embedded storage XML is malformed.
+/// Remote write paths must use markdown_to_storage instead.
+pub(crate) fn render_markdown_storage(
+    markdown: &str,
+    allow_lossy: bool,
+) -> Result<ConversionOutput> {
     let (normalized_layouts, layout_fragments) = replace_layout_blocks(markdown, allow_lossy)?;
     let (normalized_macros, macro_fragments) =
         replace_confluence_macro_blocks(&normalized_layouts, allow_lossy)?;
@@ -221,7 +232,6 @@ pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<Conversi
     }
 
     let storage = html_output.trim().to_string();
-    crate::storage::validate_generated_storage(&storage)?;
     Ok(ConversionOutput { storage })
 }
 
@@ -1937,7 +1947,7 @@ fn replace_confluence_macro_blocks(
         normalized.push_str(&markdown[last..full_match.start()]);
         let name = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
         let body_markdown = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
-        let body_storage = markdown_to_storage(body_markdown, allow_lossy)?.storage;
+        let body_storage = render_markdown_storage(body_markdown, allow_lossy)?.storage;
         let idx = fragments.len();
         fragments.push(format!(
             r#"<ac:structured-macro ac:name="{name}"><ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:structured-macro>"#
@@ -1962,7 +1972,7 @@ fn replace_confluence_macro_blocks(
         expanded.push_str(&parameterized[last..full_match.start()]);
         let title = captures.get(1).map(|m| m.as_str().trim());
         let body_markdown = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
-        let body_storage = markdown_to_storage(body_markdown, allow_lossy)?.storage;
+        let body_storage = render_markdown_storage(body_markdown, allow_lossy)?.storage;
         let idx = fragments.len();
         let title_param = title
             .filter(|value| !value.is_empty())
@@ -2356,12 +2366,12 @@ fn parse_rich_text_macro_block(
     let trimmed_body = block_body.trim_end_matches('\n');
     if let Some((header, body_markdown)) = trimmed_body.split_once("\n---\n") {
         let parameters = parse_macro_parameter_lines(header, context)?;
-        let body_storage = markdown_to_storage(body_markdown, allow_lossy)?.storage;
+        let body_storage = render_markdown_storage(body_markdown, allow_lossy)?.storage;
         Ok((parameters, body_storage))
     } else {
         Ok((
             BTreeMap::new(),
-            markdown_to_storage(trimmed_body, allow_lossy)?.storage,
+            render_markdown_storage(trimmed_body, allow_lossy)?.storage,
         ))
     }
 }
@@ -2373,12 +2383,12 @@ fn parse_generic_macro_block(
 ) -> Result<(BTreeMap<String, String>, Option<String>)> {
     let trimmed_body = block_body.trim_end_matches('\n');
     if let Some(body_markdown) = trimmed_body.strip_prefix("---\n") {
-        let body_storage = markdown_to_storage(body_markdown, allow_lossy)?.storage;
+        let body_storage = render_markdown_storage(body_markdown, allow_lossy)?.storage;
         return Ok((BTreeMap::new(), Some(body_storage)));
     }
     if let Some((header, body_markdown)) = trimmed_body.split_once("\n---\n") {
         let parameters = parse_macro_parameter_lines(header, context)?;
-        let body_storage = markdown_to_storage(body_markdown, allow_lossy)?.storage;
+        let body_storage = render_markdown_storage(body_markdown, allow_lossy)?.storage;
         return Ok((parameters, Some(body_storage)));
     }
 
@@ -2506,7 +2516,7 @@ fn parse_layout_section_block(
     let cells_xml = cells
         .into_iter()
         .map(|cell| {
-            let body_storage = markdown_to_storage(&cell, allow_lossy)?.storage;
+            let body_storage = render_markdown_storage(&cell, allow_lossy)?.storage;
             Ok(format!("<ac:layout-cell>{body_storage}</ac:layout-cell>"))
         })
         .collect::<Result<Vec<_>>>()?

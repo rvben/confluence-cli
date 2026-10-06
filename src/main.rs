@@ -17,7 +17,9 @@ use std::io::IsTerminal;
 async fn main() {
     if let Err(error) = cli::run().await {
         let machine = output::machine_readable_errors(
-            std::env::args().skip(1),
+            std::env::args_os()
+                .skip(1)
+                .map(|arg| arg.to_string_lossy().into_owned()),
             std::io::stdout().is_terminal(),
         );
         std::process::exit(output::render_anyhow(&error, machine));

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Confluence"
+  short_description: "Read and edit Confluence pages with validated bodies"
+  default_prompt: "Use $confluence to prepare and validate this Confluence page update."

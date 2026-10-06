@@ -120,6 +120,19 @@ enum Commands {
         after_help = "Checks storage XML structure and known macro body types, not server-side macro behavior. Input defaults to Markdown.\n\nExamples:\n  confluence validate --format storage --body-file body.xml\n  confluence validate --body-file page.md\n  confluence validate --format storage --body-file - -o json"
     )]
     Validate(BodyInput),
+    /// Save a body's storage XML locally for inspection, then validate it
+    #[command(
+        after_help = "No credentials or API requests are needed. If XML validation fails, the saved artifact is retained and the command exits 2; inspect its reported line and column. Existing output files are preserved unless --force is passed.\n\nExamples:\n  confluence convert --body-file page.md --output-file generated.xml\n  confluence convert --body-file - --output-file generated.xml -o json"
+    )]
+    Convert(ConvertArgs),
+    /// Print a known-good Confluence storage macro template without API requests
+    #[command(
+        after_help = "Always writes raw storage XML to stdout; --output does not transform it.\n\nExamples:\n  confluence template code > body.xml\n  confluence template expand > body.xml\n  confluence validate --format storage --body-file body.xml"
+    )]
+    Template {
+        /// Macro template to print
+        kind: StorageTemplate,
+    },
     /// Preview local changes without contacting or modifying Confluence
     #[command(
         after_help = "`plan` reads local Markdown and sidecar state only. Remote drift is checked by `apply`.\n\nExample:\n  confluence plan ./docs --diff"
@@ -654,6 +667,18 @@ struct BodyInput {
 }
 
 #[derive(Args, Debug)]
+struct ConvertArgs {
+    #[command(flatten)]
+    body: BodyInput,
+    /// Destination for the generated storage XML; parent directory must exist
+    #[arg(long)]
+    output_file: PathBuf,
+    /// Replace an existing output file; the input file is never overwritten
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args, Debug)]
 struct PageWriteContentArgs {
     /// New page title
     title: String,
@@ -918,6 +943,23 @@ enum BodyFormat {
     Storage,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum StorageTemplate {
+    Code,
+    Expand,
+    Noformat,
+}
+
+impl StorageTemplate {
+    fn storage(self) -> &'static str {
+        match self {
+            Self::Code => include_str!("../skills/confluence/assets/code.xml"),
+            Self::Expand => include_str!("../skills/confluence/assets/expand.xml"),
+            Self::Noformat => include_str!("../skills/confluence/assets/noformat.xml"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct DoctorReport {
     config_path: String,
@@ -952,7 +994,11 @@ struct DoctorSummary {
 }
 
 pub async fn run() -> Result<()> {
-    let raw_args = std::env::args().collect::<Vec<_>>();
+    // Argument paths may be non-UTF-8. Clap parses the original OsStrings;
+    // these copies are used only to choose help/error output behavior.
+    let raw_args = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
     if raw_args.len() == 1 {
         let mut command = Cli::command();
         command.print_long_help()?;
@@ -1033,6 +1079,11 @@ pub async fn run() -> Result<()> {
                 json!({"valid": true, "input_format": body.format, "storage_bytes": storage.len()}),
                 "Body passed local storage validation (server acceptance is not checked)",
             )
+        }
+        Commands::Convert(args) => handle_convert(args, output),
+        Commands::Template { kind } => {
+            io::stdout().write_all(kind.storage().as_bytes())?;
+            Ok(())
         }
         Commands::Plan(args) => {
             let show_diff = args.diff;
@@ -2520,6 +2571,100 @@ fn read_body_storage(input: &BodyInput) -> Result<String> {
             Ok(raw)
         }
     }
+}
+
+fn handle_convert(args: ConvertArgs, output: OutputFormat) -> Result<()> {
+    let artifact_path = args.output_file.to_str().ok_or_else(|| {
+        crate::output::typed_error_with_hint(
+            crate::output::ErrorKind::InvalidInput,
+            "conversion output path is not valid UTF-8",
+            "Choose a UTF-8 output path so artifact locations can be reported in JSON.",
+        )
+    })?;
+    if let Some(input) = &args.body.body_file
+        && input != Path::new("-")
+        && let (Ok(source), Ok(destination)) =
+            (fs::canonicalize(input), fs::canonicalize(&args.output_file))
+        && source == destination
+    {
+        return Err(crate::output::typed_error_with_hint(
+            crate::output::ErrorKind::InvalidInput,
+            "conversion output must differ from the input file",
+            "Choose a separate --output-file to preserve the source document.",
+        ));
+    }
+    if !args.force && args.output_file.exists() {
+        return Err(crate::output::typed_error_with_hint(
+            crate::output::ErrorKind::InvalidInput,
+            format!("output file already exists: {}", args.output_file.display()),
+            "Choose a new output path, or pass --force to replace only the output file.",
+        ));
+    }
+    let raw = read_body_text(&args.body)?;
+    let storage = match args.body.format {
+        BodyFormat::Markdown => {
+            crate::markdown::render_markdown_storage(&raw, args.body.allow_lossy)?.storage
+        }
+        BodyFormat::Storage => raw,
+    };
+    let parent = args
+        .output_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // Persist atomically. The no-clobber operation also handles files created
+    // after the existence check, and --force replaces symlinks rather than
+    // following them and overwriting an unrelated target.
+    let save = || -> Result<()> {
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(storage.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        if args.force {
+            temporary.persist(&args.output_file)?;
+        } else {
+            temporary.persist_noclobber(&args.output_file)?;
+        }
+        Ok(())
+    };
+    save().map_err(|error| {
+        crate::output::typed_error_with_hint(
+            crate::output::ErrorKind::InvalidInput,
+            format!(
+                "could not save storage XML to {}: {error}",
+                args.output_file.display()
+            ),
+            "Choose a writable output path whose parent directory exists.",
+        )
+    })?;
+    let validation = match args.body.format {
+        BodyFormat::Markdown => crate::storage::validate_generated_storage(&storage),
+        BodyFormat::Storage => crate::storage::validate_storage(&storage),
+    };
+    let validation =
+        validation.map_err(|error| match error.downcast::<crate::output::CliError>() {
+            Ok(mut error) => {
+                if let Some(details) = &mut error.details {
+                    details["artifact_saved"] = json!(true);
+                    details["path"] = json!(artifact_path);
+                }
+                error.into()
+            }
+            Err(error) => error,
+        });
+    validation.with_context(|| {
+        format!(
+            "storage XML saved to {} for inspection",
+            args.output_file.display()
+        )
+    })?;
+    print_status(
+        output,
+        json!({"valid": true, "input_format": args.body.format, "storage_bytes": storage.len(), "path": artifact_path}),
+        &format!(
+            "Saved locally validated storage XML to {}",
+            args.output_file.display()
+        ),
+    )
 }
 
 /// Read and validate write bodies before creating a provider or making requests.

@@ -114,8 +114,8 @@ confluence apply ./docs/parent-page
 Before writing a hand-edited storage body, check it offline:
 
 ```bash
+confluence template expand > body.xml
 confluence validate --format storage --body-file body.xml
-confluence page update 123 --format storage --body-file body.xml
 ```
 
 `validate` needs no credentials and makes no API requests. Writes also validate
@@ -124,6 +124,14 @@ body mismatches before contacting Confluence. Markdown input, including embedded
 storage blocks, goes through the same checks after conversion. See
 [storage-format guidance](docs/cli-reference.md#writing-storage-format-bodies)
 for the validation limits and error-recovery workflow.
+
+To inspect XML generated from Markdown, run
+`confluence convert --body-file page.md --output-file generated.xml`. The saved
+artifact remains available if validation fails. Ready-to-use code, expand, and
+noformat templates are built into the CLI. Agents can use the bundled
+[Confluence skill](skills/confluence/SKILL.md); the
+[upgrade and editing workflow](docs/agent-workflow.md) explains installation,
+preserving the original body, and updating against its base version.
 
 ## Read and explore
 
@@ -255,6 +263,7 @@ Reading, browsing, direct updates, and Markdown publishing are all first-class:
 | Content | `page move\|create\|update\|delete`, `blog create\|update\|delete` |
 | Page data | `attachment`, `label`, `comment`, and `property` command groups |
 | Markdown | `pull page\|tree\|space`, `plan`, `tui`, `apply` |
+| Body authoring | `validate`, `convert`, `template code\|expand\|noformat` (offline) |
 | Tooling | `config show\|path`, `doctor`, `completions`, `schema` |
 
 On a terminal, `--output auto` produces readable text. When piped, data

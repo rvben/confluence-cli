@@ -11,6 +11,17 @@ Trusted Publishing.
 
 ## Create a release
 
+To prepare and review a release locally before publication:
+
+```sh
+vership bump patch --prepare
+```
+
+This runs the configured release checks and creates the release commit without
+tagging or pushing. Review the version and changelog before authorizing public
+actions. Then use `vership release` to publish the prepared on-disk version; it
+must not be bumped a second time.
+
 Start from a clean, up-to-date `main` branch and run:
 
 ```sh

@@ -1,0 +1,12 @@
+<ac:structured-macro ac:name="expand" ac:schema-version="1">
+  <ac:parameter ac:name="title">Details</ac:parameter>
+  <ac:rich-text-body>
+    <p>Replace this paragraph with the content to expand.</p>
+    <ac:structured-macro ac:name="panel" ac:schema-version="1">
+      <ac:parameter ac:name="title">Context</ac:parameter>
+      <ac:rich-text-body>
+        <p>Use rich-text-body for formatted content and nested macros.</p>
+      </ac:rich-text-body>
+    </ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>

@@ -477,6 +477,10 @@ fn update_v1_content(state: &mut SimulatorState, id: &str, request: &Request) ->
     let Some(content) = state.content.get_mut(id) else {
         return not_found();
     };
+    let version = match next_content_version(&body, content.version) {
+        Ok(version) => version,
+        Err(response) => return *response,
+    };
     content.content_type = json_string(&body, "type");
     content.title = json_string(&body, "title");
     content.status = json_string(&body, "status");
@@ -487,10 +491,7 @@ fn update_v1_content(state: &mut SimulatorState, id: &str, request: &Request) ->
         .and_then(|ancestor| ancestor.get("id"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    content.version = body
-        .pointer("/version/number")
-        .and_then(Value::as_u64)
-        .unwrap_or(content.version + 1);
+    content.version = version;
     content.body_storage = body
         .pointer("/body/storage/value")
         .and_then(Value::as_str)
@@ -735,22 +736,38 @@ fn update_page(state: &mut SimulatorState, id: &str, request: &Request) -> Respo
     let Some(content) = state.content.get_mut(id) else {
         return not_found();
     };
+    let version = match next_content_version(&body, content.version) {
+        Ok(version) => version,
+        Err(response) => return *response,
+    };
     content.title = json_string(&body, "title");
     content.status = json_string(&body, "status");
     content.parent_id = body
         .get("parentId")
         .and_then(Value::as_str)
         .map(str::to_string);
-    content.version = body
-        .pointer("/version/number")
-        .and_then(Value::as_u64)
-        .unwrap_or(content.version + 1);
+    content.version = version;
     content.body_storage = body
         .pointer("/body/value")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
     v2_page_response(content)
+}
+
+fn next_content_version(body: &Value, current: u64) -> Result<u64, Box<ResponseTemplate>> {
+    let Some(version) = body.pointer("/version/number").and_then(Value::as_u64) else {
+        return Err(Box::new(bad_request(
+            "a content update requires a version number",
+        )));
+    };
+    if current.checked_add(1) != Some(version) {
+        return Err(Box::new(ResponseTemplate::new(409).set_body_json(json!({
+            "statusCode": 409,
+            "message": "Version conflict: update must use the next version"
+        }))));
+    }
+    Ok(version)
 }
 
 fn json_string(body: &Value, key: &str) -> String {

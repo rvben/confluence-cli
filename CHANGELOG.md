@@ -7,11 +7,14 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - Offline `validate` command for Markdown and Confluence storage bodies, with stdin support and structured errors carrying line and column.
+- Offline `convert` command saves generated storage XML for inspection, retaining the artifact and reporting its path if validation fails. Existing outputs require `--force`, and source files cannot be overwritten.
+- Built-in code, expand, and noformat macro templates, plus a bundled Confluence agent skill covering storage authoring, version-safe updates, and bounded write-failure recovery.
 - Automatic storage validation before page, blog, and comment body writes, plus checks on generated sync content. Malformed XML, broken CDATA, duplicate macro bodies, and known macro body type mismatches fail locally without submitting the body.
 
 ### Fixed
 
 - Invalid or unreadable body files return `invalid_input` (exit 2).
+- Non-UTF-8 argument paths no longer panic during error-output selection; conversion rejects unreportable output paths before creating artifacts.
 
 ## [0.1.35](https://github.com/rvben/confluence-cli/compare/v0.1.34...v0.1.35) - 2026-09-28
 

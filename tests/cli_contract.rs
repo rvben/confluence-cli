@@ -643,6 +643,242 @@ fn sync_plan_rejects_malformed_embedded_storage_locally() {
 }
 
 #[test]
+fn offline_conversion_saves_valid_xml_and_reports_the_artifact() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("page.md");
+    let artifact = root.path().join("generated.xml");
+    std::fs::write(&source, "# Example\n\nLiteral & text").unwrap();
+    let output = confluence(&[
+        "--profile",
+        "missing",
+        "convert",
+        "--body-file",
+        source.to_str().unwrap(),
+        "--output-file",
+        artifact.to_str().unwrap(),
+        "-o",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let saved = std::fs::read_to_string(&artifact).unwrap();
+    assert!(saved.contains("<h1>Example</h1>"));
+    assert!(saved.contains("Literal &amp; text"));
+    assert_eq!(result["path"], artifact.to_str().unwrap());
+    assert_eq!(result["storage_bytes"], saved.len());
+    assert_eq!(result["valid"], true);
+    assert!(
+        confluence(&[
+            "validate",
+            "--format",
+            "storage",
+            "--body-file",
+            artifact.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn conversion_retains_invalid_xml_for_inspection_even_inside_nested_macros() {
+    for markdown in [
+        "```confluence-storage\n<p></wrong>\n```",
+        ":::confluence-expand Details\n```confluence-storage\n<p></wrong>\n```\n:::",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("generated.xml");
+        let output = confluence(&[
+            "convert",
+            "--body",
+            markdown,
+            "--output-file",
+            artifact.to_str().unwrap(),
+            "-o",
+            "json",
+        ]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "invalid_input");
+        assert_eq!(error["error"]["details"]["artifact_saved"], true);
+        assert_eq!(
+            error["error"]["details"]["path"],
+            artifact.to_str().unwrap()
+        );
+        assert!(
+            std::fs::read_to_string(&artifact)
+                .unwrap()
+                .contains("<p></wrong>")
+        );
+    }
+}
+
+#[test]
+fn conversion_preserves_existing_output_and_never_overwrites_its_input() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("page.md");
+    let artifact = root.path().join("generated.xml");
+    std::fs::write(&source, "Source").unwrap();
+    std::fs::write(&artifact, "Previous output").unwrap();
+    let args = [
+        "convert",
+        "--body-file",
+        source.to_str().unwrap(),
+        "--output-file",
+        artifact.to_str().unwrap(),
+        "-o",
+        "json",
+    ];
+    assert_eq!(confluence(&args).status.code(), Some(2));
+    assert_eq!(
+        std::fs::read_to_string(&artifact).unwrap(),
+        "Previous output"
+    );
+    let mut force_args = args.to_vec();
+    force_args.push("--force");
+    assert!(confluence(&force_args).status.success());
+    assert_eq!(std::fs::read_to_string(&artifact).unwrap(), "<p>Source</p>");
+    let same_file = confluence(&[
+        "convert",
+        "--body-file",
+        source.to_str().unwrap(),
+        "--output-file",
+        source.to_str().unwrap(),
+        "--force",
+    ]);
+    assert_eq!(same_file.status.code(), Some(2));
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "Source");
+}
+
+#[cfg(unix)]
+#[test]
+fn conversion_refuses_input_aliases_and_replaces_output_symlinks_without_following_them() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.md");
+    let alias = root.path().join("alias.xml");
+    let unrelated = root.path().join("unrelated.xml");
+    std::fs::write(&source, "Source").unwrap();
+    symlink(&source, &alias).unwrap();
+    let args = [
+        "convert",
+        "--body-file",
+        source.to_str().unwrap(),
+        "--output-file",
+        alias.to_str().unwrap(),
+        "--force",
+    ];
+    assert_eq!(confluence(&args).status.code(), Some(2));
+    std::fs::remove_file(&alias).unwrap();
+    std::fs::write(&unrelated, "Unrelated data").unwrap();
+    symlink(&unrelated, &alias).unwrap();
+    assert!(confluence(&args).status.success());
+    assert_eq!(
+        std::fs::read_to_string(&unrelated).unwrap(),
+        "Unrelated data"
+    );
+    assert!(
+        !std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn conversion_file_failures_leave_no_success_document_or_temporary_artifacts() {
+    let root = tempfile::tempdir().unwrap();
+    let artifact = root.path().join("missing-parent/generated.xml");
+    let output = confluence(&[
+        "convert",
+        "--body",
+        "Text",
+        "--output-file",
+        artifact.to_str().unwrap(),
+        "-o",
+        "json",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!artifact.exists());
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_conversion_paths_fail_cleanly_before_writing() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = tempfile::tempdir().unwrap();
+    let artifact = root
+        .path()
+        .join(std::ffi::OsString::from_vec(b"invalid-\xff.xml".to_vec()));
+    let output = Command::new(env!("CARGO_BIN_EXE_confluence"))
+        .args(["convert", "--body", "Text", "--output-file"])
+        .arg(&artifact)
+        .args(["-o", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!artifact.exists());
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "invalid_input");
+}
+
+#[test]
+fn templates_are_valid_storage_and_code_preserves_literal_cdata_terminators() {
+    for template in ["code", "expand", "noformat"] {
+        let output = confluence(&["--profile", "missing", "template", template, "-o", "json"]);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let storage = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            confluence(&["validate", "--format", "storage", "--body", &storage])
+                .status
+                .success()
+        );
+        if template == "code" {
+            let wrapped = format!("<root xmlns:ac='http://atlassian.com/content'>{storage}</root>");
+            let parsed = roxmltree::Document::parse(&wrapped).unwrap();
+            let body = parsed
+                .descendants()
+                .find(|node| node.has_tag_name(("http://atlassian.com/content", "plain-text-body")))
+                .unwrap();
+            let code: String = body.children().filter_map(|node| node.text()).collect();
+            let value: serde_json::Value = serde_json::from_str(&code).unwrap();
+            assert_eq!(value["cdata_terminator"], "]]>");
+            assert_eq!(value["message"], "Literal <xml> & text");
+        }
+    }
+}
+
+#[test]
+fn conversion_and_template_schemas_describe_local_artifacts() {
+    let output = confluence(&["schema", "--command", "convert"]);
+    let schema: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let command = &schema["commands"][0];
+    assert_eq!(command["mutating"], true);
+    assert_eq!(command["partial_success_possible"], true);
+    assert_eq!(command["overwrites_when"], serde_json::json!(["--force"]));
+    let output = confluence(&["schema", "--command", "template"]);
+    let schema: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let command = &schema["commands"][0];
+    assert_eq!(command["mutating"], false);
+    assert_eq!(command["output_kind"], "opaque");
+    assert_eq!(command["media_type"], "application/xml");
+}
+
+#[test]
 fn short_output_flag_controls_parse_error_rendering() {
     let text = confluence(&["-o", "text", "not-a-command"]);
     assert_eq!(text.status.code(), Some(2));

@@ -56,7 +56,7 @@ fn arg_to_json(arg: &clap::Arg) -> Value {
 }
 
 fn is_mutating(path: &str) -> bool {
-    if path.starts_with("pull ") || path == "attachment download" {
+    if path.starts_with("pull ") || path == "attachment download" || path == "convert" {
         return true;
     }
     let mutating_verbs = [
@@ -290,6 +290,12 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "valid", "type": "boolean"}),
             json!({"name": "input_format", "type": "string"}),
             json!({"name": "storage_bytes", "type": "integer"}),
+        ],
+        "convert" => vec![
+            json!({"name": "valid", "type": "boolean"}),
+            json!({"name": "input_format", "type": "string"}),
+            json!({"name": "storage_bytes", "type": "integer"}),
+            json!({"name": "path", "type": "string"}),
         ],
 
         "attachment download" => vec![
@@ -545,10 +551,17 @@ fn enrich_v03(document: &mut Value) {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if name == "completions" {
+        if name == "completions" || name == "template" {
             object.remove("output_fields");
             object.insert("output_kind".into(), json!("opaque"));
-            object.insert("media_type".into(), json!("text/plain"));
+            object.insert(
+                "media_type".into(),
+                json!(if name == "template" {
+                    "application/xml"
+                } else {
+                    "text/plain"
+                }),
+            );
             continue;
         }
         let unbounded = LIST_COMMANDS.contains(&name.as_str());
@@ -582,6 +595,11 @@ fn enrich_v03(document: &mut Value) {
         if name == "attachment upload" {
             object.insert("destructive_when".into(), json!(["--replace"]));
             object.insert("requires_confirmation_when".into(), json!(["--replace"]));
+            object.insert("partial_success_possible".into(), json!(true));
+        }
+        if name == "convert" {
+            object.insert("overwrites_when".into(), json!(["--force"]));
+            object.insert("destructive_when".into(), json!(["--force"]));
             object.insert("partial_success_possible".into(), json!(true));
         }
         if name.starts_with("pull ") {
