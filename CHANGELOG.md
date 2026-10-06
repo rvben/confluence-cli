@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.36](https://github.com/rvben/confluence-cli/compare/v0.1.35...v0.1.36) - 2026-10-06
+
 ### Added
 
 - Offline `validate` command for Markdown and Confluence storage bodies, with stdin support and structured errors carrying line and column.
