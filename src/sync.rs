@@ -1212,12 +1212,14 @@ fn render_body_storage(
     let rewritten_markdown =
         rewrite_macro_page_references(&doc.body_markdown, &doc.directory, link_index);
     let converted = markdown_to_storage(&rewritten_markdown, allow_lossy)?;
-    Ok(rewrite_local_links_to_remote(
+    let storage = rewrite_local_links_to_remote(
         &converted.storage,
         &doc.directory,
         link_index,
         web_path_prefix.as_ref(),
-    ))
+    );
+    crate::storage::validate_generated_storage(&storage)?;
+    Ok(storage)
 }
 
 fn rewrite_macro_page_references(

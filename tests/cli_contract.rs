@@ -430,6 +430,219 @@ fn every_body_command_reaches_normal_error_handling_instead_of_panicking() {
 }
 
 #[test]
+fn malformed_storage_is_rejected_before_profile_resolution_for_every_body_command() {
+    for command in [
+        vec!["page", "create", "Title", "SPACE"],
+        vec!["page", "update", "123"],
+        vec!["blog", "create", "Title", "SPACE"],
+        vec!["blog", "update", "123"],
+        vec!["comment", "add", "123"],
+        vec!["comment", "update", "456"],
+    ] {
+        let mut args = command;
+        args.extend(["--format", "storage", "--body", "<p></wrong>", "-o", "json"]);
+        assert_storage_error(&confluence(&args));
+    }
+}
+
+#[test]
+fn storage_body_file_is_validated_locally() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("body.html");
+    std::fs::write(&path, "<ac:plain-text-body><![CDATA[broken").unwrap();
+    let output = confluence(&[
+        "page",
+        "update",
+        "123",
+        "--format",
+        "storage",
+        "--body-file",
+        path.to_str().unwrap(),
+        "-o",
+        "json",
+    ]);
+    assert_storage_error(&output);
+}
+
+#[test]
+fn storage_stdin_is_validated_locally() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_confluence"))
+        .args([
+            "page",
+            "update",
+            "123",
+            "--format",
+            "storage",
+            "--body-file",
+            "-",
+            "-o",
+            "json",
+        ])
+        .env("HOME", temp.path())
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env_remove("CONFLUENCE_PROFILE")
+        .env_remove("CONFLUENCE_DOMAIN")
+        .env_remove("CONFLUENCE_API_TOKEN")
+        .env_remove("CONFLUENCE_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"<p></wrong>")
+        .unwrap();
+    assert_storage_error(&child.wait_with_output().unwrap());
+}
+
+fn assert_storage_error(output: &Output) {
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "invalid_input");
+    assert_eq!(error["error"]["exit_code"], 2);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid Confluence storage body")
+    );
+    assert!(error["error"]["details"]["line"].as_u64().unwrap() >= 1);
+    assert!(error["error"]["details"]["column"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn offline_validate_reports_local_success_without_resolving_a_profile() {
+    for (format, body, storage_bytes) in [
+        ("storage", "<p>&nbsp;</p>", 13),
+        ("markdown", "Text", 11),
+        ("storage", "", 0),
+    ] {
+        let output = confluence(&[
+            "--profile",
+            "missing",
+            "validate",
+            "--format",
+            format,
+            "--body",
+            body,
+            "-o",
+            "json",
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"valid": true, "input_format": format, "storage_bytes": storage_bytes})
+        );
+    }
+    let text = confluence(&["validate", "--body", "Text", "-o", "text"]);
+    assert!(text.status.success());
+    assert!(String::from_utf8_lossy(&text.stdout).contains("server acceptance is not checked"));
+}
+
+#[test]
+fn validate_missing_input_and_invalid_files_return_input_errors() {
+    let home = tempfile::tempdir().unwrap();
+    let bad_file = home.path().join("invalid-utf8.xml");
+    std::fs::write(&bad_file, [0xff]).unwrap();
+    for args in [
+        vec!["validate", "-o", "json"],
+        vec![
+            "validate",
+            "--body-file",
+            bad_file.to_str().unwrap(),
+            "-o",
+            "json",
+        ],
+        vec![
+            "validate",
+            "--body-file",
+            "missing-body-file.xml",
+            "-o",
+            "json",
+        ],
+    ] {
+        let output = confluence(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "invalid_input");
+    }
+}
+
+#[test]
+fn malformed_markdown_storage_cannot_bypass_validation_with_allow_lossy() {
+    for command in [vec!["validate"], vec!["page", "update", "123"]] {
+        let mut args = command;
+        args.extend([
+            "--allow-lossy",
+            "--body",
+            "```confluence-storage\n<p></wrong>\n```",
+            "-o",
+            "json",
+        ]);
+        let output = confluence(&args);
+        assert_eq!(output.status.code(), Some(2));
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "invalid_input");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("generated from Markdown")
+        );
+        assert_eq!(error["error"]["details"]["input_format"], "markdown");
+    }
+}
+
+#[test]
+fn validate_schema_describes_the_runtime_result_and_read_only_effect() {
+    let output = confluence(&["schema", "--command", "validate"]);
+    assert!(output.status.success());
+    let schema: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let command = &schema["commands"][0];
+    assert_eq!(command["name"], "validate");
+    assert_eq!(command["mutating"], false);
+    assert_eq!(command["effects"], "read_only");
+    let fields = command["output_fields"].as_array().unwrap();
+    for name in ["valid", "input_format", "storage_bytes"] {
+        assert!(fields.iter().any(|field| field["name"] == name));
+    }
+}
+
+#[test]
+fn sync_plan_rejects_malformed_embedded_storage_locally() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("index.md"),
+        "---\ntitle: Test\ntype: page\nlabels: []\nstatus: current\nproperties: {}\n---\n\n```confluence-storage\n<ac:structured-macro ac:name='expand'>\n```\n").unwrap();
+    std::fs::write(root.path().join(".confluence.json"), "{}").unwrap();
+    let output = confluence(&["plan", root.path().to_str().unwrap(), "-o", "json"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "invalid_input");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("generated from Markdown")
+    );
+}
+
+#[test]
 fn short_output_flag_controls_parse_error_rendering() {
     let text = confluence(&["-o", "text", "not-a-command"]);
     assert_eq!(text.status.code(), Some(2));

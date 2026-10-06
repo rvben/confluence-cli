@@ -115,6 +115,11 @@ enum Commands {
     },
     /// Check configuration, credentials, connectivity, and local sync data
     Doctor(DoctorArgs),
+    /// Validate a body locally without credentials, API requests, or writes
+    #[command(
+        after_help = "Checks storage XML structure and known macro body types, not server-side macro behavior. Input defaults to Markdown.\n\nExamples:\n  confluence validate --format storage --body-file body.xml\n  confluence validate --body-file page.md\n  confluence validate --format storage --body-file - -o json"
+    )]
+    Validate(BodyInput),
     /// Preview local changes without contacting or modifying Confluence
     #[command(
         after_help = "`plan` reads local Markdown and sidecar state only. Remote drift is checked by `apply`.\n\nExample:\n  confluence plan ./docs --diff"
@@ -631,13 +636,16 @@ enum PropertyCommand {
 
 #[derive(Args, Debug, Clone)]
 struct BodyInput {
+    /// Prepared once before profile resolution, including stdin inputs.
+    #[arg(skip)]
+    prepared_storage: Option<String>,
     /// Body text; process-visible, so prefer --body-file for sensitive content
     #[arg(long)]
     body: Option<String>,
     /// Read body text from a file, or from stdin when PATH is -
     #[arg(long, conflicts_with = "body")]
     body_file: Option<PathBuf>,
-    /// Input representation: Markdown is converted to Confluence storage format
+    /// Input representation: Markdown is converted; storage XML is validated locally
     #[arg(long, value_enum, default_value_t = BodyFormat::Markdown)]
     format: BodyFormat,
     /// Allow raw Confluence XML to be escaped or degraded instead of refusing conversion
@@ -903,7 +911,8 @@ impl ProviderArg {
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum BodyFormat {
     Markdown,
     Storage,
@@ -950,7 +959,7 @@ pub async fn run() -> Result<()> {
         println!();
         return Ok(());
     }
-    let cli = Cli::try_parse().unwrap_or_else(|err| {
+    let mut cli = Cli::try_parse().unwrap_or_else(|err| {
         use clap::error::ErrorKind;
         match err.kind() {
             // Let clap handle help and version display normally (exit 0)
@@ -987,6 +996,7 @@ pub async fn run() -> Result<()> {
         cli.output == OutputArg::Json || (cli.json && cli.output == OutputArg::Auto);
     crate::output::configure(cli.quiet, cli.no_color, output.is_json());
     let yes = cli.yes;
+    prepare_command_body(&mut cli.command)?;
 
     match cli.command {
         Commands::Init => config::init(output, cli.profile.as_deref()).await,
@@ -1004,16 +1014,10 @@ pub async fn run() -> Result<()> {
             handle_search(&*provider, args, output).await
         }
         Commands::Page { command } => {
-            if let PageCommand::Update(args) = &command {
-                validate_page_update(args)?;
-            }
             let provider = provider_from_profile(cli.profile.as_deref())?;
             handle_page(&*provider, command, output, yes).await
         }
         Commands::Blog { command } => {
-            if let BlogCommand::Update(args) = &command {
-                validate_blog_update(args)?;
-            }
             let provider = provider_from_profile(cli.profile.as_deref())?;
             handle_blog(&*provider, command, output, yes).await
         }
@@ -1022,6 +1026,14 @@ pub async fn run() -> Result<()> {
             handle_pull(&*provider, command, output).await
         }
         Commands::Doctor(args) => handle_doctor(cli.profile.as_deref(), args, output).await,
+        Commands::Validate(body) => {
+            let storage = read_body_storage(&body)?;
+            print_status(
+                output,
+                json!({"valid": true, "input_format": body.format, "storage_bytes": storage.len()}),
+                "Body passed local storage validation (server acceptance is not checked)",
+            )
+        }
         Commands::Plan(args) => {
             let show_diff = args.diff;
             let plan =
@@ -2497,11 +2509,53 @@ async fn handle_property(
 }
 
 fn read_body_storage(input: &BodyInput) -> Result<String> {
+    if let Some(storage) = &input.prepared_storage {
+        return Ok(storage.clone());
+    }
     let raw = read_body_text(input)?;
     match input.format {
         BodyFormat::Markdown => Ok(markdown_to_storage(&raw, input.allow_lossy)?.storage),
-        BodyFormat::Storage => Ok(raw),
+        BodyFormat::Storage => {
+            crate::storage::validate_storage(&raw)?;
+            Ok(raw)
+        }
     }
+}
+
+/// Read and validate write bodies before creating a provider or making requests.
+/// Cache the result so stdin is consumed only once.
+fn prepare_command_body(command: &mut Commands) -> Result<()> {
+    let body = match command {
+        Commands::Page {
+            command: PageCommand::Create(args),
+        } => &mut args.body,
+        Commands::Blog {
+            command: BlogCommand::Create(args),
+        } => &mut args.body,
+        Commands::Page {
+            command: PageCommand::Update(args),
+        } => {
+            validate_page_update(args)?;
+            &mut args.body
+        }
+        Commands::Blog {
+            command: BlogCommand::Update(args),
+        } => {
+            validate_blog_update(args)?;
+            &mut args.body
+        }
+        Commands::Comment {
+            command: CommentCommand::Add { body, .. },
+        }
+        | Commands::Comment {
+            command: CommentCommand::Update { body, .. },
+        } => body,
+        _ => return Ok(()),
+    };
+    if body.is_provided() {
+        body.prepared_storage = Some(read_body_storage(body)?);
+    }
+    Ok(())
 }
 
 fn read_body_text(input: &BodyInput) -> Result<String> {
@@ -2511,11 +2565,22 @@ fn read_body_text(input: &BodyInput) -> Result<String> {
     if let Some(path) = &input.body_file {
         if path == Path::new("-") {
             let mut buffer = String::new();
-            io::stdin().read_to_string(&mut buffer)?;
+            io::stdin().read_to_string(&mut buffer).map_err(|error| {
+                crate::output::typed_error_with_hint(
+                    crate::output::ErrorKind::InvalidInput,
+                    format!("failed to read body from stdin: {error}"),
+                    "Provide UTF-8 body text on stdin, or use --body-file PATH.",
+                )
+            })?;
             return Ok(buffer);
         }
-        return fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()));
+        return fs::read_to_string(path).map_err(|error| {
+            crate::output::typed_error_with_hint(
+                crate::output::ErrorKind::InvalidInput,
+                format!("failed to read body file {}: {error}", path.display()),
+                "Provide a readable UTF-8 body file, or use --body-file - to read stdin.",
+            )
+        });
     }
     Err(crate::output::typed_error_with_hint(
         crate::output::ErrorKind::InvalidInput,
@@ -3318,6 +3383,33 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn prepared_storage_retains_exact_input_without_rereading_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("body.xml");
+        let storage = "<p>&nbsp; &#160;</p><p>Second paragraph</p>";
+        fs::write(&path, storage).unwrap();
+        let mut cli = Cli::parse_from([
+            "confluence",
+            "page",
+            "update",
+            "123",
+            "--format",
+            "storage",
+            "--body-file",
+            path.to_str().unwrap(),
+        ]);
+        prepare_command_body(&mut cli.command).unwrap();
+        fs::remove_file(&path).unwrap();
+        let Commands::Page {
+            command: PageCommand::Update(args),
+        } = cli.command
+        else {
+            panic!("expected page update");
+        };
+        assert_eq!(read_body_storage(&args.body).unwrap(), storage);
     }
 
     #[test]

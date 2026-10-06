@@ -53,6 +53,57 @@ confluence schema --command 'page get'
 
 The response contract is versioned independently in the schema.
 
+## Writing storage-format bodies
+
+Body input defaults to Markdown, regardless of the filename. To submit raw
+Confluence storage XML, specify the representation explicitly:
+
+```bash
+confluence page get 123 --show-body -o json
+confluence validate --format storage --body-file body.xml -o json
+confluence page update 123 --format storage --body-file body.xml -o json
+```
+
+Use the returned `body_storage` as a starting point and keep a local copy before
+editing. Storage bodies are XML fragments with Confluence `ac:` and `ri:`
+elements. Code and noformat macros use `ac:plain-text-body`, normally containing
+CDATA; expand and panel macros use `ac:rich-text-body`. Close every element and
+CDATA section, escape text outside CDATA, and split literal `]]>` inside code
+across adjacent CDATA sections.
+
+`validate` is entirely offline and uses the same body checks as writes. It needs
+no profile or credentials, accepts `--body`, `--body-file`, or stdin, and returns
+`valid`, `input_format`, and `storage_bytes` in JSON mode. Input still defaults
+to Markdown: `confluence validate --body-file page.md` checks the converted
+storage, including any embedded `confluence-storage` blocks.
+
+Page, blog, and comment body writes validate storage and converted Markdown locally
+before profile resolution or API requests. Malformed XML and known macro body
+type mismatches return `invalid_input` (exit 2), with body line and column in the
+error details. Multiple top-level elements and implicit Confluence namespaces
+are supported. Validation leaves named entity resolution and custom macro
+semantics to Confluence; passing these checks does not guarantee server acceptance.
+`--body-file -` also supports storage input from stdin.
+
+Duplicate macro bodies and XML elements inside plain-text macro bodies are
+also rejected. Empty bodies and custom macros are supported. Markdown errors
+identify coordinates in the generated storage XML; they are not Markdown
+source coordinates. `--allow-lossy` never bypasses XML validation. Local sync
+`plan` and `apply` check generated storage too.
+
+If Confluence still returns `Error parsing xhtml`, fix the body locally before
+retrying. Preserve full diagnostics and the CLI status; piping a write through
+`head` can hide failure and truncate the useful parser error:
+
+```bash
+confluence page update 123 --format storage --body-file body.xml -o json >result.json 2>error.json
+write_exit_code=$?
+# Inspect result.json and error.json; write_exit_code contains the CLI's process exit code.
+```
+
+Use read-only commands for connectivity checks. A test body written to an
+existing page replaces its contents and creates a version.
+
 ## Markdown fidelity
 
 Confluence storage format remains the remote canonical representation;

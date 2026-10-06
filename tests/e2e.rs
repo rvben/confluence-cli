@@ -327,6 +327,62 @@ fn binary_discovery_finds_the_declared_confluence_executable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_validation_makes_no_requests_and_valid_stdin_reaches_the_server_unchanged() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().unwrap();
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    let invalid_cfg = cfg.clone();
+    tokio::task::spawn_blocking(move || {
+        for command in [
+            vec!["page", "create", "Title", "TEST"],
+            vec!["page", "update", "100"],
+            vec!["blog", "create", "Title", "TEST"],
+            vec!["blog", "update", "100"],
+            vec!["comment", "add", "100"],
+            vec!["comment", "update", "100"],
+        ] {
+            for (format, body) in [
+                ("storage", "<p></wrong>"),
+                ("markdown", "```confluence-storage\n<p></wrong>\n```"),
+            ] {
+                let mut args = command.clone();
+                args.extend(["--format", format, "--body", body, "-o", "json"]);
+                let output = invalid_cfg.command().args(&args).output().unwrap();
+                assert_eq!(output.status.code(), Some(2), "{args:?}");
+                let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+                assert_eq!(error["error"]["kind"], "invalid_input");
+                assert!(output.stdout.is_empty());
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        simulator.request_count().await,
+        0,
+        "invalid bodies must not even fetch metadata"
+    );
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let storage = "<p>é &nbsp; &amp;</p>\n<ac:structured-macro ac:name='code'><ac:plain-text-body><![CDATA[<literal>&unknown;]]]]><![CDATA[>]]></ac:plain-text-body></ac:structured-macro>";
+        let mut child = cfg.command()
+            .args(["page", "update", "100", "--format", "storage", "--body-file", "-", "-o", "json"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().unwrap();
+        child.stdin.take().unwrap().write_all(storage.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let fetched = cfg.run_json(&["page", "get", "100", "--show-body"]);
+        assert_eq!(string_field(first_item(&fetched, "page get"), "body_storage"), storage);
+        assert_eq!(first_item(&fetched, "page get")["version"], 2);
+    }).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn simulated_cloud_user_can_manage_a_page() {
     let simulator = ConfluenceSimulator::start().await;
     let config_home = TempDir::new().expect("simulator config home");

@@ -111,6 +111,20 @@ confluence apply ./docs/parent-page
 
 `plan` reads only the Markdown and sidecar state on disk. `apply` validates the complete local tree and checks every remote version before writing. If Confluence changed after the pull, the apply is refused unless you explicitly choose `--force`.
 
+Before writing a hand-edited storage body, check it offline:
+
+```bash
+confluence validate --format storage --body-file body.xml
+confluence page update 123 --format storage --body-file body.xml
+```
+
+`validate` needs no credentials and makes no API requests. Writes also validate
+bodies automatically, catching malformed XML, broken CDATA, and known macro
+body mismatches before contacting Confluence. Markdown input, including embedded
+storage blocks, goes through the same checks after conversion. See
+[storage-format guidance](docs/cli-reference.md#writing-storage-format-bodies)
+for the validation limits and error-recovery workflow.
+
 ## Read and explore
 
 The direct commands cover everyday Confluence retrieval without requiring a sync directory:

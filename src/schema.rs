@@ -286,6 +286,12 @@ fn output_fields_for(path: &str) -> Vec<Value> {
             json!({"name": "summary", "type": "object"}),
         ],
 
+        "validate" => vec![
+            json!({"name": "valid", "type": "boolean"}),
+            json!({"name": "input_format", "type": "string"}),
+            json!({"name": "storage_bytes", "type": "integer"}),
+        ],
+
         "attachment download" => vec![
             json!({"name": "path", "type": "string"}),
             json!({"name": "downloaded", "type": "boolean"}),

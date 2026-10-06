@@ -220,9 +220,9 @@ pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<Conversi
         bail!(lossy.join("; "));
     }
 
-    Ok(ConversionOutput {
-        storage: html_output.trim().to_string(),
-    })
+    let storage = html_output.trim().to_string();
+    crate::storage::validate_generated_storage(&storage)?;
+    Ok(ConversionOutput { storage })
 }
 
 fn wrap_storage_fragment(storage: &str) -> String {

@@ -27,6 +27,10 @@ impl ConfluenceSimulator {
     pub fn base_url(&self) -> String {
         self.server.uri()
     }
+
+    pub async fn request_count(&self) -> usize {
+        self.server.received_requests().await.unwrap().len()
+    }
 }
 
 #[derive(Clone, Default)]

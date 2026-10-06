@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Offline `validate` command for Markdown and Confluence storage bodies, with stdin support and structured errors carrying line and column.
+- Automatic storage validation before page, blog, and comment body writes, plus checks on generated sync content. Malformed XML, broken CDATA, duplicate macro bodies, and known macro body type mismatches fail locally without submitting the body.
+
+### Fixed
+
+- Invalid or unreadable body files return `invalid_input` (exit 2).
+
 ## [0.1.35](https://github.com/rvben/confluence-cli/compare/v0.1.34...v0.1.35) - 2026-09-28
 
 ### Fixed

@@ -6,6 +6,7 @@ mod model;
 mod output;
 mod provider;
 mod schema;
+mod storage;
 mod sync;
 mod terminal;
 mod tui;
