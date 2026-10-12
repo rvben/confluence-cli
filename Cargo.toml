@@ -56,7 +56,7 @@ serde_yaml = "0.9.34"
 sha2 = "0.10.9"
 similar = "2"
 slug = "0.1.6"
-tokio = { version = "1.53.1", features = ["fs", "macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.53.2", features = ["fs", "macros", "rt-multi-thread", "time"] }
 tempfile = "3.27.0"
 url = "2.5.8"
 urlencoding = "2.1.3"
