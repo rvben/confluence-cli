@@ -1750,7 +1750,7 @@ fn rewrite_page_links(
     }
     let placeholder_re =
         Regex::new(r#"confluence-page://page[^\s\)"]+"#).expect("valid page placeholder regex");
-    rewrite_outside_inline_link_tags(markdown, |text| {
+    rewrite_outside_raw_markup(markdown, |text| {
         let mut rewritten = text.to_string();
         for (re, replacement) in &remote_links {
             rewritten = re.replace_all(&rewritten, replacement.as_str()).to_string();
@@ -1771,22 +1771,62 @@ fn rewrite_page_links(
     })
 }
 
-/// Applies a rewrite to the Markdown around links written as inline tags.
-/// Such a link keeps its address as pulled, so that apply writes the same
-/// link again.
-fn rewrite_outside_inline_link_tags(markdown: &str, rewrite: impl Fn(&str) -> String) -> String {
+/// Applies a rewrite to the Markdown around raw storage blocks and links
+/// written as inline tags. Both hold markup that apply writes back as it
+/// stands, so an address inside them stays as pulled.
+fn rewrite_outside_raw_markup(markdown: &str, rewrite: impl Fn(&str) -> String) -> String {
     static LINK_TAG: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"<a\s[^>\n]*>[^\n]*?</a>").expect("valid inline link tag regex")
+        // A blank line ends the Markdown block that holds the tag, so a
+        // link does not reach past one.
+        Regex::new(r"<a\s(?:[^>\n]|\n[^>\n])*\n?>(?:[^\n]|\n[^\n])*?</a>")
+            .expect("valid inline link tag regex")
     });
     let mut rewritten = String::with_capacity(markdown.len());
     let mut rest = 0;
-    for link in LINK_TAG.find_iter(markdown) {
-        rewritten.push_str(&rewrite(&markdown[rest..link.start()]));
-        rewritten.push_str(link.as_str());
-        rest = link.end();
+    for block in raw_storage_block_ranges(markdown) {
+        let mut text = rest;
+        for link in LINK_TAG.find_iter(&markdown[rest..block.start]) {
+            rewritten.push_str(&rewrite(&markdown[text..rest + link.start()]));
+            rewritten.push_str(link.as_str());
+            text = rest + link.end();
+        }
+        rewritten.push_str(&rewrite(&markdown[text..block.start]));
+        rewritten.push_str(&markdown[block.clone()]);
+        rest = block.end;
     }
-    rewritten.push_str(&rewrite(&markdown[rest..]));
     rewritten
+}
+
+/// Ranges of the raw storage blocks in pulled Markdown, each from its opening
+/// backticks through its closing ones, followed by the empty range at the end
+/// of the text. A block opens anywhere on a line and closes at the next line
+/// that starts with as many backticks, after the indentation and quote marks
+/// of a list item or block quote that holds it.
+fn raw_storage_block_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
+    static OPENING: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(`{3,})confluence-storage[^\n]*\n").expect("valid storage fence regex")
+    });
+    let mut ranges = Vec::new();
+    let mut rest = 0;
+    while let Some(captures) = OPENING.captures_at(markdown, rest) {
+        let opening = captures.get(0).expect("whole match");
+        let fence = &captures[1];
+        let mut line = opening.end();
+        let end = loop {
+            let text = markdown[line..].trim_start_matches([' ', '\t', '>']);
+            if text.starts_with(fence) {
+                break markdown.len() - text.len() + fence.len();
+            }
+            match markdown[line..].find('\n') {
+                Some(newline) => line += newline + 1,
+                None => break markdown.len(),
+            }
+        };
+        ranges.push(opening.start()..end);
+        rest = end;
+    }
+    ranges.push(markdown.len()..markdown.len());
+    ranges
 }
 
 fn resolve_placeholder_to_local_path(
@@ -1836,7 +1876,7 @@ fn rewrite_attachment_links(
         let escaped = regex::escape(&attachment.title);
         let re = Regex::new(&format!(r#"download/attachments/[^\s\)]+/{escaped}"#))
             .expect("valid attachment regex");
-        rewritten = rewrite_outside_inline_link_tags(&rewritten, |text| {
+        rewritten = rewrite_outside_raw_markup(&rewritten, |text| {
             let text = match &attachment.download_url {
                 Some(url) => text.replace(url, &replacement),
                 None => text.to_string(),
@@ -4551,6 +4591,32 @@ mod round_trip_tests {
         assert_round_trips(
             r#"<p><a data-href="confluence-page://page?content-id=7" href="https://x.example/">x</a></p>"#,
         );
+    }
+
+    #[test]
+    fn raw_storage_next_to_a_link_to_a_page_of_the_same_pull_stays_whole() {
+        for storage in [
+            r#"<p><ac:link><ri:page /></ac:link> <ac:link><ri:url ri:value="https://example.com/wiki/pages/456/Sibling" /><ac:plain-text-link-body><![CDATA[Sibling]]></ac:plain-text-link-body></ac:link></p>"#,
+            r#"<p>a <ac:link ac:unknown="1"><ri:url ri:value="https://example.com/wiki/pages/456/Sibling" /></ac:link> b <a href="https://example.com/wiki/pages/456/Sibling">c</a></p>"#,
+        ] {
+            let applied = apply_storage(&pull_next_to_sibling(storage)).expect("apply");
+
+            assert_eq!(canonical(&applied), canonical(storage));
+        }
+    }
+
+    #[test]
+    fn link_spread_over_lines_to_a_page_of_the_same_pull_survives() {
+        let storage = "<p>See <a title=\"tip\"\nhref=\"https://example.com/wiki/pages/456/Sibling\">one<br />two</a>.</p>";
+        let applied = apply_storage(&pull_next_to_sibling(storage)).expect("apply");
+        assert_eq!(canonical(&applied), canonical(storage));
+    }
+
+    #[test]
+    fn raw_storage_after_a_quoted_raw_block_stays_whole() {
+        let storage = r#"<blockquote><ac:emoticon ac:name="smile" /></blockquote><ac:structured-macro ac:name="html"><ac:plain-text-body><![CDATA[see https://example.com/wiki/pages/456/Sibling now]]></ac:plain-text-body></ac:structured-macro>"#;
+        let applied = apply_storage(&pull_next_to_sibling(storage)).expect("apply");
+        assert_eq!(canonical(&applied), canonical(storage));
     }
 
     #[test]
