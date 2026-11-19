@@ -33,16 +33,8 @@ impl CloudProvider {
     }
 
     async fn space_by_key_or_id(&self, key_or_id: &str) -> Result<SpaceSummary> {
-        let spaces = self.list_spaces(500).await?;
-        spaces
-            .into_iter()
-            .find(|space| space.key == key_or_id || space.id == key_or_id)
-            .ok_or_else(|| {
-                crate::output::typed_error(
-                    crate::output::ErrorKind::NotFound,
-                    format!("space `{key_or_id}` not found"),
-                )
-            })
+        let space = crate::provider::find_v1_space(&self.http, key_or_id).await?;
+        Ok(self.map_space(space))
     }
 
     async fn page_v2(&self, id: &str, include_body: bool) -> Result<V2Page> {
@@ -928,6 +920,62 @@ mod tests {
 
         assert_eq!(window.items.len(), 2);
         assert!(window.has_more);
+    }
+
+    #[tokio::test]
+    async fn get_space_asks_for_the_space_by_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wiki/rest/api/space/HDA"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 4242,
+                "key": "HDA",
+                "name": "Data Platform",
+                "type": "global",
+                "_links": { "webui": "/spaces/HDA" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let space = cloud_provider(&server.uri())
+            .get_space("HDA")
+            .await
+            .unwrap();
+
+        assert_eq!(space.key, "HDA");
+        assert_eq!(space.id, "4242");
+    }
+
+    #[tokio::test]
+    async fn get_space_falls_back_to_the_space_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wiki/rest/api/space/4242"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/wiki/rest/api/space"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    { "id": 1, "key": "DOCS", "name": "Docs", "_links": {} },
+                    { "id": 4242, "key": "HDA", "name": "Data Platform", "_links": {} }
+                ],
+                "limit": 200,
+                "size": 2,
+                "start": 0,
+                "_links": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let space = cloud_provider(&server.uri())
+            .get_space("4242")
+            .await
+            .unwrap();
+
+        assert_eq!(space.key, "HDA");
     }
 
     #[tokio::test]

@@ -350,6 +350,20 @@ pub struct Results<T> {
     pub _links: Links,
 }
 
+impl<T> Results<T> {
+    /// Whether results remain after this page, which began at `start` and
+    /// was requested with `request_limit`. `total` is the most recent total
+    /// the server reported. An empty page ends the listing whatever else it
+    /// claims, since asking again from the same offset cannot get further.
+    fn has_more_after(&self, start: usize, total: Option<usize>, request_limit: usize) -> bool {
+        let count = self.results.len();
+        count > 0
+            && (self._links.next.is_some()
+                || total.is_some_and(|total| start.saturating_add(count) < total)
+                || count >= self.limit.unwrap_or(request_limit))
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct Links {
     pub webui: Option<String>,
@@ -670,6 +684,70 @@ where
     Ok(combined)
 }
 
+/// Resolves a space from its key or its numeric ID.
+///
+/// The key is the common case and has its own endpoint, so it is asked for
+/// directly. Only when the server knows no space under that key, and the
+/// value could be an ID, are the spaces walked page by page until one has
+/// that ID.
+pub async fn find_v1_space(client: &HttpClient, key_or_id: &str) -> Result<V1Space> {
+    const PAGE_SIZE: usize = 200;
+
+    let url = client.v1_url(&format!(
+        "/space/{}?expand=homepage",
+        urlencoding::encode(key_or_id)
+    ));
+    match client.json::<V1Space>(Method::GET, url, None).await {
+        Ok(space) => return Ok(space),
+        Err(error) => {
+            let (kind, _) = crate::output::classify_anyhow(&error);
+            if !matches!(kind, crate::output::ErrorKind::NotFound) {
+                return Err(error);
+            }
+        }
+    }
+
+    let not_found = || {
+        crate::output::typed_error(
+            crate::output::ErrorKind::NotFound,
+            format!("space `{key_or_id}` not found"),
+        )
+    };
+    if key_or_id.is_empty() || !key_or_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(not_found());
+    }
+
+    let mut start: usize = 0;
+    let mut total = None;
+    // A server that answers every offset with the same spaces would keep the
+    // lookup going for ever, so a page that shows no new space ends it.
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let url = client.v1_url(&format!(
+            "/space?expand=homepage&limit={PAGE_SIZE}&start={start}"
+        ));
+        let page: Results<V1Space> = client.json(Method::GET, url, None).await?;
+        let count = page.results.len();
+        total = page.total_size.or(total);
+        let has_more = page.has_more_after(start, total, PAGE_SIZE);
+        let mut advanced = false;
+        for space in page.results {
+            if space
+                .id
+                .as_ref()
+                .is_some_and(|id| value_to_string(id) == key_or_id)
+            {
+                return Ok(space);
+            }
+            advanced |= seen.insert(space.key.clone());
+        }
+        if !has_more || !advanced {
+            return Err(not_found());
+        }
+        start = start.saturating_add(count);
+    }
+}
+
 pub async fn fetch_v1_window<T>(
     client: &HttpClient,
     path: &str,
@@ -706,17 +784,14 @@ where
 
         let page: Results<T> = client.json(Method::GET, url.to_string(), None).await?;
         let count = page.results.len();
-        let page_limit = page.limit.unwrap_or(request_limit);
         total = page.total_size.or(total);
-        let page_has_more = page._links.next.is_some()
-            || total.is_some_and(|total| start.saturating_add(count) < total)
-            || (count > 0 && count >= page_limit);
+        let page_has_more = page.has_more_after(start, total, request_limit);
 
         items.extend(page.results.into_iter().take(remaining));
         if items.len() == limit {
             break count > remaining || page_has_more;
         }
-        if !page_has_more || count == 0 {
+        if !page_has_more {
             break false;
         }
         start = start.saturating_add(count);

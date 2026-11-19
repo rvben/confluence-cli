@@ -132,14 +132,17 @@ impl Respond for SimulatorResponder {
                 "username": "simulator",
                 "displayName": "Simulator User"
             })),
-            ("GET", "v1", "/space") => results_response(vec![json!({
-                "id": SPACE_ID,
-                "key": SPACE_KEY,
-                "name": "Simulator",
-                "type": "global",
-                "homepage": { "id": "100" },
-                "_links": { "webui": "/spaces/TEST" }
-            })]),
+            ("GET", "v1", "/space") => results_response(vec![space_json()]),
+            ("GET", "v1", resource) if resource.strip_prefix("/space/").is_some() => {
+                if resource == format!("/space/{SPACE_KEY}") {
+                    ResponseTemplate::new(200).set_body_json(space_json())
+                } else {
+                    ResponseTemplate::new(404).set_body_json(json!({
+                        "statusCode": 404,
+                        "message": "No space with that key exists"
+                    }))
+                }
+            }
             ("GET", "v1", "/content/search") => results_response(
                 state
                     .content
@@ -812,6 +815,17 @@ fn v1_content_json(content: &SimulatedContent) -> Value {
             "lastUpdated": { "when": "2026-01-01T00:00:00Z" }
         },
         "_links": { "webui": format!("/spaces/TEST/pages/{}", content.id) }
+    })
+}
+
+fn space_json() -> Value {
+    json!({
+        "id": SPACE_ID,
+        "key": SPACE_KEY,
+        "name": "Simulator",
+        "type": "global",
+        "homepage": { "id": "100" },
+        "_links": { "webui": "/spaces/TEST" }
     })
 }
 

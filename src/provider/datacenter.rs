@@ -33,16 +33,8 @@ impl DataCenterProvider {
     }
 
     async fn space_by_key_or_id(&self, key_or_id: &str) -> Result<SpaceSummary> {
-        let spaces = self.list_spaces(500).await?;
-        spaces
-            .into_iter()
-            .find(|space| space.key == key_or_id || space.id == key_or_id)
-            .ok_or_else(|| {
-                crate::output::typed_error(
-                    crate::output::ErrorKind::NotFound,
-                    format!("space `{key_or_id}` not found"),
-                )
-            })
+        let space = crate::provider::find_v1_space(&self.http, key_or_id).await?;
+        Ok(self.map_space(space))
     }
 
     fn content_expand(include_body: bool) -> &'static str {
@@ -808,6 +800,277 @@ mod tests {
             "start": start,
             "_links": {}
         })
+    }
+
+    // ── get_space ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_space_asks_for_the_space_by_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space/HDA"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 4242,
+                "key": "HDA",
+                "name": "Data Platform",
+                "type": "global",
+                "homepage": { "id": "77" },
+                "_links": { "webui": "/display/HDA" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let space = dc_provider(&server.uri()).get_space("HDA").await.unwrap();
+
+        assert_eq!(space.key, "HDA");
+        assert_eq!(space.id, "4242");
+        assert_eq!(space.name, "Data Platform");
+        assert_eq!(space.homepage_id.as_deref(), Some("77"));
+    }
+
+    #[tokio::test]
+    async fn get_space_finds_a_space_by_id_beyond_the_first_500() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space/900601"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        for page in 0..4usize {
+            let results: Vec<_> = (0..if page == 3 { 1 } else { 200 })
+                .map(|offset| {
+                    let number = page * 200 + offset + 1;
+                    json!({
+                        "key": format!("S{number}"),
+                        "name": format!("Space {number}"),
+                        "id": 900_000 + number,
+                        "_links": {}
+                    })
+                })
+                .collect();
+            Mock::given(method("GET"))
+                .and(path("/rest/api/space"))
+                .and(query_param("start", (page * 200).to_string()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "results": results,
+                    "limit": 200,
+                    "size": results.len(),
+                    "start": page * 200,
+                    "_links": {}
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        let space = dc_provider(&server.uri())
+            .get_space("900601")
+            .await
+            .unwrap();
+
+        assert_eq!(space.key, "S601");
+    }
+
+    #[tokio::test]
+    async fn get_space_stops_paging_once_the_id_is_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space/900002"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let first_page: Vec<_> = (1..=200)
+            .map(|number| {
+                json!({
+                    "key": format!("S{number}"),
+                    "name": format!("Space {number}"),
+                    "id": 900_000 + number,
+                    "_links": {}
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(query_param("start", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": first_page,
+                "limit": 200,
+                "size": 200,
+                "start": 0,
+                "_links": { "next": "/rest/api/space?start=200" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .and(query_param("start", "200"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let space = dc_provider(&server.uri())
+            .get_space("900002")
+            .await
+            .unwrap();
+
+        assert_eq!(space.key, "S2");
+    }
+
+    #[tokio::test]
+    async fn get_space_reports_an_unknown_id_as_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space/777"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(space_page(&["DOCS"], 200, 0)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = dc_provider(&server.uri())
+            .get_space("777")
+            .await
+            .unwrap_err();
+
+        let (kind, _) = crate::output::classify_anyhow(&err);
+        assert!(matches!(kind, crate::output::ErrorKind::NotFound));
+        assert_eq!(err.to_string(), "space `777` not found");
+    }
+
+    #[tokio::test]
+    async fn get_space_by_id_gives_up_when_paging_makes_no_progress() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space/777"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [],
+                "limit": 200,
+                "size": 0,
+                "start": 0,
+                "_links": { "next": "/rest/api/space?start=0" }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = dc_provider(&server.uri());
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.get_space("777"),
+        )
+        .await
+        .expect("lookup ends")
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "space `777` not found");
+    }
+
+    #[tokio::test]
+    async fn get_space_by_id_gives_up_when_the_server_repeats_a_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space/777"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(space_page(&["1", "2"], 2, 0)))
+            .mount(&server)
+            .await;
+
+        let provider = dc_provider(&server.uri());
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.get_space("777"),
+        )
+        .await
+        .expect("lookup ends")
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "space `777` not found");
+    }
+
+    #[tokio::test]
+    async fn get_space_by_id_keeps_paging_while_the_reported_total_is_not_reached() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space/902"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        for (start, id, key) in [(0, 901, "ONE"), (1, 902, "TWO")] {
+            Mock::given(method("GET"))
+                .and(path("/rest/api/space"))
+                .and(query_param("start", start.to_string()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "results": [{ "key": key, "name": key, "id": id, "_links": {} }],
+                    "limit": 200,
+                    "size": 1,
+                    "start": start,
+                    "totalSize": 2,
+                    "_links": {}
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        let space = dc_provider(&server.uri()).get_space("902").await.unwrap();
+
+        assert_eq!(space.key, "TWO");
+    }
+
+    #[tokio::test]
+    async fn get_space_reports_an_unknown_space_as_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space/NOPE"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(space_page(&["DOCS"], 200, 0)))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let err = dc_provider(&server.uri())
+            .get_space("NOPE")
+            .await
+            .unwrap_err();
+
+        let (kind, _) = crate::output::classify_anyhow(&err);
+        assert!(matches!(kind, crate::output::ErrorKind::NotFound));
+        assert_eq!(err.to_string(), "space `NOPE` not found");
+    }
+
+    #[tokio::test]
+    async fn get_space_surfaces_a_failed_lookup_instead_of_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/api/space/HDA"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let err = dc_provider(&server.uri())
+            .get_space("HDA")
+            .await
+            .unwrap_err();
+
+        let (kind, _) = crate::output::classify_anyhow(&err);
+        assert!(matches!(kind, crate::output::ErrorKind::Auth));
     }
 
     // ── list_spaces ───────────────────────────────────────────────────────────
