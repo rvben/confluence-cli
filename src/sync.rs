@@ -4098,6 +4098,46 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn malformed_storage_keeps_its_confluence_markup() {
+        let markdown = storage_to_markdown(concat!(
+            r#"<p>start <ri:user ri:account-id="1" /> end<br></p>"#,
+            r#"<p><ri:user ri:account-id="2" /></p>"#,
+        ));
+        assert!(!markdown.contains("PLACEHOLDER"), "{markdown}");
+        let storage = apply_storage(&markdown).unwrap();
+        assert!(
+            storage.contains(r#"start <ri:user ri:account-id="1" /> end"#),
+            "{storage}"
+        );
+        assert!(
+            storage.contains(r#"<ri:user ri:account-id="2" />"#),
+            "{storage}"
+        );
+    }
+
+    #[test]
+    fn malformed_storage_keeps_confluence_markup_that_holds_more_of_it() {
+        for element in [
+            r#"<ac:link><ri:page ri:content-title="P" /><ac:plain-text-link-body><![CDATA[X]]></ac:plain-text-link-body></ac:link>"#,
+            r#"<ac:structured-macro ac:name="info"><ac:parameter ac:name="title">T</ac:parameter><ac:rich-text-body><p>body</p></ac:rich-text-body></ac:structured-macro>"#,
+            r#"<ac:structured-macro ac:name="expand"><ac:rich-text-body><ac:structured-macro ac:name="info"><ac:rich-text-body><p>in</p></ac:rich-text-body></ac:structured-macro></ac:rich-text-body></ac:structured-macro>"#,
+            r#"<ri:attachment ri:filename="f"><ri:page ri:content-title="P" /></ri:attachment>"#,
+            r#"<ac:emoticon ac:name="smile" />"#,
+            r#"<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[</ac:structured-macro> <ac:x>]]></ac:plain-text-body></ac:structured-macro>"#,
+            r#"<ri:attachment ri:filename="x/>y" />"#,
+            r#"<ac:link><!-- </ac:link> --><ri:page ri:content-title="P" /></ac:link>"#,
+        ] {
+            let markdown = storage_to_markdown(&format!("<p>A{element}B<br></p>"));
+            let storage = apply_storage(&markdown)
+                .unwrap_or_else(|error| panic!("apply failed for {markdown:?}: {error:#}"));
+            assert!(
+                storage.contains(element),
+                "{markdown:?} applied as {storage}"
+            );
+        }
+    }
+
+    #[test]
     fn storage_fences_keep_the_blank_lines_they_hold() {
         let storage = apply_storage(
             "```confluence-storage\n<pre>A\n\n\n```\n\n```confluence-storage\nB</pre>\n```",

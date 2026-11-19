@@ -171,29 +171,97 @@ fn storage_to_markdown_xml(storage: &str) -> Option<String> {
 
 fn storage_to_markdown_fallback(storage: &str) -> String {
     let mut xml_fragments = Vec::new();
-    let mut normalized = storage.to_string();
+    let mut normalized = String::with_capacity(storage.len());
+    // Letters and digits only, which the HTML converter writes out as they
+    // are. The digest keeps the storage itself from spelling the marker.
+    let digest = Sha256::digest(storage.as_bytes());
+    let digest: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect();
+    let marker = format!("CONFLUENCEXMLPLACEHOLDER{digest}N");
 
-    for pattern in [
-        r"(?s)<ac:[\w-]+(?:\s[^>]*)?>.*?</ac:[\w-]+>",
-        r"(?s)<ri:[\w-]+(?:\s[^>]*)?/>",
-        r"(?s)<ri:[\w-]+(?:\s[^>]*)?>.*?</ri:[\w-]+>",
-    ] {
-        let re = Regex::new(pattern).expect("valid regex");
-        normalized = re
-            .replace_all(&normalized, |captures: &regex::Captures<'_>| {
-                let idx = xml_fragments.len();
-                xml_fragments.push(captures[0].to_string());
-                format!("CONFLUENCE_XML_PLACEHOLDER_{idx}")
-            })
-            .to_string();
+    let mut rest = 0;
+    for element in confluence_element_ranges(storage) {
+        normalized.push_str(&storage[rest..element.start]);
+        normalized.push_str(&format!("{marker}{}END", xml_fragments.len()));
+        rest = element.end;
+        xml_fragments.push(&storage[element]);
     }
+    normalized.push_str(&storage[rest..]);
 
-    let mut markdown = html2md::parse_html(&normalized);
-    for (idx, fragment) in xml_fragments.into_iter().enumerate() {
-        let block = confluence_raw_block(&fragment);
-        markdown = markdown.replace(&format!("CONFLUENCE_XML_PLACEHOLDER_{idx}"), &block);
-    }
+    let markdown = html2md::parse_html(&normalized);
+    let placeholder = Regex::new(&format!("{marker}([0-9]+)END")).expect("valid regex");
+    let markdown = placeholder.replace_all(&markdown, |captures: &regex::Captures<'_>| {
+        match captures[1]
+            .parse::<usize>()
+            .ok()
+            .and_then(|idx| xml_fragments.get(idx))
+        {
+            Some(fragment) => confluence_raw_block(fragment),
+            None => captures[0].to_string(),
+        }
+    });
     markdown.trim().to_string()
+}
+
+/// Finds the outermost Confluence elements in storage that is not well
+/// formed, each from its opening tag to the closing tag that matches it. An
+/// element that is never closed is passed over, and the ones it holds are
+/// found on their own.
+fn confluence_element_ranges(storage: &str) -> Vec<Range<usize>> {
+    static TAG: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?s)<!\[CDATA\[.*?\]\]>|<!--.*?-->|<(/?)((?:ac|ri):[\w-]+)(?:\s(?:[^>"']|"[^"]*"|'[^']*')*?)?(/?)>"#,
+        )
+            .expect("valid Confluence tag regex")
+    });
+    struct Tag<'a> {
+        range: Range<usize>,
+        name: &'a str,
+        closing: bool,
+        empty: bool,
+    }
+    // A character data section or a comment matches without a name, which
+    // keeps tags spelled inside one out of the list.
+    let tags: Vec<Tag<'_>> = TAG
+        .captures_iter(storage)
+        .filter_map(|captures| {
+            Some(Tag {
+                range: captures.get(0)?.range(),
+                name: captures.get(2)?.as_str(),
+                closing: !captures[1].is_empty(),
+                empty: !captures[3].is_empty(),
+            })
+        })
+        .collect();
+
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < tags.len() {
+        let tag = &tags[index];
+        index += 1;
+        if tag.closing {
+            continue;
+        }
+        if tag.empty {
+            ranges.push(tag.range.clone());
+            continue;
+        }
+        let mut depth = 1;
+        for (offset, other) in tags[index..].iter().enumerate() {
+            if other.name != tag.name || other.empty {
+                continue;
+            }
+            depth += if other.closing { -1 } else { 1 };
+            if depth == 0 {
+                ranges.push(tag.range.start..other.range.end);
+                index += offset + 1;
+                break;
+            }
+        }
+    }
+    ranges
 }
 
 pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<ConversionOutput> {
