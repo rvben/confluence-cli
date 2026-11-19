@@ -15,10 +15,10 @@ use crate::markdown::{
     Frontmatter, LocalDocument, PageLinkPlaceholder, Sidecar, UserMentionPlaceholder,
     build_page_placeholder_url, build_storage_link_body, decode_character_references,
     document_dir_name, encode_target_segment, has_generated_label, is_local_target,
-    link_body_unless_default, load_document, markdown_to_storage, parse_page_placeholder_url,
-    parse_status_placeholder_url, parse_user_placeholder_url, rewrite_outside_cdata,
-    rewrite_outside_literal_sections, save_document, scan_local_documents, sha256_hex,
-    split_target_fragment, storage_to_markdown,
+    link_body_unless_default, link_display_attributes, load_document, markdown_to_storage,
+    parse_page_placeholder_url, parse_status_placeholder_url, parse_user_placeholder_url,
+    rewrite_outside_cdata, rewrite_outside_literal_sections, save_document, scan_local_documents,
+    sha256_hex, split_target_fragment, storage_to_markdown,
 };
 use crate::model::{AttachmentState, ContentItem, ContentKind, PlanActionKind, PlanItem, SyncPlan};
 use crate::provider::ConfluenceProvider;
@@ -1733,7 +1733,7 @@ fn rewrite_page_links(
     paths: &BTreeMap<String, PathBuf>,
     items: &BTreeMap<String, ContentItem>,
 ) -> String {
-    let mut rewritten = markdown.to_string();
+    let mut remote_links = Vec::new();
     for (content_id, target_dir) in paths {
         let target_index = target_dir.join("index.md");
         let relative = diff_paths(&target_index, current_dir).unwrap_or(target_index);
@@ -1745,23 +1745,48 @@ fn rewrite_page_links(
         ];
         for pattern in patterns {
             let re = Regex::new(&pattern).expect("valid page link regex");
-            rewritten = re.replace_all(&rewritten, replacement.as_str()).to_string();
+            remote_links.push((re, replacement.clone()));
         }
     }
     let placeholder_re =
         Regex::new(r#"confluence-page://page[^\s\)"]+"#).expect("valid page placeholder regex");
-    placeholder_re
-        .replace_all(&rewritten, |captures: &regex::Captures<'_>| {
-            let target = captures.get(0).map(|m| m.as_str()).unwrap_or_default();
-            // A link pulled without a body keeps its placeholder, which is
-            // what lets apply write it without a body again.
-            if has_generated_label(target) {
-                return target.to_string();
-            }
-            resolve_placeholder_to_local_path(target, current_dir, paths, items)
-                .unwrap_or_else(|| target.to_string())
-        })
-        .to_string()
+    rewrite_outside_inline_link_tags(markdown, |text| {
+        let mut rewritten = text.to_string();
+        for (re, replacement) in &remote_links {
+            rewritten = re.replace_all(&rewritten, replacement.as_str()).to_string();
+        }
+        placeholder_re
+            .replace_all(&rewritten, |captures: &regex::Captures<'_>| {
+                let target = captures.get(0).map(|m| m.as_str()).unwrap_or_default();
+                // A link pulled without a body keeps its placeholder, which
+                // is what lets apply write it without a body again. So does
+                // one whose placeholder says how the link is displayed.
+                if has_generated_label(target) || !link_display_attributes(target).is_empty() {
+                    return target.to_string();
+                }
+                resolve_placeholder_to_local_path(target, current_dir, paths, items)
+                    .unwrap_or_else(|| target.to_string())
+            })
+            .to_string()
+    })
+}
+
+/// Applies a rewrite to the Markdown around links written as inline tags.
+/// Such a link keeps its address as pulled, so that apply writes the same
+/// link again.
+fn rewrite_outside_inline_link_tags(markdown: &str, rewrite: impl Fn(&str) -> String) -> String {
+    static LINK_TAG: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"<a\s[^>\n]*>[^\n]*?</a>").expect("valid inline link tag regex")
+    });
+    let mut rewritten = String::with_capacity(markdown.len());
+    let mut rest = 0;
+    for link in LINK_TAG.find_iter(markdown) {
+        rewritten.push_str(&rewrite(&markdown[rest..link.start()]));
+        rewritten.push_str(link.as_str());
+        rest = link.end();
+    }
+    rewritten.push_str(&rewrite(&markdown[rest..]));
+    rewritten
 }
 
 fn resolve_placeholder_to_local_path(
@@ -1808,13 +1833,16 @@ fn rewrite_attachment_links(
         // The file name is one segment of a link destination, where a
         // literal `%` or space would be read as something else.
         let replacement = format!("attachments/{}", encode_target_segment(&attachment.title));
-        if let Some(url) = &attachment.download_url {
-            rewritten = rewritten.replace(url, &replacement);
-        }
         let escaped = regex::escape(&attachment.title);
         let re = Regex::new(&format!(r#"download/attachments/[^\s\)]+/{escaped}"#))
             .expect("valid attachment regex");
-        rewritten = re.replace_all(&rewritten, replacement.as_str()).to_string();
+        rewritten = rewrite_outside_inline_link_tags(&rewritten, |text| {
+            let text = match &attachment.download_url {
+                Some(url) => text.replace(url, &replacement),
+                None => text.to_string(),
+            };
+            re.replace_all(&text, replacement.as_str()).to_string()
+        });
     }
     rewritten
 }
@@ -1889,7 +1917,7 @@ fn rewrite_generic_macro_page_placeholder_line(
 fn rewrite_placeholder_links_to_storage(storage: &str) -> String {
     static LINK: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r#"(?s)<a([^>]*?)href="(confluence-(?:page|user|status)://[^"]+)"([^>]*)>(.*?)</a>"#,
+            r#"(?s)<a(\s(?:[^>]*?\s)?)href="(confluence-(?:page|user|status)://[^"]+)"([^>]*)>(.*?)</a>"#,
         )
         .expect("valid placeholder link regex")
     });
@@ -1902,6 +1930,10 @@ fn rewrite_placeholder_links_to_storage(storage: &str) -> String {
 }
 
 fn placeholder_to_storage_macro(target: &str, body_html: &str) -> Option<String> {
+    let display_attrs: String = link_display_attributes(target)
+        .iter()
+        .map(|(name, value)| format!(r#" ac:{name}="{}""#, escape_xml_attr(value)))
+        .collect();
     if let Some(placeholder) = parse_page_placeholder_url(target) {
         let anchor_attr = placeholder
             .anchor
@@ -1923,14 +1955,16 @@ fn placeholder_to_storage_macro(target: &str, body_html: &str) -> Option<String>
         };
         let body = placeholder_link_body(target, body_html, &placeholder.default_label());
         return Some(format!(
-            r#"<ac:link{anchor_attr}>{resource}{body}</ac:link>"#
+            r#"<ac:link{anchor_attr}{display_attrs}>{resource}{body}</ac:link>"#
         ));
     }
 
     if let Some(placeholder) = parse_user_placeholder_url(target) {
         let resource = user_placeholder_to_storage_resource(&placeholder)?;
         let body = placeholder_link_body(target, body_html, &placeholder.default_label());
-        return Some(format!(r#"<ac:link>{resource}{body}</ac:link>"#));
+        return Some(format!(
+            r#"<ac:link{display_attrs}>{resource}{body}</ac:link>"#
+        ));
     }
 
     status_placeholder_to_storage_macro(target, body_html)
@@ -4445,6 +4479,192 @@ mod round_trip_tests {
 
             assert_eq!(canonical(&applied), canonical(storage));
         }
+    }
+
+    #[test]
+    fn links_keep_their_display_attributes() {
+        for storage in [
+            r#"<p>see <a href="https://x.example/a" data-card-appearance="inline">https://x.example/a</a> now</p>"#,
+            r#"<p><a href="https://x.example/a" data-card-appearance="block">https://x.example/a</a></p>"#,
+            r#"<p>see <a href="https://x.example/a?b=1&amp;c=2" data-card-appearance="inline">https://x.example/a?b=1&amp;c=2</a> now</p>"#,
+            r#"<p>see <a href="https://x.example/a" title="a &quot;b&quot; &lt;c&gt;">the <strong>page</strong></a> now</p>"#,
+            r#"<p>see <a href="https://x.example/a" data-card-appearance="inline">a *draft* of [x](y) &amp; `z`</a> now</p>"#,
+            r#"<p>see <a href="https://x.example/a" data-card-appearance="inline"></a> now</p>"#,
+            r#"<table><tbody><tr><td><p>a | b <a href="https://x.example/a|b" data-card-appearance="inline">c | d</a></p></td></tr></tbody></table>"#,
+            r#"<ul><li><a href="https://x.example/a" data-card-appearance="inline">https://x.example/a</a></li></ul>"#,
+            r#"<p><a href="https://x.example/a" data-card-appearance="inline"></a></p>"#,
+            r#"<blockquote><p><a href="https://x.example/a" data-card-appearance="inline">a</a></p></blockquote>"#,
+            r#"<p><a href="https://x.example/a" data-card-appearance="inline">a</a><a href="https://x.example/b" data-card-appearance="inline">b</a></p>"#,
+            r#"<p><a href="https://x.example/a" data-card-appearance="inline">one<br />two</a></p>"#,
+            r#"<p><a href="https://x.example/a" data-card-appearance="inline">one <ac:emoticon ac:name="smile" /></a></p>"#,
+            r#"<h2><a href="https://x.example/a" data-card-appearance="inline">https://x.example/a</a></h2>"#,
+        ] {
+            assert_round_trips(storage);
+        }
+    }
+
+    #[test]
+    fn link_with_display_attributes_keeps_a_bar_in_its_address_inside_a_table() {
+        assert_round_trips(
+            r#"<table><thead><tr><th>h</th></tr></thead><tbody><tr><td><a href="https://x.example/a|b" title="a | b">c | d</a></td></tr></tbody></table>"#,
+        );
+    }
+
+    #[test]
+    fn link_attribute_keeps_a_tab() {
+        let storage = r#"<p><a href="https://x.example" title="a&#9;b">x</a></p>"#;
+        let applied = apply_storage(&storage_to_markdown(storage)).expect("apply");
+        assert!(applied.contains("a&#9;b"), "{applied}");
+    }
+
+    #[test]
+    fn link_with_display_attributes_is_written_as_an_inline_tag() {
+        assert_eq!(
+            storage_to_markdown(
+                r#"<p>see <a href="https://x.example/a" data-card-appearance="inline">https://x.example/a</a> now</p>"#
+            )
+            .trim(),
+            r#"see <a href="https://x.example/a" data-card-appearance="inline">https://x.example/a</a> now"#
+        );
+    }
+
+    #[test]
+    fn link_without_display_attributes_stays_a_markdown_link() {
+        for storage in [
+            r#"<p>see <a href="https://x.example/a">label</a> now</p>"#,
+            r#"<p>see <a href="https://x.example/a" local-id="1f2e">label</a> now</p>"#,
+        ] {
+            assert_eq!(
+                storage_to_markdown(storage).trim(),
+                "see [label](https://x.example/a) now"
+            );
+        }
+    }
+
+    #[test]
+    fn link_with_an_attribute_that_markdown_does_not_read_survives() {
+        assert_round_trips(r#"<p>see <a href="https://x.example/" café="1">x</a> now</p>"#);
+    }
+
+    #[test]
+    fn link_keeps_its_address_next_to_an_attribute_that_ends_in_href() {
+        assert_round_trips(
+            r#"<p><a data-href="confluence-page://page?content-id=7" href="https://x.example/">x</a></p>"#,
+        );
+    }
+
+    #[test]
+    fn link_drops_only_its_local_id() {
+        let applied = apply_storage(&storage_to_markdown(
+            r#"<p>see <a local-id="1f2e" href="https://x.example/a" data-card-appearance="inline">label</a> now</p>"#,
+        ))
+        .expect("apply");
+
+        assert_eq!(
+            canonical(&applied),
+            canonical(
+                r#"<p>see <a href="https://x.example/a" data-card-appearance="inline">label</a> now</p>"#
+            )
+        );
+    }
+
+    #[test]
+    fn confluence_links_keep_their_display_attributes() {
+        for storage in [
+            r#"<p>see <ac:link ac:card-appearance="inline"><ri:page ri:content-title="Roadmap" /></ac:link> now</p>"#,
+            r#"<p>see <ac:link ac:card-appearance="inline" ac:tooltip="the &quot;plan&quot; &amp; more (v2)"><ri:page ri:content-title="Roadmap" ri:space-key="MFS" /></ac:link> now</p>"#,
+            r#"<p>see <ac:link ac:anchor="intro" ac:card-appearance="block"><ri:page ri:content-title="Roadmap" /></ac:link> now</p>"#,
+            r#"<p>see <ac:link ac:tooltip=""><ri:page ri:content-id="987" /></ac:link> now</p>"#,
+            r#"<p>see <ac:link ac:card-appearance="inline"><ri:page ri:content-title="Roadmap" /><ac:plain-text-link-body><![CDATA[the plan]]></ac:plain-text-link-body></ac:link> now</p>"#,
+            r#"<p>see <ac:link ac:card-appearance="inline"><ri:page ri:content-title="Roadmap" /><ac:link-body>the <strong>plan</strong></ac:link-body></ac:link> now</p>"#,
+            r#"<p>ask <ac:link ac:card-appearance="inline"><ri:user ri:account-id="557058:abc" /></ac:link> now</p>"#,
+            r#"<p>ask <ac:link ac:tooltip="owner"><ri:user ri:account-id="557058:abc" /><ac:plain-text-link-body><![CDATA[Alex]]></ac:plain-text-link-body></ac:link> now</p>"#,
+            r#"<p>see <ac:link ac:card-appearance="inline"><ri:attachment ri:filename="plan.pdf" /></ac:link> now</p>"#,
+            r#"<p>see <ac:link ac:card-appearance="inline"><ri:url ri:value="https://x.example/a" /></ac:link> now</p>"#,
+            r#"<p>see <ac:link ac:anchor="intro" ac:tooltip="t" /> now</p>"#,
+            r#"<p>see <ac:link ac:unknown="1"><ri:page ri:content-title="Roadmap" /></ac:link> now</p>"#,
+        ] {
+            assert_round_trips(storage);
+        }
+    }
+
+    #[test]
+    fn display_attribute_given_twice_is_written_once() {
+        let applied = apply_storage(
+            "[x](confluence-page://page?content-id=7&tooltip=a&tooltip=b&card-appearance=inline)",
+        )
+        .expect("apply");
+
+        assert_eq!(
+            canonical(&applied),
+            canonical(
+                r#"<p><ac:link ac:tooltip="a" ac:card-appearance="inline"><ri:page ri:content-id="7" /><ac:plain-text-link-body><![CDATA[x]]></ac:plain-text-link-body></ac:link></p>"#
+            )
+        );
+    }
+
+    #[test]
+    fn confluence_link_with_display_attributes_stays_a_markdown_link() {
+        assert_eq!(
+            storage_to_markdown(
+                r#"<p>see <ac:link ac:card-appearance="inline"><ri:page ri:content-title="Roadmap" /><ac:plain-text-link-body><![CDATA[the plan]]></ac:plain-text-link-body></ac:link> now</p>"#
+            )
+            .trim(),
+            "see [the plan](confluence-page://page?content-title=Roadmap&card-appearance=inline) now"
+        );
+    }
+
+    #[test]
+    fn link_to_a_page_of_the_same_pull_keeps_its_display_attributes() {
+        for storage in [
+            r#"<p>see <ac:link ac:card-appearance="inline"><ri:page ri:content-title="Sibling" ri:space-key="MFS" /><ac:plain-text-link-body><![CDATA[the sibling]]></ac:plain-text-link-body></ac:link> now</p>"#,
+            r#"<p>see <ac:link ac:tooltip="t"><ri:page ri:content-title="Sibling" ri:space-key="MFS" /></ac:link> now</p>"#,
+            r#"<p>see <a href="https://example.com/wiki/spaces/MFS/pages/456/Sibling" data-card-appearance="inline">https://example.com/wiki/spaces/MFS/pages/456/Sibling</a> now</p>"#,
+            r#"<p>see <a href="https://example.com/wiki/pages/viewpage.action?pageId=456" data-card-appearance="inline">Sibling</a> now</p>"#,
+        ] {
+            let applied = apply_storage(&pull_next_to_sibling(storage)).expect("apply");
+
+            assert_eq!(canonical(&applied), canonical(storage));
+        }
+    }
+
+    #[test]
+    fn link_to_a_page_of_the_same_pull_is_still_local_next_to_one_with_display_attributes() {
+        let markdown = pull_next_to_sibling(
+            r#"<p><a href="https://example.com/wiki/spaces/MFS/pages/456/Sibling" data-card-appearance="inline">card</a> and <a href="https://example.com/wiki/spaces/MFS/pages/456/Sibling">plain</a></p>"#,
+        );
+
+        assert_eq!(
+            markdown.trim(),
+            r#"<a href="https://example.com/wiki/spaces/MFS/pages/456/Sibling" data-card-appearance="inline">card</a> and [plain](../sibling-page--456/index.md)"#
+        );
+    }
+
+    #[test]
+    fn link_with_display_attributes_to_an_attachment_keeps_its_address() {
+        let url = "https://example.com/download/attachments/123/plan.pdf";
+        let storage = format!(
+            r#"<p><a href="{url}" data-card-appearance="inline">{url}</a> and <a href="{url}">plain</a></p>"#
+        );
+        let pulled = rewrite_attachment_links(
+            &storage_to_markdown(&storage),
+            &[crate::model::AttachmentInfo {
+                id: "att1".to_string(),
+                title: "plan.pdf".to_string(),
+                version: None,
+                media_type: None,
+                file_size: None,
+                download_url: Some(url.to_string()),
+                comment: None,
+            }],
+        );
+
+        assert_eq!(
+            pulled.trim(),
+            format!(
+                r#"<a href="{url}" data-card-appearance="inline">{url}</a> and [plain](attachments/plan.pdf)"#
+            )
+        );
     }
 
     #[test]

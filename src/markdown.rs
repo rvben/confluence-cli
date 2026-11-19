@@ -2070,14 +2070,7 @@ fn render_inline_node(node: Node<'_, '_>, source: &str) -> Option<String> {
             "`{}`",
             node.text().unwrap_or_default().trim().replace('`', r"\`")
         )),
-        "a" => {
-            let href = node.attribute("href")?;
-            let label = render_inline_children(node, source)?.trim().to_string();
-            Some(format!(
-                "[{}]({href})",
-                if label.is_empty() { href } else { &label }
-            ))
-        }
+        "a" => render_link(node, source),
         "img" => {
             let src = node.attribute("src")?;
             let alt = node.attribute("alt").unwrap_or_default();
@@ -2266,6 +2259,126 @@ pub(crate) fn encode_target_segment(segment: &str) -> String {
     encoded
 }
 
+/// Attribute of a link that Confluence assigns itself and that says nothing
+/// about how the link looks.
+const LINK_LOCAL_ID_ATTRIBUTE: &str = "local-id";
+
+/// Renders a link as a Markdown link. A link that carries more than its
+/// address, such as how Confluence displays it, is written as an inline tag
+/// with those attributes, which Markdown has no syntax for.
+fn render_link(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let href = node.attribute("href")?;
+    let label = render_inline_children(node, source)?.trim().to_string();
+    let attributes: Vec<_> = node
+        .attributes()
+        .filter(|attribute| {
+            attribute.namespace().is_some() || attribute.name() != LINK_LOCAL_ID_ATTRIBUTE
+        })
+        .collect();
+    if attributes.len() == 1 {
+        return Some(format!(
+            "[{}]({href})",
+            if label.is_empty() { href } else { &label }
+        ));
+    }
+
+    let mut tag = String::from("<a");
+    for attribute in attributes {
+        // A prefixed attribute needs a namespace declaration that an inline
+        // tag does not carry, and Markdown reads a tag only when its
+        // attribute names are plain.
+        if attribute.namespace().is_some() || !is_markdown_attribute_name(attribute.name()) {
+            return None;
+        }
+        tag.push_str(&format!(
+            r#" {}="{}""#,
+            attribute.name(),
+            escape_inline_tag_attribute(attribute.value())
+        ));
+    }
+    tag.push('>');
+    tag.push_str(&label);
+    tag.push_str("</a>");
+    // Markdown ends an inline tag at a blank line, and a line break inside
+    // one has no single reading.
+    (!tag.contains('\n')).then_some(tag)
+}
+
+/// Escapes an attribute value of an inline tag. A bar is written as a
+/// character reference, since a table cell would otherwise put a backslash
+/// before it that an inline tag keeps. So is white space other than a space,
+/// which an attribute value holds only when written that way.
+fn escape_inline_tag_attribute(value: &str) -> String {
+    escape_xml(value)
+        .replace('|', "&#124;")
+        .replace('\t', "&#9;")
+        .replace('\n', "&#10;")
+        .replace('\r', "&#13;")
+}
+
+/// Whether Markdown accepts the name as an attribute name of an inline tag.
+fn is_markdown_attribute_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-')
+        })
+}
+
+/// Attributes of a Confluence link that say how the link is displayed. A
+/// placeholder link target carries them as query parameters of the same
+/// name.
+const LINK_DISPLAY_ATTRIBUTES: [&str; 2] = ["card-appearance", "tooltip"];
+
+/// Reads the display attributes of a Confluence link. There is no result
+/// when the link has an attribute that a placeholder link target cannot
+/// carry.
+fn confluence_link_display_attributes<'a>(node: Node<'a, '_>) -> Option<Vec<(&'a str, &'a str)>> {
+    let mut display = Vec::new();
+    for attribute in node.attributes() {
+        if attribute.namespace() != Some(AC_NS) {
+            return None;
+        }
+        if LINK_DISPLAY_ATTRIBUTES.contains(&attribute.name()) {
+            display.push((attribute.name(), attribute.value()));
+        } else if attribute.name() != "anchor" {
+            return None;
+        }
+    }
+    Some(display)
+}
+
+fn with_display_attributes(target: &str, display: &[(&str, &str)]) -> String {
+    if display.is_empty() {
+        return target.to_string();
+    }
+    let Ok(mut url) = Url::parse(target) else {
+        return target.to_string();
+    };
+    url.query_pairs_mut().extend_pairs(display);
+    url.to_string()
+}
+
+/// The display attributes that a placeholder link target carries, by the
+/// name they have on a Confluence link.
+pub(crate) fn link_display_attributes(target: &str) -> Vec<(String, String)> {
+    let Ok(url) = Url::parse(&target.replace("&amp;", "&")) else {
+        return Vec::new();
+    };
+    let mut display: Vec<(String, String)> = Vec::new();
+    for (key, value) in url.query_pairs() {
+        // An element holds an attribute once, so the first value counts.
+        if LINK_DISPLAY_ATTRIBUTES.contains(&key.as_ref())
+            && !display.iter().any(|(name, _)| *name == key)
+        {
+            display.push((key.into_owned(), value.into_owned()));
+        }
+    }
+    display
+}
+
 /// Query parameter that marks a placeholder link whose text was generated
 /// on pull because the Confluence link has no body of its own.
 const GENERATED_LABEL_PARAMETER: (&str, &str) = ("label", "generated");
@@ -2303,6 +2416,7 @@ pub(crate) fn has_generated_label(target: &str) -> bool {
 
 fn render_confluence_link(node: Node<'_, '_>, source: &str) -> Option<String> {
     let anchor = node.attribute((AC_NS, "anchor"));
+    let display = confluence_link_display_attributes(node)?;
     let label = link_label(node, source)?;
 
     if let Some(page) = namespaced_child(node, RI_NS, "page") {
@@ -2314,7 +2428,7 @@ fn render_confluence_link(node: Node<'_, '_>, source: &str) -> Option<String> {
                 .map(ToOwned::to_owned),
             anchor: anchor.map(ToOwned::to_owned),
         };
-        let target = build_page_placeholder_url(&placeholder);
+        let target = with_display_attributes(&build_page_placeholder_url(&placeholder), &display);
         let (label, target) = label_or_generated(label, &placeholder.default_label(), target);
         return Some(format!("[{}]({target})", label.trim()));
     }
@@ -2325,9 +2439,14 @@ fn render_confluence_link(node: Node<'_, '_>, source: &str) -> Option<String> {
             user_key: user.attribute((RI_NS, "userkey")).map(ToOwned::to_owned),
             username: user.attribute((RI_NS, "username")).map(ToOwned::to_owned),
         };
-        let target = build_user_placeholder_url(&placeholder);
+        let target = with_display_attributes(&build_user_placeholder_url(&placeholder), &display);
         let (label, target) = label_or_generated(label, &placeholder.default_label(), target);
         return Some(format!("[{}]({target})", label.trim()));
+    }
+
+    // Only a link to a page or a user has a target that carries them.
+    if !display.is_empty() {
+        return None;
     }
 
     if let Some(attachment) = namespaced_child(node, RI_NS, "attachment") {
