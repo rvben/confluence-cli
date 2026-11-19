@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -12,9 +13,12 @@ use walkdir::WalkDir;
 
 use crate::markdown::{
     Frontmatter, LocalDocument, PageLinkPlaceholder, Sidecar, UserMentionPlaceholder,
-    build_page_placeholder_url, document_dir_name, load_document, markdown_to_storage,
-    parse_page_placeholder_url, parse_status_placeholder_url, parse_user_placeholder_url,
-    save_document, scan_local_documents, sha256_hex, storage_to_markdown,
+    build_page_placeholder_url, build_storage_link_body, decode_character_references,
+    document_dir_name, encode_target_segment, has_generated_label, is_local_target,
+    link_body_unless_default, load_document, markdown_to_storage, parse_page_placeholder_url,
+    parse_status_placeholder_url, parse_user_placeholder_url, rewrite_outside_cdata,
+    rewrite_outside_literal_sections, save_document, scan_local_documents, sha256_hex,
+    split_target_fragment, storage_to_markdown,
 };
 use crate::model::{AttachmentState, ContentItem, ContentKind, PlanActionKind, PlanItem, SyncPlan};
 use crate::provider::ConfluenceProvider;
@@ -121,12 +125,8 @@ pub fn plan_path(
     let mut plan = SyncPlan::default();
     for doc in docs {
         validate_informational_parent(&doc)?;
-        let storage = render_body_storage(
-            &doc,
-            &link_index,
-            allow_lossy,
-            effective_web_path_prefix(&doc.sidecar, None),
-        )?;
+        let web_path_prefix = effective_web_path_prefix(&doc.sidecar, None);
+        let storage = render_body_storage(&doc, &link_index, allow_lossy, &web_path_prefix)?;
         let storage_hash = sha256_hex(storage.as_bytes());
         let current_hash = markdown_body_hash(&doc.body_markdown);
         let derived_parent_id =
@@ -1030,7 +1030,7 @@ async fn write_items(
         body_markdown = rewrite_page_links(&body_markdown, dir, &paths, &item_map);
         body_markdown =
             rewrite_generic_macro_page_placeholders(&body_markdown, dir, &paths, &item_map);
-        body_markdown = rewrite_attachment_links(&body_markdown, dir, &attachments);
+        body_markdown = rewrite_attachment_links(&body_markdown, &attachments);
 
         let frontmatter = Frontmatter {
             title: item.title.clone(),
@@ -1077,20 +1077,68 @@ async fn write_items(
         });
     }
 
-    let link_index = build_link_index(&docs_to_write);
-    for mut doc in docs_to_write {
-        let storage = render_body_storage(
-            &doc,
-            &link_index,
-            false,
-            effective_web_path_prefix(&doc.sidecar, None),
-        )?;
-        doc.sidecar.storage_hash = Some(sha256_hex(storage.as_bytes()));
+    for doc in stamp_storage_hashes(docs_to_write)? {
         save_document(&doc)?;
         written.push(doc.directory.clone());
     }
 
     Ok(written)
+}
+
+/// Records on each pulled document the hash of the storage its Markdown
+/// converts back to. Every document is converted before any is returned, so
+/// a failure reports all affected pages rather than only the first.
+fn stamp_storage_hashes(docs: Vec<LocalDocument>) -> Result<Vec<LocalDocument>> {
+    let link_index = build_link_index(&docs);
+    let total = docs.len();
+    let mut stamped = Vec::with_capacity(total);
+    let mut failures = Vec::new();
+    for mut doc in docs {
+        match render_body_storage(
+            &doc,
+            &link_index,
+            false,
+            effective_web_path_prefix(&doc.sidecar, None),
+        ) {
+            Ok(storage) => {
+                doc.sidecar.storage_hash = Some(sha256_hex(storage.as_bytes()));
+                stamped.push(doc);
+            }
+            Err(error) => failures.push(serde_json::json!({
+                "content_id": doc.sidecar.content_id,
+                "title": doc.frontmatter.title,
+                "error": format!("{error:#}"),
+            })),
+        }
+    }
+    if failures.is_empty() {
+        return Ok(stamped);
+    }
+
+    let summary = failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "{} ({}): {}",
+                failure["content_id"].as_str().unwrap_or("unknown ID"),
+                failure["title"].as_str().unwrap_or_default(),
+                failure["error"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(crate::output::typed_error_with_details(
+        crate::output::ErrorKind::Unexpected,
+        format!(
+            "{} of {total} pulled pages do not convert back to valid storage: {summary}",
+            failures.len()
+        ),
+        Some(
+            "Nothing was written. Pull the remaining pages individually, and report the listed pages as a conversion bug."
+                .to_string(),
+        ),
+        serde_json::json!({ "operation": "pull", "pages": failures }),
+    ))
 }
 
 fn safe_attachment_file_name(title: &str) -> Result<&str> {
@@ -1457,34 +1505,50 @@ fn default_web_path_prefix(provider: crate::model::ProviderKind) -> &'static str
     }
 }
 
+/// Resolves the placeholder and local targets of rendered storage to their
+/// Confluence form. CDATA sections hold literal text, such as the body of a
+/// code macro or of a link, and pass through untouched. Each step skips them
+/// on its own, so text one step wraps in CDATA is literal to the next.
 fn rewrite_local_links_to_remote(
     storage: &str,
     current_dir: &Path,
     link_index: &LinkIndex,
     web_path_prefix: &str,
 ) -> String {
-    let rewritten_placeholders = rewrite_placeholder_links_to_storage(storage);
-    let link_re = Regex::new(r#"<a([^>]*?)href="([^"]+)"([^>]*)>"#).expect("valid anchor regex");
-    let image_re = Regex::new(r#"<img([^>]*?)src="([^"]+)"([^>]*)>"#).expect("valid image regex");
+    static ELEMENT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"<(a|img)(\s[^>]*)>").expect("valid element regex"));
+    static HREF: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(\s)href="([^"]+)""#).expect("valid href regex"));
+    static SRC: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(\s)src="([^"]+)""#).expect("valid src regex"));
 
-    let rewritten =
-        link_re.replace_all(&rewritten_placeholders, |captures: &regex::Captures<'_>| {
-            let original = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
-            let href = rewrite_local_target_url(current_dir, original, link_index, web_path_prefix)
-                .unwrap_or_else(|| original.to_string());
-            format!(r#"<a{}href="{}"{}>"#, &captures[1], href, &captures[3])
-        });
-
-    image_re
-        .replace_all(&rewritten, |captures: &regex::Captures<'_>| {
-            let original = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
-            let src = rewrite_local_target_url(current_dir, original, link_index, web_path_prefix)
-                .unwrap_or_else(|| original.to_string());
-            format!(r#"<img{}src="{}"{}>"#, &captures[1], src, &captures[3])
-        })
-        .to_string()
+    let storage = rewrite_outside_cdata(storage, rewrite_placeholder_links_to_storage);
+    rewrite_outside_literal_sections(&storage, |markup| {
+        ELEMENT
+            .replace_all(markup, |element: &regex::Captures<'_>| {
+                // An anchor links through `href` and an image through `src`.
+                // Other attributes are left alone, whatever their name ends in.
+                let (name, target_attribute) = match &element[1] {
+                    "a" => ("href", &*HREF),
+                    _ => ("src", &*SRC),
+                };
+                let attributes =
+                    target_attribute.replace(&element[2], |captures: &regex::Captures<'_>| {
+                        let original = &captures[2];
+                        let target = rewrite_local_target_url(
+                            current_dir,
+                            original,
+                            link_index,
+                            web_path_prefix,
+                        )
+                        .unwrap_or_else(|| original.to_string());
+                        format!(r#"{}{name}="{target}""#, &captures[1])
+                    });
+                format!("<{}{attributes}>", &element[1])
+            })
+            .into_owned()
+    })
 }
-
 fn rewrite_local_target_url(
     current_dir: &Path,
     target: &str,
@@ -1503,12 +1567,19 @@ fn rewrite_local_target_url(
         return None;
     }
 
-    let (path_part, fragment) = split_target_fragment(target);
+    let target = decode_character_references(target);
+    let (path_part, fragment) = split_target_fragment(&target);
     if path_part.is_empty() {
         return None;
     }
+    let (path_part, query) = match path_part.split_once('?') {
+        Some((path, query)) => (path, Some(escape_xml_attr(query))),
+        None => (path_part, None),
+    };
+    let path_part = urlencoding::decode(path_part).ok()?;
+    let fragment = fragment.map(escape_xml_attr);
 
-    let resolved = normalize_path(current_dir.join(path_part));
+    let resolved = normalize_path(current_dir.join(path_part.as_ref()));
     let markdown_target = if resolved.file_name().and_then(|name| name.to_str()) == Some("index.md")
     {
         resolved.clone()
@@ -1525,7 +1596,11 @@ fn rewrite_local_target_url(
             "{}/pages/viewpage.action?pageId={content_id}",
             web_path_prefix.trim_end_matches('/')
         );
-        if let Some(fragment) = fragment {
+        if let Some(query) = &query {
+            url.push_str("&amp;");
+            url.push_str(query);
+        }
+        if let Some(fragment) = &fragment {
             url.push('#');
             url.push_str(fragment);
         }
@@ -1546,30 +1621,15 @@ fn rewrite_local_target_url(
         web_path_prefix.trim_end_matches('/'),
         urlencoding::encode(file_name)
     );
-    if let Some(fragment) = fragment {
+    if let Some(query) = &query {
+        url.push('?');
+        url.push_str(query);
+    }
+    if let Some(fragment) = &fragment {
         url.push('#');
         url.push_str(fragment);
     }
     Some(url)
-}
-
-fn is_local_target(target: &str) -> bool {
-    !(target.is_empty()
-        || target.starts_with('#')
-        || target.starts_with('/')
-        || target.starts_with("http://")
-        || target.starts_with("https://")
-        || target.starts_with("mailto:")
-        || target.starts_with("tel:")
-        || target.starts_with("data:"))
-}
-
-fn split_target_fragment(target: &str) -> (&str, Option<&str>) {
-    if let Some((path, fragment)) = target.split_once('#') {
-        (path, Some(fragment))
-    } else {
-        (target, None)
-    }
 }
 
 fn normalize_path(path: PathBuf) -> PathBuf {
@@ -1693,6 +1753,11 @@ fn rewrite_page_links(
     placeholder_re
         .replace_all(&rewritten, |captures: &regex::Captures<'_>| {
             let target = captures.get(0).map(|m| m.as_str()).unwrap_or_default();
+            // A link pulled without a body keeps its placeholder, which is
+            // what lets apply write it without a body again.
+            if has_generated_label(target) {
+                return target.to_string();
+            }
             resolve_placeholder_to_local_path(target, current_dir, paths, items)
                 .unwrap_or_else(|| target.to_string())
         })
@@ -1736,17 +1801,13 @@ fn find_item_by_title<'a>(
 
 fn rewrite_attachment_links(
     markdown: &str,
-    current_dir: &Path,
     attachments: &[crate::model::AttachmentInfo],
 ) -> String {
     let mut rewritten = markdown.to_string();
     for attachment in attachments {
-        let target = diff_paths(
-            current_dir.join("attachments").join(&attachment.title),
-            current_dir,
-        )
-        .unwrap_or_else(|| PathBuf::from("attachments").join(&attachment.title));
-        let replacement = target.to_string_lossy().replace('\\', "/");
+        // The file name is one segment of a link destination, where a
+        // literal `%` or space would be read as something else.
+        let replacement = format!("attachments/{}", encode_target_segment(&attachment.title));
         if let Some(url) = &attachment.download_url {
             rewritten = rewritten.replace(url, &replacement);
         }
@@ -1826,11 +1887,13 @@ fn rewrite_generic_macro_page_placeholder_line(
 }
 
 fn rewrite_placeholder_links_to_storage(storage: &str) -> String {
-    let re = Regex::new(
-        r#"(?s)<a([^>]*?)href="(confluence-(?:page|user|status)://[^"]+)"([^>]*)>(.*?)</a>"#,
-    )
-    .expect("valid placeholder link regex");
-    re.replace_all(storage, |captures: &regex::Captures<'_>| {
+    static LINK: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?s)<a([^>]*?)href="(confluence-(?:page|user|status)://[^"]+)"([^>]*)>(.*?)</a>"#,
+        )
+        .expect("valid placeholder link regex")
+    });
+    LINK.replace_all(storage, |captures: &regex::Captures<'_>| {
         let target = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
         let body = captures.get(4).map(|m| m.as_str()).unwrap_or_default();
         placeholder_to_storage_macro(target, body).unwrap_or_else(|| captures[0].to_string())
@@ -1858,7 +1921,7 @@ fn placeholder_to_storage_macro(target: &str, body_html: &str) -> Option<String>
                 escape_xml_attr(content_id)
             )
         };
-        let body = build_storage_link_body(body_html);
+        let body = placeholder_link_body(target, body_html, &placeholder.default_label());
         return Some(format!(
             r#"<ac:link{anchor_attr}>{resource}{body}</ac:link>"#
         ));
@@ -1866,7 +1929,7 @@ fn placeholder_to_storage_macro(target: &str, body_html: &str) -> Option<String>
 
     if let Some(placeholder) = parse_user_placeholder_url(target) {
         let resource = user_placeholder_to_storage_resource(&placeholder)?;
-        let body = build_storage_link_body(body_html);
+        let body = placeholder_link_body(target, body_html, &placeholder.default_label());
         return Some(format!(r#"<ac:link>{resource}{body}</ac:link>"#));
     }
 
@@ -1915,15 +1978,14 @@ fn user_placeholder_to_storage_resource(placeholder: &UserMentionPlaceholder) ->
         .map(|username| format!(r#"<ri:user ri:username="{}" />"#, escape_xml_attr(username)))
 }
 
-fn build_storage_link_body(body_html: &str) -> String {
-    let trimmed = body_html.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if trimmed.contains('<') {
-        format!("<ac:link-body>{trimmed}</ac:link-body>")
+/// Builds the body of a placeholder link. A target marked as carrying a
+/// generated label stands for a link without a body, and stays without one
+/// for as long as its text is still that label.
+fn placeholder_link_body(target: &str, body_html: &str, generated_label: &str) -> String {
+    if has_generated_label(target) {
+        link_body_unless_default(body_html, generated_label)
     } else {
-        format!("<ac:plain-text-link-body><![CDATA[{trimmed}]]></ac:plain-text-link-body>")
+        build_storage_link_body(body_html)
     }
 }
 
@@ -2446,6 +2508,66 @@ mod tests {
         assert_eq!(plan.items[0].action, PlanActionKind::Noop);
     }
 
+    /// Plans a pulled page whose sidecar records `storage_hash` for its
+    /// rendered body, and returns the planned action.
+    fn plan_action_with_recorded_storage_hash(body: &str, storage_hash: &str) -> PlanActionKind {
+        let dir = tempdir().expect("tempdir");
+        let page_dir = dir.path().join("root-page--123");
+        fs::create_dir_all(&page_dir).expect("create");
+        let frontmatter = Frontmatter {
+            title: "Root Page".to_string(),
+            kind: "page".to_string(),
+            labels: vec![],
+            status: "current".to_string(),
+            parent: None,
+            properties: BTreeMap::new(),
+        };
+        fs::write(
+            page_dir.join("index.md"),
+            render_document(&frontmatter, body).expect("rendered"),
+        )
+        .expect("write markdown");
+        fs::write(
+            page_dir.join(".confluence.json"),
+            serde_json::to_string_pretty(&Sidecar {
+                content_id: Some("123".to_string()),
+                space_key: Some("DOCS".to_string()),
+                provider: Some(ProviderKind::Cloud),
+                remote_version: Some(7),
+                last_pulled_hash: Some(markdown_body_hash(body)),
+                storage_hash: Some(storage_hash.to_string()),
+                remote_storage_hash: Some(sha256_hex("remote storage")),
+                ..Sidecar::default()
+            })
+            .expect("sidecar"),
+        )
+        .expect("write sidecar");
+
+        let plan = plan_path(dir.path(), false, false, false).expect("plan");
+
+        assert_eq!(plan.items.len(), 1);
+        plan.items[0].action.clone()
+    }
+
+    #[test]
+    fn plan_keeps_a_page_whose_rendering_matches_the_recorded_hash() {
+        assert_eq!(
+            plan_action_with_recorded_storage_hash("# Root", &sha256_hex("<h1>Root</h1>")),
+            PlanActionKind::Noop
+        );
+    }
+
+    #[test]
+    fn plan_updates_a_page_whose_rendering_differs_from_the_recorded_hash() {
+        assert_eq!(
+            plan_action_with_recorded_storage_hash(
+                "# Root",
+                &sha256_hex("storage an earlier release rendered"),
+            ),
+            PlanActionKind::UpdateContent
+        );
+    }
+
     #[test]
     fn plan_detects_title_change_when_sidecar_tracks_metadata() {
         let dir = tempdir().expect("tempdir");
@@ -2758,7 +2880,7 @@ mod tests {
                 properties: BTreeMap::new(),
             },
             body_markdown:
-                "[Sibling](../sibling-page--456/index.md#intro)\n\n![Logo](attachments/logo.png)\n"
+                "[Sibling](../sibling-page--456/index.md#intro)\n\n![Logo](attachments/logo.png)\n\n[Comment](../sibling-page--456/index.md?focusedCommentId=42#details)\n"
                     .to_string(),
             sidecar: Sidecar {
                 content_id: Some("123".to_string()),
@@ -2793,7 +2915,13 @@ mod tests {
             render_body_storage(&current, &index, false, "/wiki").expect("render body storage");
 
         assert!(storage.contains(r#"href="/wiki/pages/viewpage.action?pageId=456#intro""#));
-        assert!(storage.contains(r#"src="/wiki/download/attachments/123/logo.png""#));
+        assert!(storage.contains(
+            r#"href="/wiki/pages/viewpage.action?pageId=456&amp;focusedCommentId=42#details""#
+        ));
+        assert!(storage.contains(
+            r#"<ac:image ac:alt="Logo"><ri:attachment ri:filename="logo.png" /></ac:image>"#
+        ));
+        assert!(!storage.contains("download/attachments"));
     }
 
     #[test]
@@ -3419,5 +3547,877 @@ mod tests {
         assert!(storage.contains(
             r#"<ac:parameter ac:name="name"><ri:attachment ri:filename="manual.docx" /></ac:parameter>"#
         ));
+    }
+}
+
+/// Pulls storage to Markdown and renders it back through the apply path,
+/// asserting the result is the same document as the remote original.
+#[cfg(test)]
+mod round_trip_tests {
+    use std::collections::BTreeMap;
+
+    use roxmltree::{Document, Node, NodeType};
+
+    use super::*;
+    use crate::markdown::{Frontmatter, Sidecar, storage_to_markdown};
+    use crate::model::ProviderKind;
+
+    const WRAPPER_OPEN: &str =
+        r#"<root xmlns:ac="urn:confluence-ac" xmlns:ri="urn:confluence-ri">"#;
+
+    fn apply_storage(markdown: &str) -> Result<String> {
+        apply_storage_in("/tmp/root/current-page--123", markdown)
+    }
+
+    fn apply_storage_in(directory: &str, markdown: &str) -> Result<String> {
+        let directory = PathBuf::from(directory);
+        let doc = LocalDocument {
+            directory: directory.clone(),
+            markdown_path: directory.join("index.md"),
+            sidecar_path: directory.join(".confluence.json"),
+            frontmatter: Frontmatter {
+                title: "Current".to_string(),
+                kind: "page".to_string(),
+                labels: vec![],
+                status: "current".to_string(),
+                parent: None,
+                properties: BTreeMap::new(),
+            },
+            body_markdown: markdown.to_string(),
+            sidecar: Sidecar {
+                content_id: Some("123".to_string()),
+                provider: Some(ProviderKind::DataCenter),
+                ..Sidecar::default()
+            },
+        };
+        let index = build_link_index(std::slice::from_ref(&doc));
+        render_body_storage(&doc, &index, false, "")
+    }
+
+    /// Serialises storage with attributes sorted, entities resolved and
+    /// insignificant whitespace removed, so two spellings of one document
+    /// compare equal.
+    fn canonical(storage: &str) -> String {
+        let wrapped = format!("{WRAPPER_OPEN}{storage}</root>");
+        let document = Document::parse(&wrapped)
+            .unwrap_or_else(|error| panic!("storage is not well-formed: {error}\n{storage}"));
+        let mut out = String::new();
+        for child in document.root_element().children() {
+            write_canonical(child, &mut out);
+        }
+        out
+    }
+
+    fn write_canonical(node: Node<'_, '_>, out: &mut String) {
+        match node.node_type() {
+            NodeType::Text => {
+                let text = node.text().unwrap_or_default();
+                let literal = node.parent().is_some_and(|parent| {
+                    matches!(
+                        parent.tag_name().name(),
+                        "plain-text-body" | "plain-text-link-body" | "pre" | "code"
+                    )
+                });
+                if literal {
+                    out.push_str(&format!("{text:?}"));
+                    return;
+                }
+                // A line break at either end of a text node is layout. Other
+                // whitespace separates words, also from a neighbouring
+                // element.
+                let layout = |edge: &str| edge.contains('\n');
+                let leading = &text[..text.len() - text.trim_start().len()];
+                let trailing = &text[text.trim_end().len()..];
+                let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                if words.is_empty() {
+                    if !text.is_empty() && !layout(text) {
+                        out.push_str("\" \"");
+                    }
+                    return;
+                }
+                let before = if leading.is_empty() || layout(leading) {
+                    ""
+                } else {
+                    " "
+                };
+                let after = if trailing.is_empty() || layout(trailing) {
+                    ""
+                } else {
+                    " "
+                };
+                out.push_str(&format!("{:?}", format!("{before}{words}{after}")));
+            }
+            NodeType::Element => {
+                let prefix = match node.tag_name().namespace() {
+                    Some("urn:confluence-ac") => "ac:",
+                    Some("urn:confluence-ri") => "ri:",
+                    _ => "",
+                };
+                out.push_str(&format!("<{prefix}{}", node.tag_name().name()));
+                let mut attributes: Vec<String> = node
+                    .attributes()
+                    .map(|attribute| format!(" {}={:?}", attribute.name(), attribute.value()))
+                    .collect();
+                attributes.sort();
+                out.push_str(&attributes.concat());
+                out.push('>');
+                for child in node.children() {
+                    write_canonical(child, out);
+                }
+                out.push_str("</>");
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_round_trips(storage: &str) {
+        let markdown = storage_to_markdown(storage);
+        let applied = apply_storage(&markdown)
+            .unwrap_or_else(|error| panic!("apply failed for {markdown:?}: {error:#}"));
+        assert_eq!(
+            canonical(&applied),
+            canonical(storage),
+            "pulled as {markdown:?}, applied as {applied}"
+        );
+    }
+
+    #[test]
+    fn straight_quotes_and_ascii_punctuation_survive() {
+        assert_round_trips(r#"<p>NXP's "Caddy" path</p>"#);
+        assert_round_trips("<p>a -- b --- c ... d</p>");
+    }
+
+    #[test]
+    fn nested_numbered_list_starting_past_one_keeps_its_structure() {
+        assert_round_trips(
+            r#"<ul><li>Parent<ol start="3"><li>third</li><li>fourth</li></ol></li></ul>"#,
+        );
+        assert_round_trips(
+            r#"<ul><li>Parent<ul><li>sub</li></ul><ol start="3"><li>third</li></ol></li></ul>"#,
+        );
+        assert_round_trips(r#"<ol><li>one<ol start="0"><li>zero</li></ol></li></ol>"#);
+    }
+
+    #[test]
+    fn link_markup_quoted_in_a_comment_leaves_the_links_after_it_alone() {
+        let applied = apply_storage(concat!(
+            "<!-- example: <a href=\"attachments/manual.pdf\"> -->\n\n",
+            "[Guide](https://example.com) and ![shot](attachments/shot.png)\n\n",
+            "<!-- <img src=\"attachments/old.png\" /> -->",
+        ))
+        .expect("apply");
+
+        assert!(
+            applied.contains(r#"<a href="https://example.com">Guide</a>"#),
+            "{applied}"
+        );
+        assert!(
+            applied.contains(r#"<!-- example: <a href="attachments/manual.pdf"> -->"#),
+            "{applied}"
+        );
+        assert!(
+            applied.contains(r#"<!-- <img src="attachments/old.png" /> -->"#),
+            "{applied}"
+        );
+        assert!(
+            applied.contains(r#"<ri:attachment ri:filename="shot.png" />"#),
+            "{applied}"
+        );
+    }
+
+    #[test]
+    fn link_whose_body_has_no_markdown_form_keeps_that_body() {
+        for resource in [
+            r#"<ri:page ri:content-title="Home" />"#,
+            r#"<ri:user ri:account-id="abc" />"#,
+            r#"<ri:attachment ri:filename="report.pdf" />"#,
+        ] {
+            assert_round_trips(&format!(
+                concat!(
+                    "<p><ac:link>{}<ac:link-body>",
+                    r#"<ac:image ac:width="20"><ri:url ri:value="https://example.com/x.png" /></ac:image>"#,
+                    "</ac:link-body></ac:link></p>"
+                ),
+                resource
+            ));
+        }
+    }
+
+    #[test]
+    fn download_link_to_an_attachment_with_a_percent_in_its_name_names_that_file() {
+        let url = "https://example.com/download/attachments/123/budget%2520final.pdf";
+        let pulled = rewrite_attachment_links(
+            &storage_to_markdown(&format!(r#"<p><a href="{url}">Budget</a></p>"#)),
+            &[crate::model::AttachmentInfo {
+                id: "att1".to_string(),
+                title: "budget%20final.pdf".to_string(),
+                version: None,
+                media_type: None,
+                file_size: None,
+                download_url: Some(url.to_string()),
+                comment: None,
+            }],
+        );
+
+        let applied = apply_storage(&pulled).expect("apply");
+
+        assert!(
+            applied.contains(r#"<ri:attachment ri:filename="budget%20final.pdf" />"#),
+            "pulled as {pulled:?}, applied as {applied}"
+        );
+    }
+
+    #[test]
+    fn mention_whose_label_holds_a_comment_is_still_a_mention() {
+        let applied =
+            apply_storage("[A<!--note-->B](confluence-user://user?username=jdoe)").expect("apply");
+
+        assert!(
+            applied.contains(r#"<ri:user ri:username="jdoe" />"#),
+            "{applied}"
+        );
+        assert!(!applied.contains("confluence-user://"), "{applied}");
+    }
+
+    #[test]
+    fn attachment_link_whose_text_holds_a_link_still_converts() {
+        let applied = apply_storage("[<https://example.com>](attachments/manual.pdf)");
+
+        assert!(applied.is_ok(), "{applied:?}");
+    }
+
+    #[test]
+    fn confluence_markup_in_a_leading_metadata_block_is_not_refused() {
+        let applied =
+            apply_storage("---\nexample: <ac:link ac:key=\"A\"/>\n---\n\nBody").expect("apply");
+
+        assert_eq!(canonical(&applied), canonical("<p>Body</p>"));
+    }
+
+    #[test]
+    fn nested_lists_keep_their_structure() {
+        assert_round_trips("<ol><li>one<ol><li>sub</li></ol></li><li>two</li></ol>");
+        assert_round_trips("<ol><li>one<ul><li>sub</li></ul></li><li>two</li></ol>");
+        assert_round_trips("<ul><li>one<ol><li>sub</li></ol></li><li>two</li></ul>");
+        assert_round_trips("<ul><li>one<ul><li>sub</li></ul></li><li>two</li></ul>");
+        assert_round_trips(
+            "<ol><li>one<ol><li>sub<ul><li>deep<ol><li>deeper</li></ol></li></ul></li></ol></li></ol>",
+        );
+    }
+
+    #[test]
+    fn ordered_list_start_number_survives() {
+        assert_round_trips(r#"<ol start="3"><li>three</li><li>four</li></ol>"#);
+        assert_round_trips(
+            r#"<ol start="10"><li>ten<ol><li>sub</li></ol></li><li>eleven</li></ol>"#,
+        );
+    }
+
+    #[test]
+    fn mention_without_link_body_gains_none() {
+        assert_round_trips(
+            r#"<p>ask <ac:link><ri:user ri:userkey="8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a" /></ac:link> now</p>"#,
+        );
+        assert_round_trips(
+            r#"<p>ask <ac:link><ri:user ri:account-id="557058:abc" /></ac:link> now</p>"#,
+        );
+        assert_round_trips(r#"<p>ask <ac:link><ri:user ri:username="jdoe" /></ac:link> now</p>"#);
+    }
+
+    #[test]
+    fn mention_with_link_body_keeps_it() {
+        assert_round_trips(
+            r#"<p>ask <ac:link><ri:user ri:userkey="8a8a" /><ac:plain-text-link-body><![CDATA[Jane Doe]]></ac:plain-text-link-body></ac:link> now</p>"#,
+        );
+    }
+
+    #[test]
+    fn attachment_image_stays_an_attachment_reference() {
+        assert_round_trips(r#"<p><ac:image><ri:attachment ri:filename="x.png" /></ac:image></p>"#);
+        assert_round_trips(
+            r#"<p>see <ac:image ac:alt="A &quot;diagram&quot;"><ri:attachment ri:filename="x.png" /></ac:image> here</p>"#,
+        );
+        assert_round_trips(
+            r#"<p><ac:image ac:alt="Diagram" ac:title="Hover text"><ri:attachment ri:filename="x.png" /></ac:image></p>"#,
+        );
+        assert_round_trips(
+            r#"<p><ac:image><ri:attachment ri:filename="my file (1) &amp; more.png" /></ac:image></p>"#,
+        );
+    }
+
+    #[test]
+    fn image_layout_attributes_survive() {
+        assert_round_trips(
+            r#"<p><ac:image ac:width="300" ac:align="center"><ri:attachment ri:filename="x.png" /></ac:image></p>"#,
+        );
+        assert_round_trips(
+            r#"<p>inline <ac:image ac:thumbnail="true"><ri:attachment ri:filename="x.png" /></ac:image> text</p>"#,
+        );
+    }
+
+    #[test]
+    fn image_attached_to_another_page_keeps_its_owner() {
+        assert_round_trips(
+            r#"<p><ac:image><ri:attachment ri:filename="x.png"><ri:page ri:content-title="Other" ri:space-key="DOCS" /></ri:attachment></ac:image></p>"#,
+        );
+    }
+
+    #[test]
+    fn external_image_stays_a_url_reference() {
+        assert_round_trips(
+            r#"<p><ac:image ac:alt="Logo"><ri:url ri:value="https://example.com/a.png?x=1&amp;y=2" /></ac:image></p>"#,
+        );
+    }
+
+    #[test]
+    fn attachment_link_stays_an_attachment_reference() {
+        assert_round_trips(
+            r#"<p><ac:link><ri:attachment ri:filename="manual.pdf" /><ac:plain-text-link-body><![CDATA[the manual]]></ac:plain-text-link-body></ac:link></p>"#,
+        );
+    }
+
+    #[test]
+    fn link_without_body_gains_none() {
+        assert_round_trips(
+            r#"<p><ac:link><ri:attachment ri:filename="manual v2.pdf" /></ac:link></p>"#,
+        );
+        assert_round_trips(
+            r#"<p><ac:link><ri:page ri:content-title="Release_notes *draft*" ri:space-key="DOCS" /></ac:link></p>"#,
+        );
+    }
+
+    fn pulled_document(content_id: &str, title: &str, markdown: &str) -> LocalDocument {
+        let directory = PathBuf::from(format!("/tmp/root/page--{content_id}"));
+        LocalDocument {
+            directory: directory.clone(),
+            markdown_path: directory.join("index.md"),
+            sidecar_path: directory.join(".confluence.json"),
+            frontmatter: Frontmatter {
+                title: title.to_string(),
+                kind: "page".to_string(),
+                labels: vec![],
+                status: "current".to_string(),
+                parent: None,
+                properties: BTreeMap::new(),
+            },
+            body_markdown: markdown.to_string(),
+            sidecar: Sidecar {
+                content_id: Some(content_id.to_string()),
+                provider: Some(ProviderKind::DataCenter),
+                ..Sidecar::default()
+            },
+        }
+    }
+
+    #[test]
+    fn pull_names_every_page_it_cannot_convert() {
+        let docs = vec![
+            pulled_document("101", "Fine", "plain text"),
+            pulled_document("202", "Broken one", "an <unclosed> tag"),
+            pulled_document("303", "Broken two", "another <open attr> tag"),
+        ];
+
+        let error = stamp_storage_hashes(docs).expect_err("unconvertible pages fail the pull");
+        let error = error
+            .downcast::<crate::output::CliError>()
+            .expect("typed error");
+
+        assert!(error.message.contains("2 of 3"), "{}", error.message);
+        assert!(
+            error.message.contains("202 (Broken one)"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("303 (Broken two)"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains("101"), "{}", error.message);
+        let pages = error.details.expect("details")["pages"].clone();
+        assert_eq!(pages[0]["content_id"], "202");
+        assert_eq!(pages[1]["title"], "Broken two");
+        assert!(
+            pages[0]["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("unclosed"))
+        );
+    }
+
+    #[test]
+    fn pull_records_the_storage_hash_of_every_convertible_page() {
+        let docs = vec![pulled_document("101", "Fine", "plain text")];
+        let stamped = stamp_storage_hashes(docs).expect("convertible pages succeed");
+        assert_eq!(
+            stamped[0].sidecar.storage_hash.as_deref(),
+            Some(sha256_hex("<p>plain text</p>".as_bytes()).as_str())
+        );
+    }
+
+    #[test]
+    fn link_body_that_matches_the_generated_label_is_kept() {
+        assert_round_trips(
+            r#"<p>ask <ac:link><ri:user ri:account-id="557058:abc" /><ac:plain-text-link-body><![CDATA[557058:abc]]></ac:plain-text-link-body></ac:link> now</p>"#,
+        );
+        assert_round_trips(
+            r#"<p>see <ac:link><ri:page ri:content-title="Roadmap" /><ac:plain-text-link-body><![CDATA[Roadmap]]></ac:plain-text-link-body></ac:link> now</p>"#,
+        );
+    }
+
+    /// Converts storage to Markdown as a pull that also holds the page
+    /// titled "Sibling" does, and returns the Markdown written for it.
+    fn pull_next_to_sibling(storage: &str) -> String {
+        let paths = BTreeMap::from([(
+            "456".to_string(),
+            PathBuf::from("/tmp/root/sibling-page--456"),
+        )]);
+        let items = BTreeMap::from([(
+            "456".to_string(),
+            ContentItem {
+                id: "456".to_string(),
+                kind: ContentKind::Page,
+                title: "Sibling".to_string(),
+                status: "current".to_string(),
+                space_id: None,
+                space_key: Some("MFS".to_string()),
+                parent_id: None,
+                version: None,
+                body_storage: None,
+                labels: vec![],
+                properties: BTreeMap::new(),
+                web_url: None,
+                created_at: None,
+                updated_at: None,
+            },
+        )]);
+        rewrite_page_links(
+            &storage_to_markdown(storage),
+            Path::new("/tmp/root/current-page--123"),
+            &paths,
+            &items,
+        )
+    }
+
+    #[test]
+    fn bodiless_link_to_a_page_of_the_same_pull_stays_bodiless() {
+        for storage in [
+            r#"<p>see <ac:link><ri:page ri:content-title="Sibling" ri:space-key="MFS" /></ac:link> now</p>"#,
+            r#"<p>see <ac:link ac:anchor="intro"><ri:page ri:content-title="Sibling" ri:space-key="MFS" /></ac:link> now</p>"#,
+        ] {
+            let applied = apply_storage(&pull_next_to_sibling(storage)).expect("apply");
+
+            assert_eq!(canonical(&applied), canonical(storage));
+        }
+    }
+
+    #[test]
+    fn edited_label_of_a_link_to_a_page_of_the_same_pull_becomes_its_body() {
+        let markdown = pull_next_to_sibling(
+            r#"<p>see <ac:link><ri:page ri:content-title="Sibling" ri:space-key="MFS" /></ac:link> now</p>"#,
+        )
+        .replace("[Sibling]", "[the sibling]");
+
+        let applied = apply_storage(&markdown).expect("apply");
+
+        assert_eq!(
+            canonical(&applied),
+            canonical(
+                r#"<p>see <ac:link><ri:page ri:content-title="Sibling" ri:space-key="MFS" /><ac:plain-text-link-body><![CDATA[the sibling]]></ac:plain-text-link-body></ac:link> now</p>"#
+            )
+        );
+    }
+
+    #[test]
+    fn link_with_a_body_to_a_page_of_the_same_pull_points_at_its_local_file() {
+        let markdown = pull_next_to_sibling(
+            r#"<p><ac:link><ri:page ri:content-title="Sibling" ri:space-key="MFS" /><ac:plain-text-link-body><![CDATA[over there]]></ac:plain-text-link-body></ac:link></p>"#,
+        );
+
+        assert_eq!(
+            markdown.trim(),
+            "[over there](../sibling-page--456/index.md)"
+        );
+    }
+
+    #[test]
+    fn link_whose_generated_label_was_edited_gains_that_text_as_its_body() {
+        let markdown = storage_to_markdown(
+            r#"<p>ask <ac:link><ri:user ri:username="jdoe" /></ac:link> now</p>"#,
+        )
+        .replace("[@jdoe]", "[Jane]");
+
+        let applied = apply_storage(&markdown).expect("apply");
+
+        assert_eq!(
+            canonical(&applied),
+            canonical(
+                r#"<p>ask <ac:link><ri:user ri:username="jdoe" /><ac:plain-text-link-body><![CDATA[Jane]]></ac:plain-text-link-body></ac:link> now</p>"#
+            )
+        );
+    }
+
+    #[test]
+    fn link_body_with_an_ampersand_survives() {
+        assert_round_trips(
+            r#"<p><ac:link><ri:page ri:content-title="Lab" /><ac:plain-text-link-body><![CDATA[R&D lab]]></ac:plain-text-link-body></ac:link></p>"#,
+        );
+        assert_round_trips(
+            r#"<p><ac:link><ri:attachment ri:filename="manual.pdf" /><ac:plain-text-link-body><![CDATA[R&D "manual" <draft>]]></ac:plain-text-link-body></ac:link></p>"#,
+        );
+    }
+
+    #[test]
+    fn attachment_file_names_with_url_characters_survive() {
+        for file_name in [
+            "budget%20final.pdf",
+            "report#2.pdf",
+            "O'Brien.pdf",
+            "my file (1).png",
+            "what?.png",
+            "a&amp;b.png",
+            "r\u{e9}sum\u{e9}.pdf",
+        ] {
+            assert_round_trips(&format!(
+                r#"<p><ac:image><ri:attachment ri:filename="{file_name}" /></ac:image></p>"#
+            ));
+            assert_round_trips(&format!(
+                r#"<p>see <ac:link><ri:attachment ri:filename="{file_name}" /></ac:link></p>"#
+            ));
+            assert_round_trips(&format!(
+                r#"<p>see <ac:link ac:anchor="page=2"><ri:attachment ri:filename="{file_name}" /><ac:plain-text-link-body><![CDATA[the file]]></ac:plain-text-link-body></ac:link></p>"#
+            ));
+        }
+    }
+
+    #[test]
+    fn attachment_file_names_stay_readable_in_markdown() {
+        let markdown = storage_to_markdown(
+            "<p><ac:link><ri:attachment ri:filename=\"r\u{e9}sum\u{e9}-v2.pdf\" /></ac:link></p>",
+        );
+
+        assert!(
+            markdown.contains("(attachments/r\u{e9}sum\u{e9}-v2.pdf)"),
+            "{markdown}"
+        );
+    }
+
+    #[test]
+    fn markup_quoted_inside_code_is_left_alone() {
+        let storage = r#"<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[<img src="https://example.org/logo.png" alt="Logo" />
+<a href="attachments/manual.pdf">manual.pdf</a>
+<a href="confluence-user://user?username=jdoe">@jdoe</a>]]></ac:plain-text-body></ac:structured-macro>"#;
+
+        assert_round_trips(storage);
+    }
+
+    #[test]
+    fn raw_html_image_with_sizing_keeps_its_attributes() {
+        let applied =
+            apply_storage(r#"<img src="https://example.org/chart.png" width="300" alt="Chart" />"#)
+                .expect("apply");
+
+        assert!(applied.contains(r#"width="300""#), "{applied}");
+        assert!(
+            applied.contains(r#"src="https://example.org/chart.png""#),
+            "{applied}"
+        );
+    }
+
+    #[test]
+    fn attachment_references_do_not_depend_on_how_the_root_is_spelled() {
+        let markdown = "![Logo](attachments/logo.png) and [the manual](attachments/manual.pdf)";
+        let expected = apply_storage_in("/tmp/root/page--123", markdown).expect("apply");
+        assert!(
+            expected.contains(r#"<ri:attachment ri:filename="logo.png" />"#),
+            "{expected}"
+        );
+
+        for directory in [".", "./page--123", "page--123", "root/../page--123"] {
+            assert_eq!(
+                apply_storage_in(directory, markdown).expect("apply"),
+                expected,
+                "document directory {directory:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_link_with_a_title_keeps_it() {
+        let applied = apply_storage(r#"[Manual](attachments/my%20file.pdf "Download the PDF")"#)
+            .expect("apply");
+
+        assert!(applied.contains(r#"title="Download the PDF""#), "{applied}");
+        assert!(
+            applied.contains(r#"href="/download/attachments/123/my%20file.pdf""#),
+            "{applied}"
+        );
+    }
+
+    #[test]
+    fn markup_quoted_in_a_plain_text_link_body_is_left_alone() {
+        for resource in [
+            r#"<ri:page ri:content-title="Icons" />"#,
+            r#"<ri:user ri:username="jdoe" />"#,
+            r#"<ri:attachment ri:filename="icons.zip" />"#,
+        ] {
+            for body in [
+                r#"<img src="https://example.org/icon.png" />"#,
+                r#"<a href="attachments/icons.zip">icons.zip</a>"#,
+                r#"<a href="confluence-user://user?username=jdoe">@jdoe</a>"#,
+            ] {
+                assert_round_trips(&format!(
+                    "<p><ac:link>{resource}<ac:plain-text-link-body><![CDATA[{body}]]></ac:plain-text-link-body></ac:link></p>"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn explicitly_closed_image_in_raw_storage_stays_well_formed() {
+        let applied = apply_storage(
+            "```confluence-storage\n<p><img src=\"https://example.com/x.png\"></img></p>\n```",
+        )
+        .expect("apply");
+
+        assert_eq!(
+            canonical(&applied),
+            canonical(r#"<p><img src="https://example.com/x.png"></img></p>"#)
+        );
+    }
+
+    #[test]
+    fn heading_with_an_explicit_id_keeps_it() {
+        let applied = apply_storage("## Setup {#install}").expect("apply");
+
+        assert_eq!(
+            canonical(&applied),
+            canonical(r#"<h2 id="install">Setup</h2>"#)
+        );
+    }
+
+    #[test]
+    fn heading_text_in_braces_survives() {
+        for heading in [
+            "Setup {#install}",
+            "Config {.wide}",
+            "Empty {}",
+            "a {b}",
+            "{#only}",
+            "Use <code>{#x}</code>",
+            "Set <strong>{#y}</strong>",
+            r"Path C:\{#z}",
+            "a {b} c",
+            r"Ends with a backslash {#w}\",
+        ] {
+            assert_round_trips(&format!("<h2>{heading}</h2>"));
+        }
+    }
+
+    #[test]
+    fn heading_text_ending_in_hashes_survives() {
+        for heading in ["Topic #", "Topic ##", "C#", "#", "Pick a # or a #"] {
+            assert_round_trips(&format!("<h2>{heading}</h2>"));
+        }
+    }
+
+    #[test]
+    fn ordered_list_start_number_survives_at_the_marker_limit() {
+        assert_round_trips(r#"<ol start="999999998"><li>one</li><li>two</li><li>three</li></ol>"#);
+        assert_round_trips(r#"<ol start="1000000000"><li>one</li><li>two</li></ol>"#);
+    }
+
+    #[test]
+    fn images_and_attachment_links_in_raw_storage_keep_their_elements() {
+        for (raw, expected) in [
+            (
+                r#"<p><img src="https://example.com/x.png" /></p>"#,
+                r#"<p><img src="https://example.com/x.png" /></p>"#,
+            ),
+            (
+                r#"<p><img src="attachments/x.png" alt="x" /></p>"#,
+                r#"<p><img src="/download/attachments/123/x.png" alt="x" /></p>"#,
+            ),
+            (
+                r#"<p><a href="attachments/report.pdf">report.pdf</a></p>"#,
+                r#"<p><a href="/download/attachments/123/report.pdf">report.pdf</a></p>"#,
+            ),
+        ] {
+            let applied =
+                apply_storage(&format!("```confluence-storage\n{raw}\n```")).expect("apply");
+
+            assert_eq!(canonical(&applied), canonical(expected));
+        }
+    }
+
+    #[test]
+    fn local_target_is_resolved_next_to_a_similarly_named_attribute() {
+        for (raw, expected) in [
+            (
+                r#"<p><a data-src="preview" href="attachments/report.pdf">report</a></p>"#,
+                r#"<p><a data-src="preview" href="/download/attachments/123/report.pdf">report</a></p>"#,
+            ),
+            (
+                r#"<p><img data-href="attachments/y.png" src="attachments/x.png" /></p>"#,
+                r#"<p><img data-href="attachments/y.png" src="/download/attachments/123/x.png" /></p>"#,
+            ),
+        ] {
+            let applied =
+                apply_storage(&format!("```confluence-storage\n{raw}\n```")).expect("apply");
+
+            assert_eq!(canonical(&applied), canonical(expected));
+        }
+    }
+
+    #[test]
+    fn literal_confluence_tag_names_in_text_survive() {
+        assert_round_trips("<p>Write &lt;ac:link&gt; here</p>");
+        assert_round_trips("<p>Use <code>&lt;ri:page&gt;</code> for pages</p>");
+    }
+
+    #[test]
+    fn confluence_markup_outside_a_storage_block_is_refused() {
+        let error = apply_storage(r#"Write <ac:structured-macro ac:name="info" /> here"#)
+            .expect_err("markup that would be escaped");
+
+        assert!(format!("{error:#}").contains("raw Confluence XML was escaped"));
+    }
+
+    #[test]
+    fn attachment_link_with_a_query_stays_a_url() {
+        let applied =
+            apply_storage("[download](attachments/manual.pdf?download=true)").expect("apply");
+
+        assert_eq!(
+            canonical(&applied),
+            canonical(
+                r#"<p><a href="/download/attachments/123/manual.pdf?download=true">download</a></p>"#
+            )
+        );
+    }
+
+    #[test]
+    fn attachment_link_to_a_file_name_with_a_question_mark_names_that_file() {
+        let applied = apply_storage("[what?.pdf](attachments/what%3F.pdf)").expect("apply");
+
+        assert_eq!(
+            canonical(&applied),
+            canonical(r#"<p><ac:link><ri:attachment ri:filename="what?.pdf" /></ac:link></p>"#)
+        );
+    }
+
+    #[test]
+    fn checkbox_markup_quoted_in_an_attachment_link_label_stays_text() {
+        let applied = apply_storage(
+            r#"[\<ul>\<li>\<input type="checkbox" /> example\</li>\</ul>](attachments/a.pdf)"#,
+        )
+        .expect("apply");
+
+        assert_eq!(
+            canonical(&applied),
+            canonical(concat!(
+                r#"<p><ac:link><ri:attachment ri:filename="a.pdf" />"#,
+                r#"<ac:plain-text-link-body><![CDATA[<ul><li><input type="checkbox" /> example</li></ul>]]>"#,
+                "</ac:plain-text-link-body></ac:link></p>"
+            ))
+        );
+    }
+
+    #[test]
+    fn task_holding_a_code_block_is_still_a_task() {
+        let applied = apply_storage("- [ ] run\n  ```\n  make\n  ```").expect("apply");
+
+        assert!(applied.contains("<ac:task-list>"), "{applied}");
+        assert!(!applied.contains("<input"), "{applied}");
+    }
+
+    #[test]
+    fn leading_metadata_block_is_not_published() {
+        for markdown in [
+            "---\ninternal-id: 123\n---\n\nBody",
+            "+++\ninternal-id = 123\n+++\n\nBody",
+        ] {
+            let applied = apply_storage(markdown).expect("apply");
+
+            assert_eq!(canonical(&applied), canonical("<p>Body</p>"));
+        }
+    }
+
+    #[test]
+    fn text_between_rules_or_plus_signs_at_the_top_of_a_page_survives() {
+        assert_round_trips("<hr /><p>internal-id: 123</p><hr /><p>Body</p>");
+        assert_round_trips("<p>+++</p><p>internal-id = 123</p><p>+++</p>");
+        assert_round_trips("<p>---<br />internal-id: 123<br />---</p>");
+        assert_round_trips("<p>+++<br />internal-id = 123<br />+++</p>");
+    }
+
+    #[test]
+    fn definition_list_renders_as_one() {
+        let applied = apply_storage("Term\n: Definition").expect("apply");
+
+        assert_eq!(
+            canonical(&applied),
+            canonical("<dl><dt>Term</dt><dd>Definition</dd></dl>")
+        );
+    }
+
+    #[test]
+    fn text_starting_with_a_colon_survives() {
+        assert_round_trips("<p>Term</p><p>: text</p>");
+        assert_round_trips("<p>Term<br />: text</p>");
+        assert_round_trips("<p>Term</p><p>:</p>");
+        assert_round_trips("<p>:colon</p>");
+    }
+
+    #[test]
+    fn attachment_link_whose_body_repeats_the_file_name_keeps_the_body() {
+        assert_round_trips(concat!(
+            r#"<p><ac:link><ri:attachment ri:filename="report.pdf" />"#,
+            "<ac:plain-text-link-body><![CDATA[report.pdf]]></ac:plain-text-link-body>",
+            "</ac:link></p>"
+        ));
+    }
+
+    #[test]
+    fn literal_angle_bracket_text_survives() {
+        assert_round_trips("<p>use the &lt;medallion&gt; layer</p>");
+        assert_round_trips("<p>set &lt;env&gt; and &lt;TBD&gt; and a &lt; b and x &amp; y</p>");
+        assert_round_trips("<p>call &lt;foo bar&gt; then</p>");
+        assert_round_trips("<p>type &lt;br&gt; or &lt;/div&gt; or &lt;!-- note --&gt; here</p>");
+        assert_round_trips("<p>&lt;div&gt; opens a block</p>");
+    }
+
+    #[test]
+    fn literal_entity_text_survives() {
+        assert_round_trips(
+            "<p>R&amp;D writes &amp;lt; and &amp;copy; and &amp;#169; literally</p>",
+        );
+    }
+
+    #[test]
+    fn literal_tildes_survive() {
+        assert_round_trips("<p>a ~b~ c and ~~d~~ e in ~/path</p>");
+    }
+
+    #[test]
+    fn text_that_looks_like_block_syntax_stays_a_paragraph() {
+        for text in [
+            "# not a heading",
+            "###### not a heading",
+            "#hashtag",
+            "1. not a list",
+            "12) not a list",
+            "- not a list",
+            "+ not a list",
+            "&gt; not a quote",
+            "---",
+            "===",
+            "1.5 is a number",
+            "-5 degrees",
+        ] {
+            assert_round_trips(&format!("<p>{text}</p>"));
+            assert_round_trips(&format!("<p>intro<br />{text}</p>"));
+            assert_round_trips(&format!("<ul><li>{text}</li></ul>"));
+            assert_round_trips(&format!("<ol><li>{text}</li></ol>"));
+        }
     }
 }

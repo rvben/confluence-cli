@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use pulldown_cmark::{Options, Parser, html};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, html};
 use regex::Regex;
 use roxmltree::{Document, Node, NodeType};
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,32 @@ pub(crate) struct UserMentionPlaceholder {
     pub username: Option<String>,
 }
 
+impl PageLinkPlaceholder {
+    /// Link text given to a page link that has no link body in storage.
+    /// A link still carrying this text is written back without a body.
+    pub(crate) fn default_label(&self) -> String {
+        self.content_title
+            .clone()
+            .or_else(|| self.content_id.clone())
+            .or_else(|| self.anchor.clone())
+            .unwrap_or_else(|| "Confluence page".to_string())
+    }
+}
+
+impl UserMentionPlaceholder {
+    /// Link text given to a mention that has no link body in storage.
+    /// Markdown links need visible text; a mention still carrying this text
+    /// is written back without a body.
+    pub(crate) fn default_label(&self) -> String {
+        self.username
+            .as_deref()
+            .map(|username| format!("@{username}"))
+            .or_else(|| self.account_id.clone())
+            .or_else(|| self.user_key.clone())
+            .unwrap_or_else(|| "@user".to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct StatusMacroPlaceholder {
     pub title: String,
@@ -193,9 +220,14 @@ pub(crate) fn render_markdown_storage(
         })
         .to_string();
 
-    let parser = Parser::new_ext(&normalized, Options::all());
+    let escapes_confluence_markup = has_unescaped_confluence_markup(&normalized);
+    let parser = Parser::new_ext(&normalized, markdown_options());
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
+    // Raw storage blocks and macros are restored afterwards, so they stay as
+    // written, and link bodies are not yet wrapped as literal text.
+    let html_output = convert_checkbox_lists_to_task_lists(&html_output);
+    let mut html_output = convert_generated_markup(&html_output);
     for idx in (0..raw_fragments.len()).rev() {
         let fragment = &raw_fragments[idx];
         html_output = html_output.replace(
@@ -221,10 +253,9 @@ pub(crate) fn render_markdown_storage(
         );
         html_output = html_output.replace(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"), fragment);
     }
-    html_output = convert_checkbox_lists_to_task_lists(&html_output);
 
     let mut lossy = Vec::new();
-    if html_output.contains("&lt;ac:") || html_output.contains("&lt;ri:") {
+    if escapes_confluence_markup {
         lossy.push("raw Confluence XML was escaped during Markdown conversion".to_string());
     }
     if !allow_lossy && !lossy.is_empty() {
@@ -233,6 +264,329 @@ pub(crate) fn render_markdown_storage(
 
     let storage = html_output.trim().to_string();
     Ok(ConversionOutput { storage })
+}
+
+/// Whether Markdown text holds Confluence markup, which the renderer writes
+/// out as escaped text. Markup that is escaped with a backslash, written
+/// with a character reference or placed in code is meant as text.
+fn has_unescaped_confluence_markup(markdown: &str) -> bool {
+    let is_markup = |text: &str, start: usize| {
+        ["<ac:", "<ri:"].iter().any(|markup| {
+            text.match_indices(markup)
+                .any(|(at, _)| !(at == 0 && markdown[..start].ends_with('\\')))
+        })
+    };
+
+    // Text reaches the renderer in pieces. Pieces that are adjacent in the
+    // source and read the same there are one stretch of text as written.
+    let mut stretch = String::new();
+    let mut stretch_range = 0..0;
+    // Code is published as written, and a metadata block not at all.
+    let mut code_blocks = 0usize;
+    for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_) | Tag::MetadataBlock(_)) => code_blocks += 1,
+            Event::End(TagEnd::CodeBlock | TagEnd::MetadataBlock(_)) => code_blocks -= 1,
+            Event::Text(text) if code_blocks == 0 && *text == markdown[range.clone()] => {
+                if range.start != stretch_range.end {
+                    if is_markup(&stretch, stretch_range.start) {
+                        return true;
+                    }
+                    stretch.clear();
+                    stretch_range = range.start..range.start;
+                }
+                stretch.push_str(&text);
+                stretch_range.end = range.end;
+            }
+            _ => {}
+        }
+    }
+    is_markup(&stretch, stretch_range.start)
+}
+
+/// Converts the images and attachment links the Markdown renderer wrote to
+/// the elements Confluence stores for them.
+fn convert_generated_markup(html: &str) -> String {
+    static IMAGE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<img([^>]*?)src="([^"]+)"([^>]*)>"#).expect("valid image regex")
+    });
+
+    let html = rewrite_outside_literal_sections(html, rewrite_attachment_links_to_storage);
+    rewrite_outside_literal_sections(&html, |markup| {
+        IMAGE
+            .replace_all(markup, |captures: &regex::Captures<'_>| {
+                // An image with a separate end tag keeps its form, because
+                // only the start tag is replaced here.
+                let attributes = format!("{} {}", &captures[1], &captures[3]);
+                captures[3]
+                    .trim_end()
+                    .ends_with('/')
+                    .then(|| image_to_storage_macro(&captures[2], &attributes))
+                    .flatten()
+                    .unwrap_or_else(|| captures[0].to_string())
+            })
+            .into_owned()
+    })
+}
+
+const CDATA_SECTION: (&str, &str) = ("<![CDATA[", "]]>");
+const COMMENT_SECTION: (&str, &str) = ("<!--", "-->");
+
+/// Applies `rewrite` to the markup between CDATA sections and copies the
+/// sections themselves unchanged. A comment is not set apart here, so an
+/// element whose content holds one is still seen whole.
+pub(crate) fn rewrite_outside_cdata(storage: &str, rewrite: impl Fn(&str) -> String) -> String {
+    rewrite_outside_sections(storage, [CDATA_SECTION, CDATA_SECTION], rewrite)
+}
+
+/// Applies `rewrite` to the markup between CDATA sections and comments, and
+/// copies those unchanged: what they hold is text, whatever it looks like.
+pub(crate) fn rewrite_outside_literal_sections(
+    storage: &str,
+    rewrite: impl Fn(&str) -> String,
+) -> String {
+    rewrite_outside_sections(storage, [CDATA_SECTION, COMMENT_SECTION], rewrite)
+}
+
+fn rewrite_outside_sections(
+    storage: &str,
+    sections: [(&str, &str); 2],
+    rewrite: impl Fn(&str) -> String,
+) -> String {
+    let find_from = |opener: &str, from: usize| storage[from..].find(opener).map(|at| from + at);
+    let mut rewritten = String::with_capacity(storage.len());
+    let mut cursor = 0;
+    // Where each kind of section next opens. A position is searched for again
+    // only once the cursor has passed it, so the text is scanned once per kind.
+    let mut next_open = sections.map(|(opener, _)| find_from(opener, 0));
+    loop {
+        for (next, (opener, _)) in next_open.iter_mut().zip(sections) {
+            if next.is_some_and(|open| open < cursor) {
+                *next = find_from(opener, cursor);
+            }
+        }
+        let Some((open, (opener, closer))) = next_open
+            .iter()
+            .zip(sections)
+            .filter_map(|(next, section)| Some(((*next)?, section)))
+            .min_by_key(|(open, _)| *open)
+        else {
+            break;
+        };
+        rewritten.push_str(&rewrite(&storage[cursor..open]));
+        let body = open + opener.len();
+        let end = storage[body..]
+            .find(closer)
+            .map_or(storage.len(), |close| body + close + closer.len());
+        rewritten.push_str(&storage[open..end]);
+        cursor = end;
+    }
+    rewritten.push_str(&rewrite(&storage[cursor..]));
+    rewritten
+}
+
+/// Resolves a link or image target to an attachment of the page it is
+/// written on, returning the file name and any fragment. Such a target is
+/// the path `attachments/<file name>`, however it is spelled.
+fn own_attachment_target(target: &str) -> Option<(String, Option<String>)> {
+    let target = decode_character_references(target);
+    if !is_local_target(&target) {
+        return None;
+    }
+    let (path_part, fragment) = split_target_fragment(&target);
+    // A query asks for the file in some way, which a file name cannot say.
+    if path_part.contains('?') {
+        return None;
+    }
+    let path_part = urlencoding::decode(path_part).ok()?;
+    let mut segments = Vec::new();
+    for component in Path::new(path_part.as_ref()).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(segment) => segments.push(segment.to_str()?),
+            Component::ParentDir => {
+                segments.pop()?;
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    let ["attachments", file_name] = segments.as_slice() else {
+        return None;
+    };
+    let fragment = match fragment {
+        Some(fragment) => Some(urlencoding::decode(fragment).ok()?.into_owned()),
+        None => None,
+    };
+    Some((file_name.to_string(), fragment))
+}
+
+/// Resolves the character references the Markdown renderer writes into
+/// attribute values and text: the predefined XML entities and numeric
+/// references.
+pub(crate) fn decode_character_references(value: &str) -> String {
+    static REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"&(?:#x([0-9a-fA-F]{1,6})|#([0-9]{1,7})|(amp|lt|gt|quot|apos));")
+            .expect("valid character reference regex")
+    });
+    if !value.contains('&') {
+        return value.to_string();
+    }
+    REFERENCE
+        .replace_all(value, |captures: &regex::Captures<'_>| {
+            let code_point = if let Some(hex) = captures.get(1) {
+                u32::from_str_radix(hex.as_str(), 16).ok()
+            } else if let Some(decimal) = captures.get(2) {
+                decimal.as_str().parse().ok()
+            } else {
+                return match &captures[3] {
+                    "amp" => "&",
+                    "lt" => "<",
+                    "gt" => ">",
+                    "quot" => "\"",
+                    _ => "'",
+                }
+                .to_string();
+            };
+            code_point
+                .and_then(char::from_u32)
+                .map_or_else(|| captures[0].to_string(), String::from)
+        })
+        .into_owned()
+}
+
+/// Converts an image of this page's attachment or of an external URL to the
+/// `ac:image` element Confluence stores for it. Other images, and images
+/// with attributes that element has no counterpart for here, keep their
+/// `img` form.
+fn image_to_storage_macro(src: &str, attributes: &str) -> Option<String> {
+    static ATTRIBUTE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"([^\s="/]+)\s*=\s*"([^"]*)""#).expect("valid attribute regex")
+    });
+
+    let leftover = ATTRIBUTE.replace_all(attributes, "");
+    if !leftover.trim().trim_matches('/').trim().is_empty() {
+        return None;
+    }
+    // Attribute values are already escaped by the Markdown renderer.
+    let mut image = String::from("<ac:image");
+    for captures in ATTRIBUTE.captures_iter(attributes) {
+        let storage_name = match &captures[1] {
+            "alt" => "ac:alt",
+            "title" => "ac:title",
+            _ => return None,
+        };
+        if !captures[2].is_empty() {
+            image.push_str(&format!(r#" {storage_name}="{}""#, &captures[2]));
+        }
+    }
+    image.push('>');
+
+    if let Some((file_name, None)) = own_attachment_target(src) {
+        image.push_str(&format!(
+            r#"<ri:attachment ri:filename="{}" />"#,
+            escape_xml(&file_name)
+        ));
+    } else if src.starts_with("http://") || src.starts_with("https://") {
+        image.push_str(&format!(r#"<ri:url ri:value="{src}" />"#));
+    } else {
+        return None;
+    }
+    image.push_str("</ac:image>");
+    Some(image)
+}
+
+/// Converts links to this page's attachments to `ac:link` elements. A link
+/// whose text is just the file name is written without a link body. A link
+/// with further attributes, such as a title, stays an anchor, because
+/// `ac:link` has nowhere to keep them.
+fn rewrite_attachment_links_to_storage(html: &str) -> String {
+    static LINK: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?s)<a([^>]*?)href="([^"]+)"([^>]*)>(.*?)</a>"#)
+            .expect("valid attachment link regex")
+    });
+    LINK.replace_all(html, |captures: &regex::Captures<'_>| {
+        if !(captures[1].trim().is_empty() && captures[3].trim().is_empty()) {
+            return captures[0].to_string();
+        }
+        let Some((file_name, fragment)) = own_attachment_target(&captures[2]) else {
+            return captures[0].to_string();
+        };
+        // A link written inside the link text ends the match at its own end
+        // tag, so what was matched is not the whole attachment link.
+        if captures[4].contains("<a ") {
+            return captures[0].to_string();
+        }
+        let anchor = fragment
+            .map(|fragment| format!(r#" ac:anchor="{}""#, escape_xml(&fragment)))
+            .unwrap_or_default();
+        let escaped_name = escape_xml(&file_name);
+        let body = link_body_unless_default(&captures[4], &file_name);
+        format!(
+            r#"<ac:link{anchor}><ri:attachment ri:filename="{escaped_name}" />{body}</ac:link>"#
+        )
+    })
+    .into_owned()
+}
+
+/// Builds a link body, or none when the rendered link text is only the label
+/// pull generates for a link that has no body in storage.
+pub(crate) fn link_body_unless_default(body_html: &str, default_label: &str) -> String {
+    if decode_character_references(body_html.trim()) == default_label {
+        String::new()
+    } else {
+        build_storage_link_body(body_html)
+    }
+}
+
+pub(crate) fn build_storage_link_body(body_html: &str) -> String {
+    let trimmed = body_html.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.contains('<') {
+        format!("<ac:link-body>{trimmed}</ac:link-body>")
+    } else {
+        // CDATA holds literal text, and a literal `]]>` has to be split
+        // across two sections to stay inside it.
+        let text = decode_character_references(trimmed).replace("]]>", "]]]]><![CDATA[>");
+        format!("<ac:plain-text-link-body><![CDATA[{text}]]></ac:plain-text-link-body>")
+    }
+}
+
+pub(crate) fn is_local_target(target: &str) -> bool {
+    !(target.is_empty()
+        || target.starts_with('#')
+        || target.starts_with('/')
+        || target.starts_with("http://")
+        || target.starts_with("https://")
+        || target.starts_with("mailto:")
+        || target.starts_with("tel:")
+        || target.starts_with("data:"))
+}
+
+pub(crate) fn split_target_fragment(target: &str) -> (&str, Option<&str>) {
+    if let Some((path, fragment)) = target.split_once('#') {
+        (path, Some(fragment))
+    } else {
+        (target, None)
+    }
+}
+
+/// Markdown extensions honoured when converting to storage. Each one needs
+/// syntax an author writes on purpose, and text pulled from a page is
+/// escaped where it would read as that syntax. Extensions that reinterpret
+/// ordinary prose (smart punctuation, subscript, superscript, math,
+/// wikilinks) stay off, because they rewrite text a page already contains.
+fn markdown_options() -> Options {
+    Options::ENABLE_TABLES
+        | Options::ENABLE_HEADING_ATTRIBUTES
+        | Options::ENABLE_DEFINITION_LIST
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_GFM
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
 }
 
 fn wrap_storage_fragment(storage: &str) -> String {
@@ -246,7 +600,7 @@ fn render_top_level_block(node: Node<'_, '_>, source: &str) -> Option<String> {
             if text.trim().is_empty() {
                 None
             } else {
-                Some(text.trim().to_string())
+                Some(escape_block_starts(text.trim()))
             }
         }
         NodeType::Element => Some(
@@ -271,13 +625,17 @@ fn render_block_element(node: Node<'_, '_>, source: &str) -> Option<String> {
             if inline.trim().is_empty() {
                 None
             } else {
-                Some(inline.trim().to_string())
+                Some(escape_block_starts(inline.trim()))
             }
         }
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let level = node.tag_name().name()[1..].parse::<usize>().ok()?;
             let inline = render_inline_children(node, source)?;
-            Some(format!("{} {}", "#".repeat(level), inline.trim()))
+            Some(format!(
+                "{} {}",
+                "#".repeat(level),
+                escape_heading_end(inline.trim())
+            ))
         }
         "pre" => render_preformatted(node),
         "blockquote" => {
@@ -465,9 +823,30 @@ fn render_list(node: Node<'_, '_>, source: &str, indent: usize, ordered: bool) -
         return None;
     }
 
+    // Markdown takes the list's first number from its first marker, which
+    // holds nine digits at most. A list that starts at one keeps the repeated
+    // `1.` marker, and one that starts beyond what a marker holds has no
+    // Markdown form.
+    const LARGEST_MARKER: u64 = 999_999_999;
+    let start = node
+        .attribute("start")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|start| ordered && *start != 1);
+    if start.is_some_and(|start| start > LARGEST_MARKER) {
+        return None;
+    }
+
     let mut rendered = Vec::new();
-    for item in items {
-        rendered.push(render_list_item(item, source, indent, ordered)?);
+    for (position, item) in items.into_iter().enumerate() {
+        let marker = match (ordered, start) {
+            (false, _) => "-".to_string(),
+            (true, None) => "1.".to_string(),
+            (true, Some(start)) => format!(
+                "{}.",
+                start.saturating_add(position as u64).min(LARGEST_MARKER)
+            ),
+        };
+        rendered.push(render_list_item(item, source, indent, &marker)?);
     }
     Some(rendered.join("\n"))
 }
@@ -476,10 +855,12 @@ fn render_list_item(
     node: Node<'_, '_>,
     source: &str,
     indent: usize,
-    ordered: bool,
+    marker: &str,
 ) -> Option<String> {
-    let marker = if ordered { "1." } else { "-" };
     let prefix = format!("{}{} ", " ".repeat(indent), marker);
+    // A nested list belongs to this item only when indented to the column
+    // where the item's own content starts, which depends on the marker width.
+    let nested_indent = prefix.len();
     let mut inline = String::new();
     let mut nested = Vec::new();
 
@@ -490,11 +871,20 @@ fn render_list_item(
             }
             NodeType::Element => {
                 if child.tag_name().name() == "ul" {
-                    nested.push(render_list(child, source, indent + 2, false)?);
+                    nested.push(render_list(child, source, nested_indent, false)?);
                     continue;
                 }
                 if child.tag_name().name() == "ol" {
-                    nested.push(render_list(child, source, indent + 2, true)?);
+                    // Only a list numbered from one can follow an item's
+                    // text without a blank line, and a blank line would
+                    // turn that text into a paragraph.
+                    if child
+                        .attribute("start")
+                        .is_some_and(|start| start.trim() != "1")
+                    {
+                        return None;
+                    }
+                    nested.push(render_list(child, source, nested_indent, true)?);
                     continue;
                 }
                 if child.tag_name().name() == "p" {
@@ -511,7 +901,7 @@ fn render_list_item(
         }
     }
 
-    let mut out = format!("{prefix}{}", inline.trim());
+    let mut out = format!("{prefix}{}", escape_block_starts(inline.trim()));
     for block in nested {
         if !block.trim().is_empty() {
             out.push('\n');
@@ -1302,7 +1692,7 @@ fn render_inline_node(node: Node<'_, '_>, source: &str) -> Option<String> {
             let alt = node.attribute("alt").unwrap_or_default();
             Some(format!("![{}]({src})", escape_markdown_text(alt)))
         }
-        "br" => Some("  \n".to_string()),
+        "br" => Some(HARD_BREAK.to_string()),
         "span" => {
             if node.attributes().len() > 0 {
                 Some(raw_xml_fragment(node, source).to_string())
@@ -1358,27 +1748,140 @@ fn render_status_macro(node: Node<'_, '_>) -> Option<String> {
     Some(format!("[{}]({target})", escape_markdown_text(&title)))
 }
 
+/// Renders an image as Markdown only when Markdown can express all of it:
+/// an attachment of this page or an external URL, with optional alt text and
+/// title. Anything else (size, alignment, an attachment owned by another
+/// page) is left for the caller to preserve as raw storage.
 fn render_confluence_image(node: Node<'_, '_>) -> Option<String> {
-    let alt = node
-        .attribute((AC_NS, "alt"))
-        .or_else(|| node.attribute((AC_NS, "title")))
-        .unwrap_or_default();
-
-    if let Some(attachment) = namespaced_child(node, RI_NS, "attachment") {
-        let file_name = attachment.attribute((RI_NS, "filename"))?;
-        return Some(format!(
-            "![{}](attachments/{file_name})",
-            escape_markdown_text(alt)
-        ));
+    let mut alt = "";
+    let mut title = None;
+    for attribute in node.attributes() {
+        match (attribute.namespace(), attribute.name()) {
+            (Some(AC_NS), "alt") => alt = attribute.value(),
+            (Some(AC_NS), "title") => title = Some(attribute.value()),
+            _ => return None,
+        }
     }
 
-    let url = namespaced_child(node, RI_NS, "url")?.attribute((RI_NS, "value"))?;
-    Some(format!("![{}]({url})", escape_markdown_text(alt)))
+    let resource = sole_element_child(node)?;
+    let target = if is_ri_element(resource, "attachment") {
+        let file_name = sole_attribute(resource, "filename")?;
+        format!("attachments/{}", encode_target_segment(file_name))
+    } else if is_ri_element(resource, "url") {
+        sole_attribute(resource, "value")?.to_string()
+    } else {
+        return None;
+    };
+
+    let destination = markdown_link_destination(&target)?;
+    let title = title
+        .map(|title| {
+            format!(
+                r#" "{}""#,
+                escape_markdown_text(title).replace('"', r#"\""#)
+            )
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "![{}]({destination}{title})",
+        escape_markdown_text(alt)
+    ))
+}
+
+fn is_ri_element(node: Node<'_, '_>, name: &str) -> bool {
+    node.tag_name().namespace() == Some(RI_NS) && node.tag_name().name() == name
+}
+
+/// The only element child of a node, if it has exactly one.
+fn sole_element_child<'a, 'input>(node: Node<'a, 'input>) -> Option<Node<'a, 'input>> {
+    let mut elements = node.children().filter(Node::is_element);
+    let first = elements.next()?;
+    elements.next().is_none().then_some(first)
+}
+
+/// The value of a resource identifier's single `ri:` attribute, provided the
+/// element carries nothing else.
+fn sole_attribute<'a>(node: Node<'a, '_>, name: &str) -> Option<&'a str> {
+    if node.attributes().len() != 1 || node.children().any(|child| child.is_element()) {
+        return None;
+    }
+    node.attribute((RI_NS, name))
+}
+
+/// Formats a link or image destination, using the angle-bracket form when
+/// the target contains characters that would otherwise end it.
+fn markdown_link_destination(target: &str) -> Option<String> {
+    if target.contains(['<', '>', '\n']) {
+        return None;
+    }
+    if target.contains([' ', '(', ')']) || target.is_empty() {
+        Some(format!("<{target}>"))
+    } else {
+        Some(target.to_string())
+    }
+}
+
+/// Percent-encodes the characters of a file name or anchor that would be
+/// read as URL or Markdown syntax inside a link destination, leaving the
+/// rest readable.
+pub(crate) fn encode_target_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for character in segment.chars() {
+        if character.is_control()
+            || matches!(
+                character,
+                ' ' | '%' | '#' | '?' | '&' | '<' | '>' | '(' | ')' | '\\' | '"'
+            )
+        {
+            let mut buffer = [0; 4];
+            for byte in character.encode_utf8(&mut buffer).bytes() {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            encoded.push(character);
+        }
+    }
+    encoded
+}
+
+/// Query parameter that marks a placeholder link whose text was generated
+/// on pull because the Confluence link has no body of its own.
+const GENERATED_LABEL_PARAMETER: (&str, &str) = ("label", "generated");
+
+/// The label of a pulled link and its target. A link without a body gets
+/// the generated label, and its target records that the label is generated.
+fn label_or_generated(label: Option<String>, generated: &str, target: String) -> (String, String) {
+    match label {
+        Some(label) => (label, target),
+        None => (
+            escape_markdown_text(generated),
+            mark_generated_label(&target),
+        ),
+    }
+}
+
+fn mark_generated_label(target: &str) -> String {
+    let Ok(mut url) = Url::parse(target) else {
+        return target.to_string();
+    };
+    url.query_pairs_mut()
+        .append_pair(GENERATED_LABEL_PARAMETER.0, GENERATED_LABEL_PARAMETER.1);
+    url.to_string()
+}
+
+/// Whether a placeholder link target says its link text was generated on
+/// pull rather than taken from a link body.
+pub(crate) fn has_generated_label(target: &str) -> bool {
+    Url::parse(&target.replace("&amp;", "&")).is_ok_and(|url| {
+        url.query_pairs().any(|(key, value)| {
+            key == GENERATED_LABEL_PARAMETER.0 && value == GENERATED_LABEL_PARAMETER.1
+        })
+    })
 }
 
 fn render_confluence_link(node: Node<'_, '_>, source: &str) -> Option<String> {
     let anchor = node.attribute((AC_NS, "anchor"));
-    let label = link_label(node, source);
+    let label = link_label(node, source)?;
 
     if let Some(page) = namespaced_child(node, RI_NS, "page") {
         let placeholder = PageLinkPlaceholder {
@@ -1390,11 +1893,7 @@ fn render_confluence_link(node: Node<'_, '_>, source: &str) -> Option<String> {
             anchor: anchor.map(ToOwned::to_owned),
         };
         let target = build_page_placeholder_url(&placeholder);
-        let label = label
-            .or_else(|| placeholder.content_title.clone())
-            .or_else(|| placeholder.content_id.clone())
-            .or_else(|| placeholder.anchor.clone())
-            .unwrap_or_else(|| "Confluence page".to_string());
+        let (label, target) = label_or_generated(label, &placeholder.default_label(), target);
         return Some(format!("[{}]({target})", label.trim()));
     }
 
@@ -1405,28 +1904,27 @@ fn render_confluence_link(node: Node<'_, '_>, source: &str) -> Option<String> {
             username: user.attribute((RI_NS, "username")).map(ToOwned::to_owned),
         };
         let target = build_user_placeholder_url(&placeholder);
-        let label = label
-            .or_else(|| {
-                placeholder
-                    .username
-                    .clone()
-                    .map(|value| format!("@{value}"))
-            })
-            .or_else(|| placeholder.account_id.clone())
-            .or_else(|| placeholder.user_key.clone())
-            .unwrap_or_else(|| "@user".to_string());
+        let (label, target) = label_or_generated(label, &placeholder.default_label(), target);
         return Some(format!("[{}]({target})", label.trim()));
     }
 
     if let Some(attachment) = namespaced_child(node, RI_NS, "attachment") {
-        let file_name = attachment.attribute((RI_NS, "filename"))?;
-        let mut target = format!("attachments/{file_name}");
+        let file_name = sole_attribute(attachment, "filename")?;
+        let mut target = format!("attachments/{}", encode_target_segment(file_name));
         if let Some(anchor) = anchor {
             target.push('#');
-            target.push_str(anchor);
+            target.push_str(&encode_target_segment(anchor));
         }
-        let label = label.unwrap_or_else(|| file_name.to_string());
-        return Some(format!("[{}]({target})", label.trim()));
+        let destination = markdown_link_destination(&target)?;
+        // A link without a body shows the file name. An explicit body that
+        // reads the same would be taken for that, so such a link has no
+        // Markdown form.
+        let generated = escape_markdown_text(file_name);
+        if label.as_deref().map(str::trim) == Some(generated.as_str()) {
+            return None;
+        }
+        let label = label.unwrap_or(generated);
+        return Some(format!("[{}]({destination})", label.trim()));
     }
 
     if let Some(url) =
@@ -1449,14 +1947,16 @@ fn render_confluence_link(node: Node<'_, '_>, source: &str) -> Option<String> {
     None
 }
 
-fn link_label(node: Node<'_, '_>, source: &str) -> Option<String> {
+/// Renders a link's body as link text. The outer option is empty when the
+/// body has no Markdown form, the inner one when the link has no body.
+fn link_label(node: Node<'_, '_>, source: &str) -> Option<Option<String>> {
     if let Some(body) = namespaced_child(node, AC_NS, "plain-text-link-body") {
-        return body.text().map(|text| escape_markdown_text(text.trim()));
+        return Some(body.text().map(|text| escape_markdown_text(text.trim())));
     }
     if let Some(body) = namespaced_child(node, AC_NS, "link-body") {
-        return render_inline_children(body, source).map(|text| text.trim().to_string());
+        return render_inline_children(body, source).map(|text| Some(text.trim().to_string()));
     }
-    None
+    Some(None)
 }
 
 fn namespaced_child<'a, 'input>(
@@ -1566,18 +2066,114 @@ fn normalize_text_node(text: &str) -> String {
     }
 }
 
+/// Escapes characters that Markdown would read as syntax, so literal page
+/// text converts back to the same text.
 fn escape_markdown_text(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '\\' | '*' | '_' | '[' | ']' | '`' => {
-                escaped.push('\\');
-                escaped.push(ch);
-            }
-            _ => escaped.push(ch),
+    for (index, ch) in text.char_indices() {
+        let rest = &text[index + ch.len_utf8()..];
+        let needs_escape = match ch {
+            '\\' | '*' | '_' | '[' | ']' | '`' | '~' => true,
+            '<' => starts_markup(rest),
+            '&' => starts_entity(rest),
+            _ => false,
+        };
+        if needs_escape {
+            escaped.push('\\');
         }
+        escaped.push(ch);
     }
     escaped
+}
+
+/// Escapes the last character of heading content where Markdown would take
+/// the end of the line as syntax: a `}` closes an attribute block and a `#`
+/// belongs to a closing sequence.
+fn escape_heading_end(content: &str) -> String {
+    match content.char_indices().next_back() {
+        Some((last, '}' | '#')) => format!("{}\\{}", &content[..last], &content[last..]),
+        _ => content.to_string(),
+    }
+}
+
+/// Whether the text after a `<` could open an HTML tag, comment, declaration
+/// or autolink.
+fn starts_markup(rest: &str) -> bool {
+    rest.chars()
+        .next()
+        .is_some_and(|next| next.is_ascii_alphabetic() || matches!(next, '/' | '!' | '?'))
+}
+
+/// Whether the text after an `&` completes a character reference.
+fn starts_entity(rest: &str) -> bool {
+    let end = rest
+        .bytes()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || byte == b'#'))
+        .unwrap_or(rest.len());
+    if rest.as_bytes().get(end) != Some(&b';') {
+        return false;
+    }
+    let name = &rest[..end];
+    if let Some(digits) = name.strip_prefix('#') {
+        let digits = digits
+            .strip_prefix(['x', 'X'])
+            .filter(|hex| hex.chars().all(|ch| ch.is_ascii_hexdigit()))
+            .or_else(|| {
+                Some(digits).filter(|decimal| decimal.chars().all(|ch| ch.is_ascii_digit()))
+            });
+        return digits.is_some_and(|digits| !digits.is_empty());
+    }
+    !name.is_empty() && name.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+/// Escapes rendered inline content whose lines would otherwise open a
+/// heading, list, block quote, definition, thematic break, metadata block
+/// or setext underline. Lines
+/// begin at the start of the content and after each hard line break.
+fn escape_block_starts(inline: &str) -> String {
+    inline
+        .split(HARD_BREAK)
+        .map(escape_block_start)
+        .collect::<Vec<_>>()
+        .join(HARD_BREAK)
+}
+
+const HARD_BREAK: &str = "  \n";
+
+fn escape_block_start(line: &str) -> String {
+    let content = line.trim_start();
+    let indent = &line[..line.len() - content.len()];
+    let followed_by_space_or_end = |rest: &str| rest.is_empty() || rest.starts_with([' ', '\t']);
+    let only = |allowed: &[char]| {
+        !content.trim_end().is_empty() && content.trim_end().chars().all(|ch| allowed.contains(&ch))
+    };
+
+    let escape_at = match content.chars().next() {
+        Some('#') => {
+            let rest = content.trim_start_matches('#');
+            (content.len() - rest.len() <= 6 && followed_by_space_or_end(rest)).then_some(0)
+        }
+        Some('>') => Some(0),
+        Some('-') => (followed_by_space_or_end(&content[1..]) || only(&['-', ' '])).then_some(0),
+        Some('+') => (followed_by_space_or_end(&content[1..]) || only(&['+'])).then_some(0),
+        Some('=') => only(&['=']).then_some(0),
+        Some(':') => followed_by_space_or_end(&content[1..]).then_some(0),
+        Some(first) if first.is_ascii_digit() => {
+            let digits = content.len()
+                - content
+                    .trim_start_matches(|ch: char| ch.is_ascii_digit())
+                    .len();
+            let rest = &content[digits..];
+            (digits <= 9 && rest.starts_with(['.', ')']) && followed_by_space_or_end(&rest[1..]))
+                .then_some(digits)
+        }
+        _ => None,
+    };
+
+    match escape_at {
+        Some(position) => format!("{indent}{}\\{}", &content[..position], &content[position..]),
+        None => line.to_string(),
+    }
 }
 
 fn wrap_markdown(wrapper: &str, content: String) -> Option<String> {
@@ -5410,5 +6006,24 @@ SELECT ']]>' AS sentinel;
         let (parsed, body) = split_frontmatter(&rendered).expect("parsed");
         assert_eq!(parsed.title, "Docs");
         assert_eq!(body, "# Hello");
+    }
+
+    #[test]
+    fn text_full_of_ampersands_converts_in_linear_time() {
+        let storage = format!("<p>{}</p>", "a=1&amp;b=2 ".repeat(300_000));
+        let started = std::time::Instant::now();
+
+        let markdown = storage_to_markdown(&storage);
+
+        assert!(
+            markdown.starts_with("a=1&b=2 a=1&b=2"),
+            "{}",
+            &markdown[..40]
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }
