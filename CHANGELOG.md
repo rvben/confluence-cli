@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.39](https://github.com/rvben/confluence-cli/compare/v0.1.38...v0.1.39) - 2026-11-19
+
+### Fixed
+
+- **markdown**: keep task lists that follow each other separate ([a73bf6c](https://github.com/rvben/confluence-cli/commit/a73bf6c66894dd87f710a83ebd4495a5696cc0ec))
+- **markdown**: read version-stamped attachments as Markdown ([063fdbf](https://github.com/rvben/confluence-cli/commit/063fdbf1f82d3b7b29bae20fb3b3862f38de9e28))
+- **markdown**: keep indented or commented lists separate ([8fef953](https://github.com/rvben/confluence-cli/commit/8fef953f3fac7fcc43d7bc302cc11b21b0e80f63))
+
 ## [0.1.38](https://github.com/rvben/confluence-cli/compare/v0.1.37...v0.1.38) - 2026-11-19
 
 ### Fixed
