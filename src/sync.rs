@@ -4604,6 +4604,18 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn link_to_a_page_it_does_not_name_survives() {
+        for storage in [
+            r#"<p>see <ac:link><ri:page /></ac:link> now</p>"#,
+            r#"<p>see <ac:link ac:card-appearance="inline"><ri:page /><ac:link-body>home <strong>page</strong></ac:link-body></ac:link> now</p>"#,
+            r#"<p>see <ac:link ac:anchor="intro"><ri:page /></ac:link> now</p>"#,
+            r#"<p>see <ac:link><ri:page ri:space-key="MFS" /></ac:link> now</p>"#,
+        ] {
+            assert_round_trips(storage);
+        }
+    }
+
+    #[test]
     fn confluence_link_with_display_attributes_stays_a_markdown_link() {
         assert_eq!(
             storage_to_markdown(

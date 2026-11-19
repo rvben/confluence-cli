@@ -2420,6 +2420,13 @@ fn render_confluence_link(node: Node<'_, '_>, source: &str) -> Option<String> {
     let label = link_label(node, source)?;
 
     if let Some(page) = namespaced_child(node, RI_NS, "page") {
+        // A placeholder target says which page it stands for by its id or
+        // its title.
+        if !page.has_attribute((RI_NS, "content-id"))
+            && !page.has_attribute((RI_NS, "content-title"))
+        {
+            return None;
+        }
         let placeholder = PageLinkPlaceholder {
             content_id: page.attribute((RI_NS, "content-id")).map(ToOwned::to_owned),
             space_key: page.attribute((RI_NS, "space-key")).map(ToOwned::to_owned),
