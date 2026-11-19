@@ -3830,6 +3830,300 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn raw_blocks_with_a_blank_line_keep_their_text() {
+        assert_round_trips("<ul><li>a<ul><li>n</li></ul>b</li><li>\n\n*literal*\n\n</li></ul>");
+        assert_round_trips("<ul><li>a<ul><li>n</li></ul>b\n\n*c*</li></ul>");
+        assert_round_trips("<table><tbody><tr><td><pre>x\n\n*y*</pre></td></tr></tbody></table>");
+
+        let markdown = storage_to_markdown("<ul><li>a<ul><li>n</li></ul>b\n \n*c*</li></ul>");
+        assert!(
+            markdown.starts_with("```confluence-storage\n"),
+            "{markdown}"
+        );
+        let markdown = storage_to_markdown("<ul><li>a<ul><li>n</li></ul>b\n*c*</li></ul>");
+        assert_eq!(markdown, "<ul><li>a<ul><li>n</li></ul>b\n*c*</li></ul>");
+    }
+
+    #[test]
+    fn raw_blocks_holding_a_fence_line_stay_whole() {
+        let code_macro = concat!(
+            r#"<table><tbody><tr><td><ac:structured-macro ac:name="code">"#,
+            "<ac:plain-text-body><![CDATA[a\n```\nb\n`````\nc]]></ac:plain-text-body>",
+            "</ac:structured-macro><p>x</p><p>y</p></td></tr></tbody></table>"
+        );
+        assert_round_trips(code_macro);
+        assert!(
+            storage_to_markdown(code_macro).starts_with("``````confluence-storage\n"),
+            "{}",
+            storage_to_markdown(code_macro)
+        );
+        assert_round_trips(
+            "<table><tbody><tr><td><pre>a\n\n```\nb</pre></td></tr></tbody></table>",
+        );
+        assert_round_trips(
+            "<table><tbody><tr><td><pre>a\n\n```confluence-storage\nb\n```</pre></td></tr></tbody></table>",
+        );
+    }
+
+    #[test]
+    fn raw_blocks_inside_a_block_quote_stay_storage() {
+        assert_round_trips(concat!(
+            "<blockquote><ul><li>a<ul><li>n</li></ul>b",
+            r#"<ac:emoticon ac:name="smile" /></li></ul></blockquote>"#
+        ));
+        assert_round_trips(
+            "<blockquote><table><tbody><tr><td><pre>x\n\n  y\n```\nz</pre></td></tr></tbody></table></blockquote>",
+        );
+        assert_round_trips(concat!(
+            "<blockquote><p>before</p><blockquote><ul><li>a<ul><li>n</li></ul>b",
+            r#"<ac:emoticon ac:name="smile" /></li></ul></blockquote><p>after</p></blockquote>"#
+        ));
+    }
+
+    #[test]
+    fn storage_fences_written_by_hand_are_read() {
+        let apply = |markdown: &str| canonical(&apply_storage(markdown).unwrap());
+        let fragment = r#"<ac:emoticon ac:name="smile" />"#;
+
+        assert_eq!(
+            apply(&format!("```confluence-storage\n{fragment}\n```")),
+            canonical(fragment)
+        );
+        assert_eq!(
+            apply(&format!(
+                "````confluence-storage\n{fragment}\n````\n\nafter"
+            )),
+            canonical(&format!("{fragment}<p>after</p>"))
+        );
+        assert_eq!(
+            apply(&format!(
+                "> quoted\n>\n> ```confluence-storage\n> {fragment}\n> ```"
+            )),
+            canonical(&format!("<blockquote><p>quoted</p>{fragment}</blockquote>"))
+        );
+        assert_eq!(
+            apply(&format!(
+                ">   ```confluence-storage\n>   {fragment}\n>   ```"
+            )),
+            canonical(&format!("<blockquote>{fragment}</blockquote>"))
+        );
+        assert_eq!(
+            apply(&format!(
+                "- item\n\n  ```confluence-storage\n  {fragment}\n  ```\n- next"
+            )),
+            canonical(&format!(
+                "<ul><li><p>item</p>{fragment}</li><li><p>next</p></li></ul>"
+            ))
+        );
+        assert_eq!(
+            apply(&format!(
+                "```confluence-storage\r\n{fragment}\r\n```\r\n\r\nafter\r\n"
+            )),
+            canonical(&format!("{fragment}<p>after</p>"))
+        );
+        assert_eq!(
+            apply("```confluence-storage\n```\n\nafter"),
+            canonical("<p>after</p>")
+        );
+    }
+
+    #[test]
+    fn storage_fences_sharing_a_line_with_text_are_read() {
+        let apply = |markdown: &str| canonical(&apply_storage(markdown).unwrap());
+        let fragment = r#"<ac:emoticon ac:name="smile" />"#;
+
+        for (markdown, expected) in [
+            (
+                format!("before ```confluence-storage\n{fragment}\n``` after"),
+                format!("<p>before {fragment} after</p>"),
+            ),
+            (
+                format!("```confluence-storage\n{fragment}\n``` after"),
+                format!("<p>{fragment} after</p>"),
+            ),
+            (
+                format!("before ```confluence-storage\n{fragment}\n```"),
+                format!("<p>before {fragment}</p>"),
+            ),
+            (
+                format!(
+                    "```confluence-storage\n{fragment}\n``` and ```confluence-storage\n{fragment}\n```\n\nnext"
+                ),
+                format!("<p>{fragment} and {fragment}</p><p>next</p>"),
+            ),
+            (
+                format!(
+                    "one ```confluence-storage\n{fragment}\n```\n\ntwo ```confluence-storage\n{fragment}\n```"
+                ),
+                format!("<p>one {fragment}</p><p>two {fragment}</p>"),
+            ),
+            (
+                format!(
+                    "one ```confluence-storage\n{fragment}\n```\n\n```confluence-storage\n{fragment}\n```\n\nend"
+                ),
+                format!("<p>one {fragment}</p>{fragment}<p>end</p>"),
+            ),
+            (
+                format!(
+                    "```confluence-storage\n{fragment}\n```123 ```confluence-storage\n{fragment}\n```0"
+                ),
+                format!("<p>{fragment}123 {fragment}0</p>"),
+            ),
+            (
+                format!("```confluence-storage\n{fragment}\n```\t"),
+                fragment.to_string(),
+            ),
+            (
+                format!("x ```confluence-storage\n\n  {fragment}\n``` y"),
+                format!("<p>x   {fragment} y</p>"),
+            ),
+            (
+                "x ```confluence-storage\n\n\n``` y".to_string(),
+                "<p>x  y</p>".to_string(),
+            ),
+        ] {
+            assert_eq!(apply(&markdown), canonical(&expected), "{markdown:?}");
+        }
+    }
+
+    #[test]
+    fn storage_fences_without_a_closing_line_stay_code() {
+        let apply = |markdown: &str| apply_storage(markdown).unwrap();
+
+        for markdown in [
+            "```confluence-storage\n<p>x</p>",
+            "```confluence-storage\n<p>x</p>\n",
+            "```confluence-storage\n<p>x</p>\n\n\n",
+            "```confluence-storage\n<p>x</p>\n    ```",
+            "```confluence-storage\n<p>x</p>\n    ```\n",
+            "````confluence-storage\n<p>x</p>\n```",
+            "```confluence-storage\n<p>x</p>\n~~~",
+            "```confluence-storage",
+            "> ```confluence-storage\n> <p>x</p>\n\nafter",
+            "- item\n\n  ```confluence-storage\n  <p>x</p>\n\nafter",
+        ] {
+            let storage = apply(markdown);
+            assert!(storage.contains("<pre>"), "{markdown:?} gave {storage}");
+            assert!(!storage.contains("<p>x</p>"), "{markdown:?} gave {storage}");
+        }
+    }
+
+    #[test]
+    fn text_naming_a_placeholder_survives() {
+        assert_round_trips(concat!(
+            r#"<p><ac:emoticon ac:name="smile" /></p>"#,
+            "<table><tbody><tr><td><p>CONFLUENCE_XML_PLACEHOLDER_0_END</p>",
+            r#"<p><ac:emoticon ac:name="sad" /></p></td></tr></tbody></table>"#,
+        ));
+        assert_round_trips(concat!(
+            r#"<table><tbody><tr><td><p><ac:emoticon ac:name="sad" /></p></td></tr></tbody></table>"#,
+            "<p>CONFLUENCE_XML_PLACEHOLDER_0_END and CONFLUENCE_XML_PLACEHOLDERX_0_END</p>",
+        ));
+    }
+
+    #[test]
+    fn text_naming_a_placeholder_survives_a_fence_spelled_with_a_reference() {
+        let storage = apply_storage(
+            "CONFLUENCE_XML_PLACEHOLDER_0_END\n\n```confluence&#45;storage\n<p>x</p>\n```",
+        )
+        .unwrap();
+        assert_eq!(storage, "<p>CONFLUENCE_XML_PLACEHOLDER_0_END</p>\n<p>x</p>");
+    }
+
+    #[test]
+    fn text_spelling_a_placeholder_in_a_file_name_survives() {
+        let markdown = "![](attachments/%43ONFLUENCE_XML_PLACEHOLDER_0_END)\n\n```confluence-storage\n<b>x</b>\n```";
+        let storage = apply_storage(markdown).unwrap();
+        assert_eq!(
+            storage,
+            concat!(
+                r#"<p><ac:image><ri:attachment ri:filename="CONFLUENCE_XML_PLACEHOLDER_0_END" /></ac:image></p>"#,
+                "\n<b>x</b>",
+            )
+        );
+    }
+
+    #[test]
+    fn storage_fences_next_to_other_text_stay_in_the_paragraph() {
+        for (markdown, expected) in [
+            (
+                "before <em>\n```confluence-storage\nend</em>\n```",
+                "<p>before <em>\nend</em></p>",
+            ),
+            (
+                "text\n```confluence-storage\n<b>x</b>\n```\nmore",
+                "<p>text\n<b>x</b>\nmore</p>",
+            ),
+            (
+                "```confluence-storage\n<em>\n```\nend</em>",
+                "<p><em>\nend</em></p>",
+            ),
+            (
+                "```confluence-storage\n<em>Title</em>\n```\n===",
+                "<h1><em>Title</em></h1>",
+            ),
+            (
+                "```confluence-storage\n<em>Title</em>\n```\n---",
+                "<h2><em>Title</em></h2>",
+            ),
+            (
+                "```confluence-storage\n<em>a</em>\n```\n```confluence-storage\n<em>b</em>\n```",
+                "<p><em>a</em>\n<em>b</em></p>",
+            ),
+            (
+                "Hi ```confluence-storage\n<b>1</b>\n``````confluence-storage\n<b>2</b>\n```!",
+                "<p>Hi <b>1</b><b>2</b>!</p>",
+            ),
+            (
+                "before ```confluence-storage\u{a0}\n<b/>\n``` after",
+                "<p>before <b/> after</p>",
+            ),
+        ] {
+            assert_eq!(apply_storage(markdown).unwrap(), expected, "{markdown:?}");
+        }
+    }
+
+    #[test]
+    fn storage_fences_keep_the_blank_lines_they_hold() {
+        let storage = apply_storage(
+            "```confluence-storage\n<pre>A\n\n\n```\n\n```confluence-storage\nB</pre>\n```",
+        )
+        .unwrap();
+        assert_eq!(storage, "<pre>A\n\n\nB</pre>");
+    }
+
+    #[test]
+    fn storage_fences_end_with_their_container() {
+        let apply = |markdown: &str| apply_storage(markdown).unwrap();
+
+        // The fence is never closed inside its quote, so the paragraph after
+        // the quote is Markdown and the later backtick line opens new code.
+        let storage = apply("> ```confluence-storage\n> <p>x</p>\n\n*middle*\n\n> ```\n> tail");
+        assert!(storage.contains("<p><em>middle</em></p>"), "{storage}");
+        assert!(storage.contains("&lt;p&gt;x&lt;/p&gt;"), "{storage}");
+    }
+
+    #[test]
+    fn storage_fences_shown_as_code_stay_text() {
+        let apply = |markdown: &str| apply_storage(markdown).unwrap();
+        let shown = "&lt;ac:emoticon ac:name=\"smile\" /&gt;";
+
+        for markdown in [
+            "~~~markdown\n> ```confluence-storage\n> <ac:emoticon ac:name=\"smile\" />\n> ```\n~~~",
+            "````markdown\n```confluence-storage\n<ac:emoticon ac:name=\"smile\" />\n```\n````",
+            "    ```confluence-storage\n    <ac:emoticon ac:name=\"smile\" />\n    ```",
+            "~~~\ntext ```confluence-storage\n<ac:emoticon ac:name=\"smile\" />\n``` text\n~~~",
+        ] {
+            let storage = apply(markdown);
+            assert!(storage.contains(shown), "{markdown:?} gave {storage}");
+            assert!(
+                !storage.contains("<ac:emoticon"),
+                "{markdown:?} gave {storage}"
+            );
+        }
+    }
+
+    #[test]
     fn list_items_keep_their_paragraphs_apart() {
         assert_round_trips("<ul><li><p>para a</p><p>para b</p></li><li><p>single</p></li></ul>");
         assert_round_trips("<ol><li><p>one</p><p>more</p></li><li><p>two</p></li></ol>");

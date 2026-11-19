@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, html};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, html};
 use regex::Regex;
 use roxmltree::{Document, Node, NodeType};
 use serde::{Deserialize, Serialize};
@@ -189,7 +190,7 @@ fn storage_to_markdown_fallback(storage: &str) -> String {
 
     let mut markdown = html2md::parse_html(&normalized);
     for (idx, fragment) in xml_fragments.into_iter().enumerate() {
-        let block = format!("```confluence-storage\n{fragment}\n```");
+        let block = confluence_raw_block(&fragment);
         markdown = markdown.replace(&format!("CONFLUENCE_XML_PLACEHOLDER_{idx}"), &block);
     }
     markdown.trim().to_string()
@@ -210,32 +211,18 @@ pub(crate) fn render_markdown_storage(
     let (normalized_layouts, layout_fragments) = replace_layout_blocks(markdown, allow_lossy)?;
     let (normalized_macros, macro_fragments) =
         replace_confluence_macro_blocks(&normalized_layouts, allow_lossy)?;
-    let block_re = Regex::new(r"(?s)```confluence-storage\s*\n(.*?)\n```")?;
-    let mut raw_fragments = Vec::new();
-    let normalized = block_re
-        .replace_all(&normalized_macros, |captures: &regex::Captures<'_>| {
-            let idx = raw_fragments.len();
-            raw_fragments.push(captures[1].to_string());
-            format!("CONFLUENCE_XML_PLACEHOLDER_{idx}")
-        })
-        .to_string();
+    let mut raw_fragments = StorageFragments::for_markdown(&normalized_macros);
+    let normalized = replace_inline_storage_fences(&normalized_macros, &mut raw_fragments);
 
     let escapes_confluence_markup = has_unescaped_confluence_markup(&normalized);
-    let parser = Parser::new_ext(&normalized, markdown_options());
+    let events = parse_with_storage_fences(&normalized, &mut raw_fragments);
     let mut html_output = String::new();
-    html::push_html(&mut html_output, parser);
+    html::push_html(&mut html_output, events.into_iter());
     // Raw storage blocks and macros are restored afterwards, so they stay as
     // written, and link bodies are not yet wrapped as literal text.
     let html_output = convert_checkbox_lists_to_task_lists(&html_output);
     let mut html_output = convert_generated_markup(&html_output);
-    for idx in (0..raw_fragments.len()).rev() {
-        let fragment = &raw_fragments[idx];
-        html_output = html_output.replace(
-            &format!("<p>CONFLUENCE_XML_PLACEHOLDER_{idx}</p>"),
-            fragment,
-        );
-        html_output = html_output.replace(&format!("CONFLUENCE_XML_PLACEHOLDER_{idx}"), fragment);
-    }
+    html_output = raw_fragments.restore(&html_output);
     for idx in (0..layout_fragments.len()).rev() {
         let fragment = &layout_fragments[idx];
         html_output = html_output.replace(
@@ -264,6 +251,265 @@ pub(crate) fn render_markdown_storage(
 
     let storage = html_output.trim().to_string();
     Ok(ConversionOutput { storage })
+}
+
+const STORAGE_FENCE_INFO: &str = "confluence-storage";
+
+/// The storage fragments taken out of a Markdown document while it is parsed
+/// and rendered, each with a placeholder standing in for it.
+struct StorageFragments {
+    /// The text every placeholder starts with. It carries a digest of the
+    /// document, so nothing the document says can spell it, however the
+    /// text is escaped or encoded.
+    marker: String,
+    fragments: Vec<String>,
+}
+
+impl StorageFragments {
+    fn for_markdown(markdown: &str) -> Self {
+        let digest = Sha256::digest(markdown.as_bytes());
+        let digest: String = digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
+        Self {
+            marker: format!("CONFLUENCE_XML_PLACEHOLDER_{digest}"),
+            fragments: Vec::new(),
+        }
+    }
+
+    /// Keeps a fragment and returns its placeholder. The placeholder ends in
+    /// a letter so that digits following it are not read as part of its
+    /// number.
+    fn hold(&mut self, fragment: String) -> String {
+        let placeholder = format!("{}_{}_END", self.marker, self.fragments.len());
+        self.fragments.push(fragment);
+        placeholder
+    }
+
+    /// Puts the fragments back in place of their placeholders, together with
+    /// the paragraph the parser wraps around a placeholder standing alone.
+    ///
+    /// The fragments go in during a single pass over the rendered HTML, so
+    /// nothing inside a fragment is replaced.
+    fn restore(&self, html: &str) -> String {
+        let mut out = String::with_capacity(html.len());
+        let mut rest = html;
+        while let Some(at) = rest.find(&self.marker) {
+            let (before, after) = rest.split_at(at);
+            let Some((fragment, after)) = self.fragment_at(&after[self.marker.len()..]) else {
+                out.push_str(before);
+                out.push_str(&self.marker);
+                rest = &after[self.marker.len()..];
+                continue;
+            };
+            let (before, after) = match (before.strip_suffix("<p>"), after.strip_prefix("</p>")) {
+                (Some(before), Some(after)) => (before, after),
+                _ => (before, after),
+            };
+            out.push_str(before);
+            out.push_str(fragment);
+            rest = after;
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Reads the rest of a placeholder after its marker, returning the
+    /// fragment it stands for and the text that follows it.
+    fn fragment_at<'t>(&self, text: &'t str) -> Option<(&str, &'t str)> {
+        let text = text.strip_prefix('_')?;
+        let digits = text.len()
+            - text
+                .trim_start_matches(|ch: char| ch.is_ascii_digit())
+                .len();
+        let (index, text) = text.split_at(digits);
+        let fragment = self.fragments.get(index.parse::<usize>().ok()?)?;
+        Some((fragment, text.strip_prefix("_END")?))
+    }
+}
+
+/// Parses Markdown and swaps every `confluence-storage` code block for a
+/// placeholder, adding the storage it holds to `fragments`.
+///
+/// The parser decides what a fenced block is, so a fence inside a block quote
+/// or a list item comes without its container's markers, and one shown inside
+/// another code block stays text.
+fn parse_with_storage_fences<'a>(
+    markdown: &'a str,
+    fragments: &mut StorageFragments,
+) -> Vec<Event<'a>> {
+    let mut events = Vec::new();
+    // The events and source of the storage block being read.
+    let mut open: Option<(Vec<Event<'a>>, &'a str)> = None;
+    for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
+        match (event, &mut open) {
+            (Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))), None)
+                if info.trim() == STORAGE_FENCE_INFO =>
+            {
+                let start = Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)));
+                open = Some((vec![start], &markdown[range]));
+            }
+            (Event::End(TagEnd::CodeBlock), Some((block, source))) => {
+                let content: String = block
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Text(text) => Some(text.as_ref()),
+                        _ => None,
+                    })
+                    .collect();
+                if has_closing_fence(source, &content) {
+                    // The last newline belongs to the closing line.
+                    let fragment = content.strip_suffix('\n').unwrap_or(&content);
+                    let placeholder = fragments.hold(fragment.to_string());
+                    events.push(Event::Html(format!("{placeholder}\n").into()));
+                } else {
+                    events.append(block);
+                    events.push(Event::End(TagEnd::CodeBlock));
+                }
+                open = None;
+            }
+            (event, Some((block, _))) => block.push(event),
+            (event, None) => events.push(event),
+        }
+    }
+    events
+}
+
+/// Whether a fenced code block ends with a closing fence, given its source
+/// and the content the parser read from it. A block that runs to the end of
+/// its container without one is left as code.
+///
+/// The source holds the opening line, one line for each line of content, and
+/// the closing line if there is one.
+fn has_closing_fence(source: &str, content: &str) -> bool {
+    let source_lines = source.trim_end_matches(['\n', '\r']).split('\n').count();
+    let content_lines = content.split_inclusive('\n').count();
+    source_lines == content_lines + 2
+}
+
+/// Replaces `confluence-storage` fences that are not code blocks with a
+/// placeholder, adding the storage they hold to `fragments`.
+///
+/// The fallback for malformed storage writes fragments in the middle of a
+/// paragraph, so that other text shares a line with the opening fence, the
+/// closing fence, or both. The parser reads no storage block there, so such a
+/// fence is matched as text: it closes at the first line that starts with as
+/// many backticks as opened it. Fences the parser reads as closed code blocks
+/// are left to it, along with everything else inside a code block.
+fn replace_inline_storage_fences(markdown: &str, fragments: &mut StorageFragments) -> String {
+    static OPENING: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(`{3,})confluence-storage[\s&&[^\n]]*\n").expect("valid regex")
+    });
+
+    if !OPENING.is_match(markdown) {
+        return markdown.to_string();
+    }
+    let code_blocks: Vec<Range<usize>> = Parser::new_ext(markdown, markdown_options())
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            matches!(event, Event::Start(Tag::CodeBlock(_))).then_some(range)
+        })
+        .collect();
+
+    let mut out = String::with_capacity(markdown.len());
+    let mut cursor = 0;
+    let mut search_from = 0;
+    // The shortest fence found to have no closing line. No longer fence that
+    // opens later has one either.
+    let mut unclosed = usize::MAX;
+    // Taking a fence out of the text changes where the code blocks after it
+    // are, so from the first one on the fences are matched as text alone.
+    let mut by_text_alone = false;
+    while let Some(captures) = OPENING.captures_at(markdown, search_from) {
+        let opening = captures.get(0).expect("whole match");
+        let ticks = &captures[1];
+        let closing = format!("\n{ticks}");
+        let body_start = opening.end() - 1;
+        search_from = opening.end();
+
+        // Code blocks come in source order and do not overlap.
+        let after = code_blocks.partition_point(|block| block.end <= opening.start());
+        let block = code_blocks
+            .get(after)
+            .filter(|block| !by_text_alone && block.start <= opening.start());
+        let at = match block {
+            Some(block) if !is_container_prefix(&markdown[block.start..opening.start()]) => {
+                // The fence is text inside another code block.
+                search_from = block.end.max(opening.end());
+                continue;
+            }
+            Some(block) => {
+                // The fence opens a code block of its own. It is a fragment
+                // in a paragraph when other text stands on the line before or
+                // after it, or when something other than spaces follows the
+                // backticks that close it, which the parser reads as one
+                // more line of code.
+                let end = block.end.max(body_start);
+                let joins_other_text = !stands_apart(markdown, block);
+                let fragment_end = markdown[body_start..end].find(&closing).filter(|at| {
+                    let after_ticks = &markdown[body_start + at + closing.len()..];
+                    let rest_of_line = after_ticks.lines().next().unwrap_or_default();
+                    joins_other_text
+                        || !rest_of_line
+                            .trim_start_matches('`')
+                            .trim_matches(' ')
+                            .is_empty()
+                });
+                let Some(at) = fragment_end else {
+                    search_from = end.max(opening.end());
+                    continue;
+                };
+                at
+            }
+            None if ticks.len() >= unclosed => continue,
+            None => {
+                let Some(at) = markdown[body_start..].find(&closing) else {
+                    unclosed = ticks.len();
+                    continue;
+                };
+                at
+            }
+        };
+
+        // The fragment starts after the opening line and any blank lines.
+        let mut body = &markdown[body_start..body_start + at];
+        while let Some((line, rest)) = body.split_once('\n')
+            && line.trim().is_empty()
+        {
+            body = rest;
+        }
+        out.push_str(&markdown[cursor..opening.start()]);
+        out.push_str(&fragments.hold(body.to_string()));
+        cursor = body_start + at + closing.len();
+        search_from = cursor;
+        by_text_alone = true;
+    }
+    out.push_str(&markdown[cursor..]);
+    out
+}
+
+/// Whether a code block stands apart from the text around it: the line
+/// before it and the line after it are blank or missing.
+fn stands_apart(markdown: &str, block: &Range<usize>) -> bool {
+    let line_start = markdown[..block.start].rfind('\n').map_or(0, |at| at + 1);
+    let line_before = markdown[..line_start]
+        .strip_suffix('\n')
+        .map(|before| before.rsplit('\n').next().unwrap_or_default());
+    let block_end = block.start + markdown[block.clone()].trim_end().len();
+    let line_after = markdown[block_end..]
+        .split_once('\n')
+        .map(|(_, after)| after.split('\n').next().unwrap_or_default());
+    [line_before, line_after]
+        .into_iter()
+        .flatten()
+        .all(|line| is_container_prefix(line.trim_end_matches('\r')))
+}
+
+/// Whether text holds nothing but what may precede a fence on its line:
+/// block quote markers and indentation.
+fn is_container_prefix(text: &str) -> bool {
+    text.chars().all(|ch| matches!(ch, ' ' | '\t' | '>'))
 }
 
 /// Whether Markdown text holds Confluence markup, which the renderer writes
@@ -2306,15 +2552,28 @@ fn prefix_markdown_block(block: &str, prefix: &str) -> String {
 }
 
 fn fallback_block_markdown(node: Node<'_, '_>, source: &str) -> String {
-    if contains_confluence_markup(node) || is_confluence_node(node) {
-        confluence_raw_block(raw_xml_fragment(node, source))
+    let raw = raw_xml_fragment(node, source);
+    // A blank line ends a Markdown HTML block, and what follows it would be
+    // read as Markdown, so such a fragment needs the fence as well.
+    let has_blank_line = raw.trim().lines().any(|line| line.trim().is_empty());
+    if contains_confluence_markup(node) || is_confluence_node(node) || has_blank_line {
+        confluence_raw_block(raw)
     } else {
-        raw_xml_fragment(node, source).trim().to_string()
+        raw.trim().to_string()
     }
 }
 
 fn confluence_raw_block(raw: &str) -> String {
-    format!("```confluence-storage\n{}\n```", raw.trim())
+    let raw = raw.trim();
+    // A fence longer than every run of backticks in the fragment, so that
+    // nothing inside can close it.
+    let longest_run = raw
+        .split(|ch| ch != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let fence = "`".repeat(longest_run.max(2) + 1);
+    format!("{fence}confluence-storage\n{raw}\n{fence}")
 }
 
 fn collect_macro_parameters(node: Node<'_, '_>) -> BTreeMap<String, String> {
