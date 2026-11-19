@@ -3812,6 +3812,24 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn attachment_stamped_with_its_version_at_save_reads_as_markdown() {
+        let image = r#"<p><ac:image ac:alt="Shot"><ri:attachment ri:filename="shot.png" ri:version-at-save="1" /></ac:image></p>"#;
+        assert_eq!(storage_to_markdown(image), "![Shot](attachments/shot.png)");
+
+        let link = r#"<p>see <ac:link><ri:attachment ri:filename="manual.pdf" ri:version-at-save="3" /><ac:plain-text-link-body><![CDATA[the manual]]></ac:plain-text-link-body></ac:link></p>"#;
+        let markdown = storage_to_markdown(link);
+        assert_eq!(markdown, "see [the manual](attachments/manual.pdf)");
+        assert_eq!(
+            canonical(&apply_storage(&markdown).unwrap()),
+            canonical(&link.replace(r#" ri:version-at-save="3""#, "")),
+        );
+
+        // Any other extra attribute still has no Markdown form.
+        let other = r#"<p><ac:image><ri:attachment ri:filename="shot.png" ri:space-key="DOCS" /></ac:image></p>"#;
+        assert!(storage_to_markdown(other).contains("```confluence-storage"));
+    }
+
+    #[test]
     fn lists_that_follow_each_other_stay_separate() {
         assert_round_trips(r#"<ol><li>one</li><li>two</li></ol><ol start="5"><li>five</li></ol>"#);
         assert_round_trips("<ol><li>one</li></ol><ol><li>again</li></ol><ol><li>third</li></ol>");

@@ -1780,7 +1780,7 @@ fn render_confluence_image(node: Node<'_, '_>) -> Option<String> {
 
     let resource = sole_element_child(node)?;
     let target = if is_ri_element(resource, "attachment") {
-        let file_name = sole_attribute(resource, "filename")?;
+        let file_name = attachment_file_name(resource)?;
         format!("attachments/{}", encode_target_segment(file_name))
     } else if is_ri_element(resource, "url") {
         sole_attribute(resource, "value")?.to_string()
@@ -1829,6 +1829,21 @@ fn sole_attribute<'a>(node: Node<'a, '_>, name: &str) -> Option<&'a str> {
         return None;
     }
     node.attribute((RI_NS, name))
+}
+
+/// The file name of an attachment of this page, provided the element says
+/// nothing else about it. Confluence Cloud stamps each reference with the
+/// attachment's version when the page is saved and does so again on the next
+/// save, so that stamp is not content to preserve.
+fn attachment_file_name<'a>(node: Node<'a, '_>) -> Option<&'a str> {
+    let only_names_the_file = node.attributes().all(|attribute| {
+        attribute.namespace() == Some(RI_NS)
+            && matches!(attribute.name(), "filename" | "version-at-save")
+    });
+    if !only_names_the_file || node.children().any(|child| child.is_element()) {
+        return None;
+    }
+    node.attribute((RI_NS, "filename"))
 }
 
 /// Formats a link or image destination, using the angle-bracket form when
@@ -1932,7 +1947,7 @@ fn render_confluence_link(node: Node<'_, '_>, source: &str) -> Option<String> {
     }
 
     if let Some(attachment) = namespaced_child(node, RI_NS, "attachment") {
-        let file_name = sole_attribute(attachment, "filename")?;
+        let file_name = attachment_file_name(attachment)?;
         let mut target = format!("attachments/{}", encode_target_segment(file_name));
         if let Some(anchor) = anchor {
             target.push('#');
