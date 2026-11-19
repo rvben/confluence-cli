@@ -842,7 +842,7 @@ fn render_list(node: Node<'_, '_>, source: &str, indent: usize, ordered: bool) -
     let list_name = node.tag_name().name();
     let preceding_lists =
         std::iter::successors(node.prev_sibling(), |sibling| sibling.prev_sibling())
-            .filter(|sibling| !sibling.text().is_some_and(|text| text.trim().is_empty()))
+            .filter(|sibling| !renders_nothing(*sibling))
             .take_while(|sibling| sibling.is_element() && sibling.tag_name().name() == list_name)
             .count();
     let (bullet, delimiter) = if preceding_lists % 2 == 0 {
@@ -1801,6 +1801,14 @@ fn render_confluence_image(node: Node<'_, '_>) -> Option<String> {
         "![{}]({destination}{title})",
         escape_markdown_text(alt)
     ))
+}
+
+/// Whether a node renders as nothing: whitespace between elements, a
+/// comment or a processing instruction.
+fn renders_nothing(node: Node<'_, '_>) -> bool {
+    node.is_comment()
+        || node.is_pi()
+        || (node.is_text() && node.text().is_some_and(|text| text.trim().is_empty()))
 }
 
 fn is_ri_element(node: Node<'_, '_>, name: &str) -> bool {

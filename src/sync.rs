@@ -3795,6 +3795,23 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn indented_or_commented_lists_that_follow_each_other_stay_separate() {
+        assert_round_trips(
+            "<ol>\n<li>one</li>\n<li>two</li>\n</ol>\n<ol start=\"5\">\n<li>five</li>\n</ol>",
+        );
+        assert_round_trips("<ul>\n<li>a</li>\n</ul>\n<ul>\n<li>b</li>\n</ul>");
+
+        let markdown = storage_to_markdown(
+            r#"<ol><li>one</li></ol><!-- note --><ol start="5"><li>five</li></ol>"#,
+        );
+        assert_eq!(
+            canonical(&apply_storage(&markdown).unwrap()),
+            canonical(r#"<ol><li>one</li></ol><ol start="5"><li>five</li></ol>"#),
+            "pulled as {markdown:?}"
+        );
+    }
+
+    #[test]
     fn lists_that_follow_each_other_stay_separate() {
         assert_round_trips(r#"<ol><li>one</li><li>two</li></ol><ol start="5"><li>five</li></ol>"#);
         assert_round_trips("<ol><li>one</li></ol><ol><li>again</li></ol><ol><li>third</li></ol>");
