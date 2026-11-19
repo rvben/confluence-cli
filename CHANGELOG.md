@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.38](https://github.com/rvben/confluence-cli/compare/v0.1.37...v0.1.38) - 2026-11-19
+
+### Fixed
+
+- **markdown**: keep lists that follow each other separate ([9ebd56e](https://github.com/rvben/confluence-cli/commit/9ebd56e250207541cb2f91fcb75da752f24f950c))
+- **sync**: keep page content intact across pull and apply ([bda1b93](https://github.com/rvben/confluence-cli/commit/bda1b936b6d51894af66d3a191762753d56588d4))
+- **provider**: look a space up directly instead of scanning the first 500 ([bb974a1](https://github.com/rvben/confluence-cli/commit/bb974a1b289f1c4535d4219467d9066f62aeaefd))
+- **deps**: resolve security advisories and refresh dependencies ([e2c660c](https://github.com/rvben/confluence-cli/commit/e2c660c466a09b85d1be11b3ed6e160b828645c0))
+
 ## [0.1.37](https://github.com/rvben/confluence-cli/compare/v0.1.36...v0.1.37) - 2026-10-06
 
 ### Fixed
