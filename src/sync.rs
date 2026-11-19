@@ -4455,6 +4455,11 @@ mod round_trip_tests {
         assert_round_trips("<p>Term<br />: text</p>");
         assert_round_trips("<p>Term</p><p>:</p>");
         assert_round_trips("<p>:colon</p>");
+        assert_round_trips("<p>Term</p><p>:text</p>");
+        assert_round_trips("<p>Term</p><p>:::</p>");
+        assert_round_trips("<p>Term<br />:text</p>");
+        assert_round_trips("<p>Term</p><p>:smile: done</p>");
+        assert_round_trips("<ul><li><p>Term</p><p>:text</p></li></ul>");
     }
 
     #[test]

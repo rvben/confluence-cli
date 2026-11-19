@@ -2264,7 +2264,7 @@ fn escape_block_start(line: &str) -> String {
         Some('-') => (followed_by_space_or_end(&content[1..]) || only(&['-', ' '])).then_some(0),
         Some('+') => (followed_by_space_or_end(&content[1..]) || only(&['+'])).then_some(0),
         Some('=') => only(&['=']).then_some(0),
-        Some(':') => followed_by_space_or_end(&content[1..]).then_some(0),
+        Some(':') => Some(0),
         Some(first) if first.is_ascii_digit() => {
             let digits = content.len()
                 - content
