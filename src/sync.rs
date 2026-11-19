@@ -3830,6 +3830,16 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn task_lists_that_follow_each_other_stay_separate() {
+        assert_round_trips(
+            "<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>one</ac:task-body></ac:task></ac:task-list><ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>two</ac:task-body></ac:task></ac:task-list>",
+        );
+        assert_round_trips(
+            "<ul><li>a</li></ul><ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>one</ac:task-body></ac:task></ac:task-list><ul><li>b</li></ul>",
+        );
+    }
+
+    #[test]
     fn lists_that_follow_each_other_stay_separate() {
         assert_round_trips(r#"<ol><li>one</li><li>two</li></ol><ol start="5"><li>five</li></ol>"#);
         assert_round_trips("<ol><li>one</li></ol><ol><li>again</li></ol><ol><li>third</li></ol>");

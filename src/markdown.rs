@@ -836,19 +836,10 @@ fn render_list(node: Node<'_, '_>, source: &str, indent: usize, ordered: bool) -
         return None;
     }
 
-    // Markdown reads lists of one kind that follow each other as a single
-    // list unless their markers differ, so every other one takes the
-    // alternative marker.
-    let list_name = node.tag_name().name();
-    let preceding_lists =
-        std::iter::successors(node.prev_sibling(), |sibling| sibling.prev_sibling())
-            .filter(|sibling| !renders_nothing(*sibling))
-            .take_while(|sibling| sibling.is_element() && sibling.tag_name().name() == list_name)
-            .count();
-    let (bullet, delimiter) = if preceding_lists % 2 == 0 {
-        ("-", ".")
-    } else {
+    let (bullet, delimiter) = if takes_alternative_marker(node) {
         ("*", ")")
+    } else {
+        ("-", ".")
     };
 
     let mut rendered = Vec::new();
@@ -864,6 +855,22 @@ fn render_list(node: Node<'_, '_>, source: &str, indent: usize, ordered: bool) -
         rendered.push(render_list_item(item, source, indent, &marker)?);
     }
     Some(rendered.join("\n"))
+}
+
+/// Whether a list has to use the alternative marker to stay a list of its
+/// own. Markdown reads lists that follow each other as a single list unless
+/// their markers differ, so every other one in such a run takes the
+/// alternative. Bullet and task lists share the bullet markers.
+fn takes_alternative_marker(list: Node<'_, '_>) -> bool {
+    let is_numbered = |node: Node<'_, '_>| node.tag_name().name() == "ol";
+    let is_list = |node: Node<'_, '_>| {
+        node.is_element() && matches!(node.tag_name().name(), "ul" | "ol" | "task-list")
+    };
+    let preceding = std::iter::successors(list.prev_sibling(), |sibling| sibling.prev_sibling())
+        .filter(|sibling| !renders_nothing(*sibling))
+        .take_while(|sibling| is_list(*sibling) && is_numbered(*sibling) == is_numbered(list))
+        .count();
+    preceding % 2 == 1
 }
 
 fn render_list_item(
@@ -1004,6 +1011,11 @@ fn render_task_list(node: Node<'_, '_>, source: &str) -> Option<String> {
         return None;
     }
 
+    let bullet = if takes_alternative_marker(node) {
+        "*"
+    } else {
+        "-"
+    };
     let mut lines = Vec::new();
     for task in tasks {
         let status = namespaced_child(task, AC_NS, "task-status")?
@@ -1014,7 +1026,7 @@ fn render_task_list(node: Node<'_, '_>, source: &str) -> Option<String> {
         let body = namespaced_child(task, AC_NS, "task-body")?;
         let text = render_inline_children(body, source)?;
         let marker = if status == "complete" { "[x]" } else { "[ ]" };
-        lines.push(format!("- {marker} {}", text.trim()));
+        lines.push(format!("{bullet} {marker} {}", text.trim()));
     }
     Some(lines.join("\n"))
 }
