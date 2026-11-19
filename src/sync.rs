@@ -3830,6 +3830,38 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn list_items_keep_their_paragraphs_apart() {
+        assert_round_trips("<ul><li><p>para a</p><p>para b</p></li><li><p>single</p></li></ul>");
+        assert_round_trips("<ol><li><p>one</p><p>more</p></li><li><p>two</p></li></ol>");
+        assert_round_trips("<ul><li><p>a</p><p>b</p><ul><li>nested</li></ul></li></ul>");
+        assert_round_trips("<ul><li><p>a</p><p>- not a list</p></li></ul>");
+        assert_round_trips("<ul><li><p>a</p><p><strong>b</strong> and c</p><p>d</p></li></ul>");
+
+        let markdown = storage_to_markdown("<ul><li><p>para a</p><p>para b</p></li></ul>");
+        assert_eq!(markdown, "- para a\n\n  para b");
+    }
+
+    #[test]
+    fn list_items_markdown_cannot_express_keep_their_storage() {
+        for storage in [
+            "<ul><li><p>a</p><ul><li>nested</li></ul><p>b</p></li></ul>",
+            "<ul><li>a<ul><li>nested</li></ul>b</li></ul>",
+            "<ul><li><p>a</p><p></p></li></ul>",
+            "<ul><li><p>a</p><p>b</p></li><li>c</li></ul>",
+            "<ul><li>c</li><li><p>a</p><p>b</p></li></ul>",
+            "<ul><li>a<p>b</p></li></ul>",
+            "<ul><li><p>a</p>b</li></ul>",
+        ] {
+            let markdown = storage_to_markdown(storage);
+            assert_eq!(
+                canonical(&apply_storage(&markdown).unwrap()),
+                canonical(storage),
+                "pulled as {markdown:?}"
+            );
+        }
+    }
+
+    #[test]
     fn task_lists_that_follow_each_other_stay_separate() {
         assert_round_trips(
             "<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>one</ac:task-body></ac:task></ac:task-list><ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>two</ac:task-body></ac:task></ac:task-list>",

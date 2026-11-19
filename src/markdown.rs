@@ -842,6 +842,10 @@ fn render_list(node: Node<'_, '_>, source: &str, indent: usize, ordered: bool) -
         ("-", ".")
     };
 
+    // Whether every item keeps its text in paragraphs, which is what a loose
+    // Markdown list reads back.
+    let paragraphs_only = !items.iter().copied().any(has_text_outside_paragraphs);
+
     let mut rendered = Vec::new();
     for (position, item) in items.into_iter().enumerate() {
         let marker = match (ordered, start) {
@@ -852,7 +856,13 @@ fn render_list(node: Node<'_, '_>, source: &str, indent: usize, ordered: bool) -
                 start.saturating_add(position as u64).min(LARGEST_MARKER)
             ),
         };
-        rendered.push(render_list_item(item, source, indent, &marker)?);
+        rendered.push(render_list_item(
+            item,
+            source,
+            indent,
+            &marker,
+            paragraphs_only,
+        )?);
     }
     Some(rendered.join("\n"))
 }
@@ -878,15 +888,26 @@ fn render_list_item(
     source: &str,
     indent: usize,
     marker: &str,
+    list_holds_paragraphs_only: bool,
 ) -> Option<String> {
     let prefix = format!("{}{} ", " ".repeat(indent), marker);
     // A nested list belongs to this item only when indented to the column
     // where the item's own content starts, which depends on the marker width.
     let nested_indent = prefix.len();
+    // Paragraphs of the item in document order. Text outside a `<p>` collects
+    // in `inline` and becomes a paragraph of its own where a `<p>` starts.
+    let mut paragraphs: Vec<String> = Vec::new();
     let mut inline = String::new();
     let mut nested = Vec::new();
 
     for child in node.children() {
+        // Nested lists are written after the item's text, so text that
+        // follows one in the document has no place to go.
+        let is_nested_list = child.is_element() && matches!(child.tag_name().name(), "ul" | "ol");
+        let is_blank_text = child.is_text() && child.text().unwrap_or_default().trim().is_empty();
+        if !nested.is_empty() && !is_nested_list && !is_blank_text && !renders_nothing(child) {
+            return None;
+        }
         match child.node_type() {
             NodeType::Text => {
                 inline.push_str(&normalize_text_node(child.text().unwrap_or_default()))
@@ -910,7 +931,11 @@ fn render_list_item(
                     continue;
                 }
                 if child.tag_name().name() == "p" {
-                    inline.push_str(render_inline_children(child, source)?.trim());
+                    if !inline.trim().is_empty() {
+                        paragraphs.push(inline.trim().to_string());
+                    }
+                    inline.clear();
+                    paragraphs.push(render_inline_children(child, source)?.trim().to_string());
                     continue;
                 }
                 if is_inlineish_tag(child) || is_confluence_inline(child) {
@@ -923,7 +948,31 @@ fn render_list_item(
         }
     }
 
-    let mut out = format!("{prefix}{}", escape_block_starts(inline.trim()));
+    if !inline.trim().is_empty() || paragraphs.is_empty() {
+        paragraphs.push(inline.trim().to_string());
+    }
+    // An empty paragraph next to others would vanish between the blank lines
+    // that separate them.
+    if paragraphs.len() > 1 && paragraphs.iter().any(String::is_empty) {
+        return None;
+    }
+    // The blank line between paragraphs makes the whole Markdown list loose,
+    // which reads every item's text as a paragraph. Text that sits outside a
+    // `<p>` anywhere in the list would come back wrapped in one.
+    if paragraphs.len() > 1 && !list_holds_paragraphs_only {
+        return None;
+    }
+
+    // Further paragraphs follow a blank line, indented to the item's content.
+    let continuation = format!("\n\n{}", " ".repeat(nested_indent));
+    let mut out = prefix;
+    out.push_str(
+        &paragraphs
+            .iter()
+            .map(|paragraph| escape_block_starts(paragraph))
+            .collect::<Vec<_>>()
+            .join(&continuation),
+    );
     for block in nested {
         if !block.trim().is_empty() {
             out.push('\n');
@@ -1817,6 +1866,14 @@ fn render_confluence_image(node: Node<'_, '_>) -> Option<String> {
 
 /// Whether a node renders as nothing: whitespace between elements, a
 /// comment or a processing instruction.
+/// Whether a list item holds content other than paragraphs and nested lists.
+fn has_text_outside_paragraphs(item: Node<'_, '_>) -> bool {
+    item.children().any(|child| {
+        !renders_nothing(child)
+            && !(child.is_element() && matches!(child.tag_name().name(), "p" | "ul" | "ol"))
+    })
+}
+
 fn renders_nothing(node: Node<'_, '_>) -> bool {
     node.is_comment()
         || node.is_pi()
