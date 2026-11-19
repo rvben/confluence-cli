@@ -16,7 +16,7 @@ services:
       retries: 10
 
   confluence:
-    image: atlassian/confluence:latest
+    image: atlassian/confluence:10.2.13
     ports:
       - "8090:8090"
     environment:
