@@ -3795,6 +3795,18 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn lists_that_follow_each_other_stay_separate() {
+        assert_round_trips(r#"<ol><li>one</li><li>two</li></ol><ol start="5"><li>five</li></ol>"#);
+        assert_round_trips("<ol><li>one</li></ol><ol><li>again</li></ol><ol><li>third</li></ol>");
+        assert_round_trips("<ul><li>a</li></ul><ul><li>b</li></ul><ul><li>c</li></ul>");
+        assert_round_trips("<ul><li>a</li></ul><ol><li>b</li></ol><ul><li>c</li></ul>");
+        assert_round_trips("<ul><li>parent<ol><li>a</li></ol><ol><li>b</li></ol></li></ul>");
+        assert_round_trips(
+            "<blockquote><ul><li>a</li></ul><ul><li>b<ul><li>c</li></ul></li></ul></blockquote>",
+        );
+    }
+
+    #[test]
     fn nested_lists_keep_their_structure() {
         assert_round_trips("<ol><li>one<ol><li>sub</li></ol></li><li>two</li></ol>");
         assert_round_trips("<ol><li>one<ul><li>sub</li></ul></li><li>two</li></ol>");

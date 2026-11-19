@@ -836,13 +836,28 @@ fn render_list(node: Node<'_, '_>, source: &str, indent: usize, ordered: bool) -
         return None;
     }
 
+    // Markdown reads lists of one kind that follow each other as a single
+    // list unless their markers differ, so every other one takes the
+    // alternative marker.
+    let list_name = node.tag_name().name();
+    let preceding_lists =
+        std::iter::successors(node.prev_sibling(), |sibling| sibling.prev_sibling())
+            .filter(|sibling| !sibling.text().is_some_and(|text| text.trim().is_empty()))
+            .take_while(|sibling| sibling.is_element() && sibling.tag_name().name() == list_name)
+            .count();
+    let (bullet, delimiter) = if preceding_lists % 2 == 0 {
+        ("-", ".")
+    } else {
+        ("*", ")")
+    };
+
     let mut rendered = Vec::new();
     for (position, item) in items.into_iter().enumerate() {
         let marker = match (ordered, start) {
-            (false, _) => "-".to_string(),
-            (true, None) => "1.".to_string(),
+            (false, _) => bullet.to_string(),
+            (true, None) => format!("1{delimiter}"),
             (true, Some(start)) => format!(
-                "{}.",
+                "{}{delimiter}",
                 start.saturating_add(position as u64).min(LARGEST_MARKER)
             ),
         };
