@@ -1050,7 +1050,8 @@ fn render_preformatted(node: Node<'_, '_>) -> Option<String> {
                 .to_string(),
         )
     };
-    Some(format!("```{language}\n{content}\n```"))
+    let fence = backtick_fence(&content);
+    Some(format!("{fence}{language}\n{content}\n{fence}"))
 }
 
 fn language_from_class(class_name: &str) -> Option<String> {
@@ -2565,15 +2566,19 @@ fn fallback_block_markdown(node: Node<'_, '_>, source: &str) -> String {
 
 fn confluence_raw_block(raw: &str) -> String {
     let raw = raw.trim();
-    // A fence longer than every run of backticks in the fragment, so that
-    // nothing inside can close it.
-    let longest_run = raw
+    let fence = backtick_fence(raw);
+    format!("{fence}confluence-storage\n{raw}\n{fence}")
+}
+
+/// A code fence longer than every run of backticks in the content, so that
+/// nothing inside can close it.
+fn backtick_fence(content: &str) -> String {
+    let longest_run = content
         .split(|ch| ch != '`')
         .map(str::len)
         .max()
         .unwrap_or_default();
-    let fence = "`".repeat(longest_run.max(2) + 1);
-    format!("{fence}confluence-storage\n{raw}\n{fence}")
+    "`".repeat(longest_run.max(2) + 1)
 }
 
 fn collect_macro_parameters(node: Node<'_, '_>) -> BTreeMap<String, String> {

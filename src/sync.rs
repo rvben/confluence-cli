@@ -4084,6 +4084,20 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn preformatted_text_holding_a_fence_line_stays_whole() {
+        assert_round_trips("<p>text</p><pre><code>a\n```\nb\n</code></pre>");
+        assert_round_trips("<pre><code>a\n`````\nb\n~~~\n</code></pre>");
+        assert_round_trips(concat!(
+            r#"<pre><code class="language-md">"#,
+            "```rust\nfn x() {}\n```\n</code></pre>",
+        ));
+        assert_eq!(
+            apply_storage(&storage_to_markdown("<pre>a\n```\nb</pre>")).unwrap(),
+            "<pre><code>a\n```\nb\n</code></pre>"
+        );
+    }
+
+    #[test]
     fn storage_fences_keep_the_blank_lines_they_hold() {
         let storage = apply_storage(
             "```confluence-storage\n<pre>A\n\n\n```\n\n```confluence-storage\nB</pre>\n```",
