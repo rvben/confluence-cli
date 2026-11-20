@@ -449,6 +449,43 @@ pub(crate) fn render_markdown_storage(
     markdown: &str,
     allow_lossy: bool,
 ) -> Result<ConversionOutput> {
+    render_text_storage(&markdown[leading_metadata_block(markdown)..], allow_lossy)
+}
+
+/// The length of the metadata block a document opens with: lines between
+/// two of `---` or of `+++`, which say something about the document and are
+/// no text of the page.
+fn leading_metadata_block(markdown: &str) -> usize {
+    let metadata_blocks = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
+    match Parser::new_ext(markdown, metadata_blocks)
+        .into_offset_iter()
+        .next()
+    {
+        // Dashes that end the parameter lines of a macro block end no
+        // metadata.
+        Some((Event::Start(Tag::MetadataBlock(_)), range))
+            if !ends_inside_a_confluence_block(markdown, range.end) =>
+        {
+            range.end
+        }
+        _ => 0,
+    }
+}
+
+/// Whether the text before `end` stops inside a Confluence block of a
+/// Markdown document.
+fn ends_inside_a_confluence_block(markdown: &str, end: usize) -> bool {
+    confluence_blocks(markdown).is_ok_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.range.start < end && end < block.range.end)
+    })
+}
+
+/// The storage of Markdown text: a document below its metadata, the body of
+/// a macro or a cell of a layout section.
+fn render_text_storage(markdown: &str, allow_lossy: bool) -> Result<ConversionOutput> {
     let mut raw_fragments = StorageFragments::for_markdown(markdown);
     let normalized_blocks = replace_confluence_blocks(markdown, allow_lossy, &mut raw_fragments)?;
     let normalized_tasks = hold_empty_task_bodies(&normalized_blocks, &mut raw_fragments);
@@ -787,12 +824,12 @@ fn has_unescaped_confluence_markup(markdown: &str) -> bool {
     // source and read the same there are one stretch of text as written.
     let mut stretch = String::new();
     let mut stretch_range = 0..0;
-    // Code is published as written, and a metadata block not at all.
+    // Code is published as written.
     let mut code_blocks = 0usize;
     for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
         match event {
-            Event::Start(Tag::CodeBlock(_) | Tag::MetadataBlock(_)) => code_blocks += 1,
-            Event::End(TagEnd::CodeBlock | TagEnd::MetadataBlock(_)) => code_blocks -= 1,
+            Event::Start(Tag::CodeBlock(_)) => code_blocks += 1,
+            Event::End(TagEnd::CodeBlock) => code_blocks -= 1,
             Event::Text(text) if code_blocks == 0 && *text == markdown[range.clone()] => {
                 if range.start != stretch_range.end {
                     if is_markup(&stretch, stretch_range.start) {
@@ -1125,8 +1162,6 @@ pub(crate) fn markdown_options() -> Options {
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_GFM
-        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
-        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
 }
 
 /// A storage body as one XML document.
@@ -4339,13 +4374,13 @@ fn replace_confluence_blocks(
 fn colon_macro_storage(colon: ColonMacro<'_>, body: &str, allow_lossy: bool) -> Result<String> {
     match colon {
         ColonMacro::Panel(name) => {
-            let body_storage = render_markdown_storage(body, allow_lossy)?.storage;
+            let body_storage = render_text_storage(body, allow_lossy)?.storage;
             Ok(format!(
                 r#"<ac:structured-macro ac:name="{name}"><ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:structured-macro>"#
             ))
         }
         ColonMacro::Expand(title) => {
-            let body_storage = render_markdown_storage(body, allow_lossy)?.storage;
+            let body_storage = render_text_storage(body, allow_lossy)?.storage;
             let title_param = if title.is_empty() {
                 String::new()
             } else {
@@ -4584,7 +4619,7 @@ fn parse_rich_text_macro_block(
         Some(header) => parse_macro_parameter_lines(header, context)?,
         None => BTreeMap::new(),
     };
-    let body_storage = render_markdown_storage(body_markdown, allow_lossy)?.storage;
+    let body_storage = render_text_storage(body_markdown, allow_lossy)?.storage;
     Ok((parameters, body_storage))
 }
 
@@ -4619,7 +4654,7 @@ fn parse_generic_macro_block(
     let (header, body_markdown) = split_generic_macro_block(block_body);
     let parameters = parse_macro_parameter_lines(header, context)?;
     let body_storage = body_markdown
-        .map(|body_markdown| render_markdown_storage(body_markdown, allow_lossy))
+        .map(|body_markdown| render_text_storage(body_markdown, allow_lossy))
         .transpose()?
         .map(|rendered| rendered.storage);
     Ok((parameters, body_storage))
@@ -4659,7 +4694,7 @@ fn layout_section_storage(section_type: &str, body: &str, allow_lossy: bool) -> 
     let cells_xml = cells
         .into_iter()
         .map(|cell| {
-            let body_storage = render_markdown_storage(&cell, allow_lossy)?.storage;
+            let body_storage = render_text_storage(&cell, allow_lossy)?.storage;
             Ok(format!("<ac:layout-cell>{body_storage}</ac:layout-cell>"))
         })
         .collect::<Result<Vec<_>>>()?
@@ -7993,6 +8028,60 @@ SELECT ']]>' AS sentinel;
         assert_eq!(
             storage_of(":::confluence-info\n<!--\n:::\n-->\n\nhello\n:::\n"),
             "<ac:structured-macro ac:name=\"info\"><ac:rich-text-body><!--\n:::\n-->\n<p>hello</p></ac:rich-text-body></ac:structured-macro>"
+        );
+    }
+
+    #[test]
+    fn text_between_two_rules_is_text_of_the_page() {
+        // Only at the top of a document do such lines enclose metadata. In
+        // the text below it a line of dashes is a rule or underlines a
+        // heading.
+        assert_eq!(
+            storage_of("a\n\n---\nb: 1\n---\n\nc\n"),
+            "<p>a</p>\n<hr />\n<h2>b: 1</h2>\n<p>c</p>"
+        );
+        assert_eq!(
+            storage_of("a\n\n+++\nb\n+++\n\nc\n"),
+            "<p>a</p>\n<p>+++\nb\n+++</p>\n<p>c</p>"
+        );
+        assert_eq!(
+            storage_of(":::confluence-info\n---\nb\n---\n:::\n"),
+            r#"<ac:structured-macro ac:name="info"><ac:rich-text-body><hr />
+<h2>b</h2></ac:rich-text-body></ac:structured-macro>"#
+        );
+        // The line that ends the parameters of one macro and the same line
+        // in a later one enclose nothing.
+        assert_eq!(
+            storage_of(
+                ":::confluence-macro custom\nmode: s\n---\nbody\n:::\n\n:::confluence-info\nhello\n:::\n\n~~~confluence-noformat\nnopanel: true\n---\ntext\n~~~\n"
+            ),
+            concat!(
+                r#"<ac:structured-macro ac:name="custom"><ac:parameter ac:name="mode">s</ac:parameter><ac:rich-text-body><p>body</p></ac:rich-text-body></ac:structured-macro>"#,
+                "\n",
+                r#"<ac:structured-macro ac:name="info"><ac:rich-text-body><p>hello</p></ac:rich-text-body></ac:structured-macro>"#,
+                "\n",
+                r#"<ac:structured-macro ac:name="noformat"><ac:parameter ac:name="nopanel">true</ac:parameter><ac:plain-text-body><![CDATA[text]]></ac:plain-text-body></ac:structured-macro>"#,
+            )
+        );
+    }
+
+    #[test]
+    fn dashes_inside_a_macro_block_end_no_metadata_block() {
+        assert_eq!(
+            storage_of("---\n~~~confluence-code\ntitle: example\n---\ncode\n~~~\n"),
+            concat!(
+                "<hr />\n",
+                r#"<ac:structured-macro ac:name="code"><ac:parameter ac:name="title">example</ac:parameter>"#,
+                "<ac:plain-text-body><![CDATA[code]]></ac:plain-text-body></ac:structured-macro>",
+            )
+        );
+        assert_eq!(
+            storage_of("---\n:::confluence-macro sample\na: 1\n---\nbody\n:::\n"),
+            concat!(
+                "<hr />\n",
+                r#"<ac:structured-macro ac:name="sample"><ac:parameter ac:name="a">1</ac:parameter>"#,
+                "<ac:rich-text-body><p>body</p></ac:rich-text-body></ac:structured-macro>",
+            )
         );
     }
 
