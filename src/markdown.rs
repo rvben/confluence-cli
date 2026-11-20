@@ -792,9 +792,43 @@ const COMMENT_SECTION: (&str, &str) = ("<!--", "-->");
 
 /// Applies `rewrite` to the markup between CDATA sections and copies the
 /// sections themselves unchanged. A comment is not set apart here, so an
-/// element whose content holds one is still seen whole.
+/// element whose content holds one is still seen whole, but what a comment
+/// holds is text and opens no section.
 pub(crate) fn rewrite_outside_cdata(storage: &str, rewrite: impl Fn(&str) -> String) -> String {
-    rewrite_outside_sections(storage, [CDATA_SECTION, CDATA_SECTION], rewrite)
+    let find_from = |text: &str, from: usize| storage[from..].find(text).map(|at| from + at);
+    let mut rewritten = String::with_capacity(storage.len());
+    let mut copied = 0;
+    let mut cursor = 0;
+    // Each opener is searched for again only once the scan has passed it,
+    // so the text is read a bounded number of times.
+    let mut next_comment = find_from(COMMENT_SECTION.0, 0);
+    let mut next_cdata = find_from(CDATA_SECTION.0, 0);
+    loop {
+        if next_cdata.is_some_and(|open| open < cursor) {
+            next_cdata = find_from(CDATA_SECTION.0, cursor);
+        }
+        let Some(open) = next_cdata else {
+            break;
+        };
+        if next_comment.is_some_and(|comment| comment < cursor) {
+            next_comment = find_from(COMMENT_SECTION.0, cursor);
+        }
+        if let Some(comment) = next_comment.filter(|comment| *comment < open) {
+            let body = comment + COMMENT_SECTION.0.len();
+            cursor = find_from(COMMENT_SECTION.1, body)
+                .map_or(storage.len(), |close| close + COMMENT_SECTION.1.len());
+            continue;
+        }
+        rewritten.push_str(&rewrite(&storage[copied..open]));
+        let body = open + CDATA_SECTION.0.len();
+        let end = find_from(CDATA_SECTION.1, body)
+            .map_or(storage.len(), |close| close + CDATA_SECTION.1.len());
+        rewritten.push_str(&storage[open..end]);
+        copied = end;
+        cursor = end;
+    }
+    rewritten.push_str(&rewrite(&storage[copied..]));
+    rewritten
 }
 
 /// Applies `rewrite` to the markup between CDATA sections and comments, and
@@ -5129,6 +5163,18 @@ mod tests {
     }
 
     #[test]
+    fn invalid_conversion_names_the_block_left_open_around_one_that_is_closed() {
+        let markdown = "<div>\n\n<section>\n\nx\n\n</section>\n";
+        let error = markdown_to_storage(markdown, false).expect_err("a div is left open");
+        let error = error
+            .downcast::<crate::output::CliError>()
+            .expect("typed error");
+        let details = error.details.expect("details");
+        assert_eq!(details["markdown_start_line"], 1, "{}", error.message);
+        assert_eq!(details["markdown_end_line"], 1, "{}", error.message);
+    }
+
+    #[test]
     fn invalid_conversion_names_the_block_left_open_not_an_earlier_one_that_is_closed() {
         let markdown = "<div>\n\nfirst\n\n</div>\n\ntext\n\n<div>\n\nsecond\n";
         let error = markdown_to_storage(markdown, false).expect_err("a div is left open");
@@ -5170,18 +5216,6 @@ mod tests {
             "{}",
             error.message
         );
-    }
-
-    #[test]
-    fn invalid_conversion_names_the_block_left_open_around_one_that_is_closed() {
-        let markdown = "<div>\n\n<section>\n\nx\n\n</section>\n";
-        let error = markdown_to_storage(markdown, false).expect_err("a div is left open");
-        let error = error
-            .downcast::<crate::output::CliError>()
-            .expect("typed error");
-        let details = error.details.expect("details");
-        assert_eq!(details["markdown_start_line"], 1, "{}", error.message);
-        assert_eq!(details["markdown_end_line"], 1, "{}", error.message);
     }
 
     #[test]

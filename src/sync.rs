@@ -5095,6 +5095,15 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn placeholder_link_after_a_comment_that_names_a_section_is_still_a_link() {
+        let storage = resolve_placeholder_links(
+            r#"<!-- <![CDATA[ example --><p><a href="confluence-user://user?userkey=abc">x</a></p><ac:plain-text-body><![CDATA[<a href="confluence-user://user?userkey=abc">x</a>]]></ac:plain-text-body>"#,
+        );
+        assert_eq!(storage.matches("<ac:link>").count(), 1, "{storage}");
+        assert_eq!(storage.matches("<a href=").count(), 1, "{storage}");
+    }
+
+    #[test]
     fn task_keeps_a_space_that_does_not_break_at_its_edges() {
         assert_keeps(
             "<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>&nbsp;a&nbsp;</ac:task-body></ac:task></ac:task-list>",
