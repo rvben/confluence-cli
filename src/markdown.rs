@@ -422,7 +422,8 @@ pub(crate) fn render_markdown_storage(
 ) -> Result<ConversionOutput> {
     let mut raw_fragments = StorageFragments::for_markdown(markdown);
     let normalized_blocks = replace_confluence_blocks(markdown, allow_lossy, &mut raw_fragments)?;
-    let normalized = replace_inline_storage_fences(&normalized_blocks, &mut raw_fragments);
+    let normalized_tasks = hold_empty_task_bodies(&normalized_blocks, &mut raw_fragments);
+    let normalized = replace_inline_storage_fences(&normalized_tasks, &mut raw_fragments);
 
     let escapes_confluence_markup = has_unescaped_confluence_markup(&normalized);
     let events = parse_with_storage_fences(&normalized, &mut raw_fragments);
@@ -520,6 +521,41 @@ impl StorageFragments {
         let fragment = self.fragments.get(index.parse::<usize>().ok()?)?;
         Some((fragment, text.strip_prefix("_END")?))
     }
+}
+
+/// Gives a task without a body the placeholder of an empty one. Markdown
+/// reads a list item that is a checkbox and nothing else as an item with
+/// the text of the checkbox, not as a task.
+///
+/// The parser says what a list item is, so a line of code or of raw markup
+/// that reads as one stays as written.
+fn hold_empty_task_bodies(markdown: &str, fragments: &mut StorageFragments) -> String {
+    let mut output = String::with_capacity(markdown.len());
+    if !markdown.contains('[') {
+        output.push_str(markdown);
+        return output;
+    }
+    let mut rest = 0;
+    for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
+        if !matches!(event, Event::Start(Tag::Item)) {
+            continue;
+        }
+        let line = markdown[range.start..].lines().next().unwrap_or_default();
+        let task = line.trim_end();
+        let is_empty_task = task
+            .trim_start()
+            .strip_prefix(['-', '*', '+'])
+            .is_some_and(|checkbox| matches!(checkbox, " [ ]" | " [x]" | " [X]"));
+        if is_empty_task {
+            let end = range.start + task.len();
+            output.push_str(&markdown[rest..end]);
+            output.push(' ');
+            output.push_str(&fragments.hold(String::new()));
+            rest = end;
+        }
+    }
+    output.push_str(&markdown[rest..]);
+    output
 }
 
 /// Parses Markdown and swaps every `confluence-storage` code block for a
@@ -1613,7 +1649,11 @@ fn render_task_list(node: Node<'_, '_>, source: &str) -> Option<String> {
         let body = namespaced_child(task, AC_NS, "task-body")?;
         let text = render_inline_children(body, source)?;
         let marker = if status == "complete" { "[x]" } else { "[ ]" };
-        lines.push(format!("{bullet} {marker} {}", text.trim()));
+        lines.push(
+            format!("{bullet} {marker} {}", text.trim())
+                .trim_end()
+                .to_string(),
+        );
     }
     Some(lines.join("\n"))
 }
@@ -7604,6 +7644,23 @@ SELECT ']]>' AS sentinel;
                 )),
                 format!("<{element}>\n{info}\n</{element}>")
             );
+        }
+    }
+
+    #[test]
+    fn line_of_code_or_markup_that_reads_as_an_empty_task_stays_as_written() {
+        for (markdown, storage) in [
+            (
+                "a\n\n    - [ ]\n",
+                "<p>a</p>\n<pre><code>- [ ]\n</code></pre>",
+            ),
+            ("<pre>\n- [ ]\n</pre>\n", "<pre>\n- [ ]\n</pre>"),
+            (
+                "- ```confluence-storage\n  <pre>\n  - [ ]\n  </pre>\n  ```\n",
+                "<ul>\n<li><pre>\n- [ ]\n</pre>\n</li>\n</ul>",
+            ),
+        ] {
+            assert_eq!(storage_of(markdown), storage, "{markdown:?}");
         }
     }
 

@@ -5329,6 +5329,47 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn task_without_a_body_stays_a_task() {
+        let task = |status: &str, body: &str| {
+            format!(
+                "<ac:task><ac:task-status>{status}</ac:task-status><ac:task-body>{body}</ac:task-body></ac:task>"
+            )
+        };
+        for tasks in [
+            task("incomplete", ""),
+            task("complete", ""),
+            format!(
+                "{}{}{}",
+                task("incomplete", "first"),
+                task("complete", ""),
+                task("incomplete", "last")
+            ),
+        ] {
+            assert_keeps(&format!("<ac:task-list>{tasks}</ac:task-list>"));
+            assert_keeps(&format!("<ac:task-list>{tasks}</ac:task-list><p>after</p>"));
+        }
+        // The line of a task without a body ends at its checkbox, so that an
+        // editor that strips trailing white space leaves it as it is.
+        assert_eq!(
+            storage_to_markdown(&format!(
+                "<ac:task-list>{}</ac:task-list><p>after</p>",
+                task("incomplete", "")
+            )),
+            "- [ ]\n\nafter"
+        );
+        assert_eq!(
+            storage_to_markdown(&format!(
+                "<ac:task-list>{}</ac:task-list>",
+                task("incomplete", "")
+            )),
+            "- [ ]"
+        );
+        // A list item that shows a checkbox as text is not a task.
+        assert_keeps("<ul><li>[ ]</li><li>[x]</li></ul>");
+        assert_keeps("<pre><code>- [ ]\n</code></pre>");
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");
