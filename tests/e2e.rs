@@ -575,7 +575,7 @@ async fn pull_marks_a_page_that_markdown_does_not_carry_until_an_update_rewrites
     let simulator = ConfluenceSimulator::start().await;
     let config_home = TempDir::new().expect("simulator config home");
     let cfg = simulated_cloud_config(&simulator, &config_home);
-    let wrapped_storage = "<div><p>Wrapped text</p></div>";
+    let wrapped_storage = "<p><span>Wrapped text</span></p>";
     let page_id = simulator.add_page("Wrapped", Some("100"), wrapped_storage);
 
     tokio::task::spawn_blocking(move || {

@@ -5539,6 +5539,22 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn block_that_wraps_other_blocks_is_kept() {
+        for storage in [
+            "<div><p>a</p></div><p>b</p>",
+            "<div>a</div><div>b</div>",
+            "<div><ul><li>a</li></ul></div><div><ul><li>b</li></ul></div>",
+            r#"<div class="x"><p>a</p></div>"#,
+            "<section><h2>a</h2><p>b</p></section>",
+            "<article><p>a</p></article><main><p>b</p></main>",
+            "<div><div><p>a</p></div></div>",
+            "<div></div><p>a</p>",
+        ] {
+            assert_keeps(storage);
+        }
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");
@@ -6875,7 +6891,6 @@ mod round_trip_tests {
             );
         }
         for different in [
-            "<div><p>a</p></div>",
             "<p><span>a</span> b</p>",
             r#"<p><img src="https://example.com/a.png" /></p>"#,
         ] {
@@ -6891,7 +6906,8 @@ mod round_trip_tests {
     fn sidecar_of_a_page_that_converts_exactly_does_not_mention_it() {
         let sidecar = serde_json::to_value(pulled_sidecar("<p>a</p>")).expect("sidecar");
         assert!(sidecar.get("storage_differs_from_remote").is_none());
-        let sidecar = serde_json::to_value(pulled_sidecar("<div><p>a</p></div>")).expect("sidecar");
+        let sidecar =
+            serde_json::to_value(pulled_sidecar("<p><span>a</span> b</p>")).expect("sidecar");
         assert_eq!(sidecar["storage_differs_from_remote"], true);
     }
 

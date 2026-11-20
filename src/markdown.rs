@@ -1208,7 +1208,8 @@ fn render_block_element(node: Node<'_, '_>, source: &str) -> Option<String> {
         "ol" => render_list(node, source, 0, true),
         "table" => render_table(node, source),
         "hr" => Some("---".to_string()),
-        "div" | "section" | "article" | "main" => render_container_blocks(node, source),
+        // Markdown has no block that only wraps other blocks.
+        "div" | "section" | "article" | "main" => None,
         "img" => render_inline_node(node, source).map(|value| value.trim().to_string()),
         _ => {
             if has_block_children(node) {
