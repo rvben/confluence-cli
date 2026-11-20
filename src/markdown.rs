@@ -1188,7 +1188,7 @@ fn render_top_level_block(node: Node<'_, '_>, source: &str) -> Option<String> {
             render_block_element(node, source)
                 .unwrap_or_else(|| fallback_block_markdown(node, source)),
         ),
-        NodeType::Comment => Some(fallback_block_markdown(node, source)),
+        NodeType::Comment | NodeType::PI => Some(fallback_block_markdown(node, source)),
         _ => None,
     }
 }

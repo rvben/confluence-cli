@@ -5763,6 +5763,12 @@ mod round_trip_tests {
         assert_keeps("<p>a<?x y?>b</p>");
         assert_keeps("<ul><li>a<?x y?></li></ul>");
         assert!(storage_to_markdown("<p>a<?x y?>b</p>").contains("<?x y?>"));
+        let markdown = storage_to_markdown("<p>a</p><?x y?><p>b</p>");
+        assert_eq!(markdown, "a\n\n<?x y?>\n\nb");
+        assert_eq!(
+            apply_storage(&markdown).expect("apply"),
+            "<p>a</p>\n<?x y?>\n<p>b</p>"
+        );
     }
 
     #[test]
