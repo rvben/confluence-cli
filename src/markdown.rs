@@ -1707,11 +1707,44 @@ fn parameters_fit_lines(node: Node<'_, '_>) -> bool {
         })
 }
 
+/// Whether a macro element has an attribute besides its name and the ids
+/// that Confluence assigns. A macro block has no place for one.
+fn has_other_macro_attributes(node: Node<'_, '_>) -> bool {
+    node.attributes().any(|attribute| {
+        !matches!(
+            (attribute.namespace(), attribute.name()),
+            (
+                Some(AC_NS),
+                "name" | "schema-version" | "macro-id" | "local-id"
+            ) | (None, "local-id")
+        )
+    })
+}
+
+fn has_nameless_parameter(node: Node<'_, '_>) -> bool {
+    node.children().any(|child| {
+        child.is_element()
+            && child.tag_name().namespace() == Some(AC_NS)
+            && child.tag_name().name() == "parameter"
+            && child.attribute((AC_NS, "name")).is_none_or(str::is_empty)
+    })
+}
+
 fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
-    let name = node.attribute((AC_NS, "name"))?;
-    if !parameters_fit_lines(node) {
+    if !parameters_fit_lines(node) || has_other_macro_attributes(node) {
         return Some(confluence_raw_block(raw_xml_fragment(node, source)));
     }
+    let block = render_macro_block_by_name(node, source)?;
+    // Only some macro blocks have a line for a parameter without a name,
+    // so such a macro is written as a block when the block can be read.
+    if has_nameless_parameter(node) && render_markdown_storage(&block, false).is_err() {
+        return Some(confluence_raw_block(raw_xml_fragment(node, source)));
+    }
+    Some(block)
+}
+
+fn render_macro_block_by_name(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let name = node.attribute((AC_NS, "name"))?;
     if name == "anchor" {
         return render_default_parameter_macro_block("anchor", "name", node);
     }
@@ -2043,10 +2076,11 @@ fn render_expand_macro_block(node: Node<'_, '_>, source: &str) -> Option<String>
     if parameters.keys().any(|name| name != "title") {
         return Some(confluence_raw_block(raw_xml_fragment(node, source)));
     }
-    let title = parameters
-        .get("title")
-        .map(|value| value.trim())
-        .unwrap_or("");
+    // The opening line has no place for a title that is set to nothing.
+    if parameters.get("title").is_some_and(String::is_empty) {
+        return Some(confluence_raw_block(raw_xml_fragment(node, source)));
+    }
+    let title = parameters.get("title").map_or("", String::as_str);
     let body = namespaced_child(node, AC_NS, "rich-text-body")?;
     let body_markdown = storage_to_markdown(&inner_xml_fragment(body, source));
     let header = if title.is_empty() {
@@ -2362,9 +2396,11 @@ fn render_code_macro_block(node: Node<'_, '_>) -> Option<String> {
     let code_body = namespaced_child(node, AC_NS, "plain-text-body")?;
     let code = code_body.text().unwrap_or_default();
     let mut parameters = collect_macro_parameters(node);
-    let language = parameters
-        .remove("language")
-        .filter(|value| !value.is_empty());
+    let language = parameters.remove("language");
+    // The opening line has no place for a language that is set to nothing.
+    if language.as_deref() == Some("") {
+        return None;
+    }
 
     let fence = tilde_fence(code, 3);
     let mut markdown = match language {

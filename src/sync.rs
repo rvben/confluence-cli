@@ -5485,6 +5485,60 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn macro_keeps_what_its_block_has_no_place_for() {
+        let code = "<ac:plain-text-body><![CDATA[x]]></ac:plain-text-body>";
+        let body = "<ac:rich-text-body><p>b</p></ac:rich-text-body>";
+        let nameless = r#"<ac:parameter ac:name="">x</ac:parameter>"#;
+        for (attributes, name, inner) in [
+            (
+                "",
+                "code",
+                format!(r#"<ac:parameter ac:name="language"></ac:parameter>{code}"#),
+            ),
+            ("", "code", format!("{nameless}{code}")),
+            ("", "noformat", format!("{nameless}{code}")),
+            (
+                "",
+                "expand",
+                format!(r#"<ac:parameter ac:name="title"></ac:parameter>{body}"#),
+            ),
+            ("", "toc", nameless.to_string()),
+            ("", "children", nameless.to_string()),
+            ("", "attachments", nameless.to_string()),
+            ("", "excerpt", format!("{nameless}{body}")),
+            ("", "anchor", nameless.to_string()),
+            ("", "jira", nameless.to_string()),
+            (r#" ac:breakout-mode="wide""#, "code", code.to_string()),
+            (r#" data-layout="wide""#, "info", body.to_string()),
+            (
+                r#" ac:schema-version="1" ac:macro-id="7f""#,
+                "info",
+                body.to_string(),
+            ),
+        ] {
+            assert_keeps(&format!(
+                r#"<ac:structured-macro ac:name="{name}"{attributes}>{inner}</ac:structured-macro><p>after</p>"#
+            ));
+        }
+        // A block that reads back as the macro is still written.
+        for (name, inner, block) in [
+            ("anchor", nameless, ":::confluence-anchor\nname: x\n:::"),
+            (
+                "jira",
+                r#"<ac:parameter ac:name="jql"></ac:parameter>"#,
+                ":::confluence-macro jira\njql: \n:::",
+            ),
+        ] {
+            assert_eq!(
+                storage_to_markdown(&format!(
+                    r#"<ac:structured-macro ac:name="{name}" ac:macro-id="7f">{inner}</ac:structured-macro>"#
+                )),
+                block
+            );
+        }
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");
