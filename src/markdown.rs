@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -449,6 +450,7 @@ pub(crate) fn render_markdown_storage(
     markdown: &str,
     allow_lossy: bool,
 ) -> Result<ConversionOutput> {
+    let markdown = &*unix_line_endings(markdown);
     render_text_storage(&markdown[leading_metadata_block(markdown)..], allow_lossy)
 }
 
@@ -5478,7 +5480,19 @@ fn convert_checkbox_lists_to_task_lists(html: &str) -> String {
         .to_string()
 }
 
+/// Text with every line ending in a line feed alone. A file written with
+/// carriage returns says the same thing, and everything that reads
+/// Markdown by its lines reads it in this form.
+pub(crate) fn unix_line_endings(text: &str) -> Cow<'_, str> {
+    if text.contains("\r\n") {
+        Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 pub fn split_frontmatter(content: &str) -> Result<(Frontmatter, String)> {
+    let content = unix_line_endings(content);
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---\n") {
         bail!("missing YAML frontmatter");
@@ -8029,6 +8043,30 @@ SELECT ']]>' AS sentinel;
             storage_of(":::confluence-info\n<!--\n:::\n-->\n\nhello\n:::\n"),
             "<ac:structured-macro ac:name=\"info\"><ac:rich-text-body><!--\n:::\n-->\n<p>hello</p></ac:rich-text-body></ac:structured-macro>"
         );
+    }
+
+    #[test]
+    fn line_endings_of_a_file_do_not_change_what_it_says() {
+        for markdown in [
+            ":::confluence-excerpt\nname: foo\n---\nbody\n:::\n",
+            ":::confluence-macro custom\nmode: s\n---\nbody\n:::\n",
+            "~~~confluence-code\ntitle: T\n---\nlet x;\nlet y;\n~~~\n",
+            "~~~confluence-noformat\nnopanel: true\n---\nline 1\nline 2\n~~~\n",
+            "~~~~confluence-layout-section single\n--- cell ---\nx\n~~~~\n",
+            "- [ ]\n- [x] done\n",
+            "```confluence-storage\n<p>a</p>\n<p>b</p>\n```\n",
+        ] {
+            assert_eq!(
+                storage_of(&markdown.replace('\n', "\r\n")),
+                storage_of(markdown),
+                "{markdown:?}"
+            );
+        }
+        let (frontmatter, body) =
+            split_frontmatter("---\r\ntitle: T\r\ntype: page\r\n---\r\n\r\nbody\r\nmore\r\n")
+                .expect("frontmatter");
+        assert_eq!(frontmatter.title, "T");
+        assert_eq!(body, "body\nmore\n");
     }
 
     #[test]

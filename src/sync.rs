@@ -1784,8 +1784,10 @@ fn unvalidated_storage_of_body(
 }
 
 /// The number of lines of `file` that precede the first line of `body`, when
-/// the file ends with that body.
+/// the file ends with that body. The body is read with a line feed alone at
+/// the end of each line, whichever way the file ends its lines.
 fn lines_before_body(file: &str, body: &str) -> Option<usize> {
+    let file = crate::markdown::unix_line_endings(file);
     let before = file.trim_end().strip_suffix(body.trim())?;
     let leading = &body[..body.len() - body.trim_start().len()];
     before
@@ -6280,6 +6282,16 @@ mod round_trip_tests {
             "~~~~confluence-layout-section single\n--- cell ---\n:::confluence-children\npage: TARGET\n:::\n~~~~\n",
         ] {
             assert_eq!(rewrite(text), text.replace("TARGET", local));
+        }
+    }
+
+    #[test]
+    fn body_of_a_file_starts_on_the_same_line_whatever_its_line_endings() {
+        let file = "---\ntitle: T\ntype: page\n---\n\nbody\nmore\n";
+        for file in [file.to_string(), file.replace('\n', "\r\n")] {
+            let (_, body) = crate::markdown::split_frontmatter(&file).expect("front matter");
+
+            assert_eq!(lines_before_body(&file, &body), Some(5), "{file:?}");
         }
     }
 
