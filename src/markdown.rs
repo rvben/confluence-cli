@@ -5513,18 +5513,23 @@ pub(crate) fn unix_line_endings(text: &str) -> Cow<'_, str> {
 
 pub fn split_frontmatter(content: &str) -> Result<(Frontmatter, String)> {
     let content = unix_line_endings(content);
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---\n") {
+    let Some(opened) = content.trim_start().strip_prefix("---\n") else {
         bail!("missing YAML frontmatter");
-    }
-    let mut parts = trimmed.splitn(3, "---\n");
-    let _ = parts.next();
-    let fm = parts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("missing frontmatter body"))?;
-    let body = parts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("missing markdown body"))?;
+    };
+    // The front matter ends at a line of three dashes. Dashes that end a
+    // line of it are part of a value.
+    let mut closing = 0;
+    let (fm, body) = loop {
+        let line = opened[closing..].split_inclusive('\n').next();
+        let Some(line) = line else {
+            bail!("missing markdown body");
+        };
+        let after = closing + line.len();
+        if line.strip_suffix('\n').unwrap_or(line) == "---" {
+            break (&opened[..closing], &opened[after..]);
+        }
+        closing = after;
+    };
     let frontmatter: Frontmatter = serde_yaml::from_str(fm)?;
     Ok((frontmatter, body.trim_start().to_string()))
 }
@@ -8182,6 +8187,25 @@ SELECT ']]>' AS sentinel;
 
             assert_eq!(storage_of(&markdown), storage, "pulled as {markdown:?}");
         }
+    }
+
+    #[test]
+    fn front_matter_ends_at_a_line_of_dashes_not_at_dashes_in_a_line() {
+        let doc = Frontmatter {
+            title: "Before and after ---".to_string(),
+            kind: "page".to_string(),
+            labels: vec!["a---".to_string()],
+            status: "current".to_string(),
+            parent: None,
+            properties: BTreeMap::new(),
+        };
+        let rendered = render_document(&doc, "First\n\n---\n\nLast").expect("rendered");
+
+        let (parsed, body) = split_frontmatter(&rendered).expect("parsed");
+
+        assert_eq!(parsed.title, "Before and after ---");
+        assert_eq!(parsed.labels, ["a---"]);
+        assert_eq!(body, "First\n\n---\n\nLast");
     }
 
     fn storage_of(markdown: &str) -> String {
