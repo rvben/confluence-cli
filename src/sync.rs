@@ -13,12 +13,12 @@ use walkdir::WalkDir;
 
 use crate::markdown::{
     Frontmatter, LocalDocument, PULL_FAILURES_DIR, PULL_FAILURES_MANIFEST, PageLinkPlaceholder,
-    Sidecar, UserMentionPlaceholder, build_page_placeholder_url, build_storage_link_body,
-    decode_character_references, document_dir_name, encode_target_segment, has_generated_label,
-    is_local_target, link_body_unless_default, link_display_attributes, load_document,
-    parse_page_placeholder_url, parse_status_placeholder_url, parse_user_placeholder_url,
-    rewrite_outside_cdata, rewrite_outside_literal_sections, save_document, scan_local_documents,
-    sha256_hex, split_target_fragment, storage_to_markdown,
+    ParameterMacro, Sidecar, UserMentionPlaceholder, build_page_placeholder_url,
+    build_storage_link_body, decode_character_references, document_dir_name, encode_target_segment,
+    has_generated_label, is_local_target, link_body_unless_default, link_display_attributes,
+    load_document, parse_page_placeholder_url, parse_status_placeholder_url,
+    parse_user_placeholder_url, rewrite_outside_cdata, rewrite_outside_literal_sections,
+    save_document, scan_local_documents, sha256_hex, split_target_fragment, storage_to_markdown,
 };
 use crate::model::{
     AttachmentState, ContentItem, ContentKind, PlanActionKind, PlanItem, SyncPlan, UserReference,
@@ -1822,7 +1822,9 @@ fn rewrite_macro_parameter_lines(
                 .find('\n')
                 .map_or(block.range.len(), |newline| newline + 1);
         rewritten.push_str(&markdown[rest..opening_end]);
-        let mode = MacroPageReferenceMode::of_block(&markdown[block.range.start..opening_end]);
+        let mode = block
+            .parameters_of
+            .and_then(MacroPageReferenceMode::of_block);
         let own_lines = |rewritten: &mut String, lines: &str| {
             let Some(mode) = mode else {
                 rewritten.push_str(lines);
@@ -1866,21 +1868,19 @@ enum MacroPageReferenceMode {
 }
 
 impl MacroPageReferenceMode {
-    /// The mode of the macro block that a line opens, for a macro whose
-    /// parameters can name a page.
-    fn of_block(line: &str) -> Option<Self> {
-        match line.trim() {
-            line if line.starts_with(":::confluence-macro ") => Some(Self::Generic),
-            ":::confluence-children" => Some(Self::Children),
-            ":::confluence-excerpt-include" => Some(Self::ExcerptInclude),
-            ":::confluence-include-page" => Some(Self::IncludePage),
-            ":::confluence-page-tree" => Some(Self::PageTree),
-            ":::confluence-page-tree-search" => Some(Self::PageTreeSearch),
-            ":::confluence-view-file"
-            | ":::confluence-view-doc"
-            | ":::confluence-view-xls"
-            | ":::confluence-view-ppt" => Some(Self::AttachmentPreview),
-            _ => None,
+    /// The mode of the block of a macro whose parameters can name a page.
+    fn of_block(block: ParameterMacro) -> Option<Self> {
+        match block {
+            ParameterMacro::Generic => Some(Self::Generic),
+            ParameterMacro::BuiltIn("children") => Some(Self::Children),
+            ParameterMacro::BuiltIn("excerpt-include") => Some(Self::ExcerptInclude),
+            ParameterMacro::BuiltIn("include-page") => Some(Self::IncludePage),
+            ParameterMacro::BuiltIn("page-tree") => Some(Self::PageTree),
+            ParameterMacro::BuiltIn("page-tree-search") => Some(Self::PageTreeSearch),
+            ParameterMacro::BuiltIn("view-file" | "view-doc" | "view-xls" | "view-ppt") => {
+                Some(Self::AttachmentPreview)
+            }
+            ParameterMacro::BuiltIn(_) => None,
         }
     }
 
@@ -4292,6 +4292,50 @@ mod tests {
         assert!(storage.contains(
             r#"<ac:parameter ac:name="related"><ac:link><ri:page ri:content-title="Sibling" ri:space-key="MFS" /></ac:link></ac:parameter>"#
         ));
+    }
+
+    #[test]
+    fn render_body_storage_rewrites_page_parameters_of_a_macro_named_after_a_tab() {
+        let current_dir = PathBuf::from("/tmp/root/current-page--123");
+        let sibling_dir = PathBuf::from("/tmp/root/sibling-page--456");
+        let document =
+            |directory: &Path, title: &str, content_id: &str, body: &str| LocalDocument {
+                directory: directory.to_path_buf(),
+                markdown_path: directory.join("index.md"),
+                sidecar_path: directory.join(".confluence.json"),
+                frontmatter: Frontmatter {
+                    title: title.to_string(),
+                    kind: "page".to_string(),
+                    labels: vec![],
+                    status: "current".to_string(),
+                    parent: None,
+                    properties: BTreeMap::new(),
+                },
+                body_markdown: body.to_string(),
+                sidecar: Sidecar {
+                    content_id: Some(content_id.to_string()),
+                    space_key: Some("MFS".to_string()),
+                    provider: Some(ProviderKind::Cloud),
+                    web_path_prefix: Some("/wiki".to_string()),
+                    ..Sidecar::default()
+                },
+            };
+        let current = document(
+            &current_dir,
+            "Current",
+            "123",
+            ":::confluence-macro\tuserlister\nsource: !page ../sibling-page--456/index.md\n:::\n",
+        );
+        let sibling = document(&sibling_dir, "Sibling", "456", "# Sibling");
+
+        let index = build_link_index(&[current.clone(), sibling]);
+        let storage =
+            render_body_storage(&current, &index, false, "/wiki").expect("render body storage");
+
+        assert_eq!(
+            storage,
+            r#"<ac:structured-macro ac:name="userlister"><ac:parameter ac:name="source"><ri:page ri:content-title="Sibling" ri:space-key="MFS" /></ac:parameter></ac:structured-macro>"#
+        );
     }
 
     #[test]

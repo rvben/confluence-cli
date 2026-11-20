@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::ops::Range;
@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd, html};
+use pulldown_cmark::{CodeBlockKind, Event, MetadataBlockKind, Options, Parser, Tag, TagEnd, html};
 use regex::Regex;
 use roxmltree::{Document, Node, NodeType};
 use serde::{Deserialize, Serialize};
@@ -460,45 +460,56 @@ pub(crate) fn render_markdown_storage(
 fn leading_metadata_block(markdown: &str) -> usize {
     let metadata_blocks = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
         | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
-    match Parser::new_ext(markdown, metadata_blocks)
-        .into_offset_iter()
-        .next()
-    {
-        // Dashes that end the parameter lines of a macro block end no
-        // metadata.
-        Some((Event::Start(Tag::MetadataBlock(_)), range))
-            if !ends_inside_a_confluence_block(markdown, range.end) =>
-        {
-            range.end
-        }
-        _ => 0,
-    }
-}
-
-/// Whether the text before `end` stops inside a Confluence block of a
-/// Markdown document.
-fn ends_inside_a_confluence_block(markdown: &str, end: usize) -> bool {
-    confluence_blocks(markdown).is_ok_and(|blocks| {
+    let Some((Event::Start(Tag::MetadataBlock(kind)), range)) =
+        Parser::new_ext(markdown, metadata_blocks)
+            .into_offset_iter()
+            .next()
+    else {
+        return 0;
+    };
+    let end = range.end;
+    let reading = Reading::of(markdown);
+    // Dashes that end the parameter lines of a macro block end no metadata.
+    let ends_inside_a_block = reading.blocks().is_ok_and(|blocks| {
         blocks
             .iter()
             .any(|block| block.range.start < end && end < block.range.end)
-    })
+    });
+    // Nor do dashes that storage in a paragraph holds, unless the lines
+    // above them are the names and values of metadata: a value can end in
+    // what reads as the opening of a fence.
+    let ends_inside_storage = reading
+        .fences
+        .iter()
+        .any(|fence| fence.range.start < end && end < fence.range.end);
+    let names_values = || {
+        let lines = markdown[..end].trim_end_matches('\n');
+        let lines = lines.split_once('\n').map_or("", |(_, lines)| lines);
+        let lines = lines.rsplit_once('\n').map_or("", |(lines, _)| lines);
+        kind == MetadataBlockKind::YamlStyle
+            && serde_yaml::from_str::<serde_yaml::Mapping>(lines).is_ok()
+    };
+    if ends_inside_a_block || (ends_inside_storage && !names_values()) {
+        0
+    } else {
+        end
+    }
 }
 
 /// The storage of Markdown text: a document below its metadata, the body of
 /// a macro or a cell of a layout section.
 fn render_text_storage(markdown: &str, allow_lossy: bool) -> Result<ConversionOutput> {
     let mut raw_fragments = StorageFragments::for_markdown(markdown);
-    let normalized_blocks = replace_confluence_blocks(markdown, allow_lossy, &mut raw_fragments)?;
-    let normalized_tasks = hold_empty_task_bodies(&normalized_blocks, &mut raw_fragments);
-    let normalized = replace_inline_storage_fences(&normalized_tasks, &mut raw_fragments);
-
-    let escapes_confluence_markup = has_unescaped_confluence_markup(&normalized);
-    let events = parse_with_storage_fences(&normalized, &mut raw_fragments);
+    let normalized = hold_confluence_blocks(markdown, allow_lossy, &mut raw_fragments)?;
     let task_body = TaskBody {
         start: raw_fragments.hold("<ac:task-body>".to_string()),
         end: raw_fragments.hold("</ac:task-body>".to_string()),
+        no_text: raw_fragments.hold(String::new()),
     };
+    let normalized = task_body.with_checkboxes_alone_held(&normalized);
+
+    let escapes_confluence_markup = has_unescaped_confluence_markup(&normalized);
+    let events = parse_with_storage_fences(&normalized, &mut raw_fragments);
     let mut html_output = String::new();
     html::push_html(
         &mut html_output,
@@ -598,43 +609,6 @@ impl StorageFragments {
     }
 }
 
-/// Whether a line is a list item that is a checkbox and nothing else.
-fn is_empty_task_line(line: &str) -> bool {
-    line.trim()
-        .strip_prefix(['-', '*', '+'])
-        .is_some_and(|checkbox| matches!(checkbox, " [ ]" | " [x]" | " [X]"))
-}
-
-/// Gives a task without a body the placeholder of an empty one. Markdown
-/// reads a list item that is a checkbox and nothing else as an item with
-/// the text of the checkbox, not as a task.
-///
-/// The parser says what a list item is, so a line of code or of raw markup
-/// that reads as one stays as written.
-fn hold_empty_task_bodies(markdown: &str, fragments: &mut StorageFragments) -> String {
-    let mut output = String::with_capacity(markdown.len());
-    if !markdown.contains('[') {
-        output.push_str(markdown);
-        return output;
-    }
-    let mut rest = 0;
-    for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
-        if !matches!(event, Event::Start(Tag::Item)) {
-            continue;
-        }
-        let line = markdown[range.start..].lines().next().unwrap_or_default();
-        if is_empty_task_line(line) {
-            let end = range.start + line.trim_end().len();
-            output.push_str(&markdown[rest..end]);
-            output.push(' ');
-            output.push_str(&fragments.hold(String::new()));
-            rest = end;
-        }
-    }
-    output.push_str(&markdown[rest..]);
-    output
-}
-
 /// Parses Markdown and swaps every `confluence-storage` code block for a
 /// placeholder, adding the storage it holds to `fragments`. A numbered
 /// list holds no tasks, so the checkbox of one of its items is the text of
@@ -698,6 +672,19 @@ fn parse_with_storage_fences<'a>(
     events
 }
 
+/// Whether the first line of a list item, from its marker on, is a checkbox
+/// and nothing else. More than four spaces after the marker make the
+/// checkbox code.
+fn is_checkbox_alone(line: &str) -> bool {
+    line.trim_end_matches([' ', '\t'])
+        .strip_prefix(['-', '*', '+'])
+        .is_some_and(|rest| {
+            let checkbox = rest.trim_start_matches(' ');
+            (1..=4).contains(&(rest.len() - checkbox.len()))
+                && matches!(checkbox, "[ ]" | "[x]" | "[X]")
+        })
+}
+
 /// Whether a fenced code block ends with a closing fence, given its source
 /// and the content the parser read from it. A block that runs to the end of
 /// its container without one is left as code.
@@ -710,8 +697,7 @@ fn has_closing_fence(source: &str, content: &str) -> bool {
     source_lines == content_lines + 2
 }
 
-/// Replaces `confluence-storage` fences that are not code blocks with a
-/// placeholder, adding the storage they hold to `fragments`.
+/// A `confluence-storage` fence that is no code block.
 ///
 /// The fallback for malformed storage writes fragments in the middle of a
 /// paragraph, so that other text shares a line with the opening fence, the
@@ -719,96 +705,260 @@ fn has_closing_fence(source: &str, content: &str) -> bool {
 /// fence is matched as text: it closes at the first line that starts with as
 /// many backticks as opened it. Fences the parser reads as closed code blocks
 /// are left to it, along with everything else inside a code block.
-fn replace_inline_storage_fences(markdown: &str, fragments: &mut StorageFragments) -> String {
-    static OPENING: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(`{3,})confluence-storage[\s&&[^\n]]*\n").expect("valid regex")
-    });
+#[derive(Debug)]
+struct InlineStorageFence {
+    /// From the backticks that open the fence to the ones that close it.
+    range: Range<usize>,
+    /// The storage between them: the lines after the opening line and any
+    /// blank lines.
+    storage: Range<usize>,
+}
 
-    if !OPENING.is_match(markdown) {
-        return markdown.to_string();
-    }
-    let code_blocks: Vec<Range<usize>> = Parser::new_ext(markdown, markdown_options())
-        .into_offset_iter()
-        .filter_map(|(event, range)| {
-            matches!(event, Event::Start(Tag::CodeBlock(_))).then_some(range)
-        })
-        .collect();
-
-    let mut out = String::with_capacity(markdown.len());
-    let mut cursor = 0;
-    let mut search_from = 0;
-    // The shortest fence found to have no closing line. No longer fence that
-    // opens later has one either.
-    let mut unclosed = usize::MAX;
-    // Taking a fence out of the text changes where the code blocks after it
-    // are, so from the first one on the fences are matched as text alone.
-    let mut by_text_alone = false;
-    while let Some(captures) = OPENING.captures_at(markdown, search_from) {
-        let opening = captures.get(0).expect("whole match");
-        let ticks = &captures[1];
-        let closing = format!("\n{ticks}");
-        let body_start = opening.end() - 1;
-        search_from = opening.end();
-
-        // Code blocks come in source order and do not overlap.
-        let after = code_blocks.partition_point(|block| block.end <= opening.start());
-        let block = code_blocks
-            .get(after)
-            .filter(|block| !by_text_alone && block.start <= opening.start());
-        let at = match block {
-            Some(block) if !is_container_prefix(&markdown[block.start..opening.start()]) => {
-                // The fence is text inside another code block.
-                search_from = block.end.max(opening.end());
-                continue;
-            }
-            Some(block) => {
-                // The fence opens a code block of its own. It is a fragment
-                // in a paragraph when other text stands on the line before or
-                // after it, or when something other than spaces follows the
-                // backticks that close it, which the parser reads as one
-                // more line of code.
-                let end = block.end.max(body_start);
-                let joins_other_text = !stands_apart(markdown, block);
-                let fragment_end = markdown[body_start..end].find(&closing).filter(|at| {
-                    let after_ticks = &markdown[body_start + at + closing.len()..];
-                    let rest_of_line = after_ticks.lines().next().unwrap_or_default();
-                    joins_other_text
-                        || !rest_of_line
-                            .trim_start_matches('`')
-                            .trim_matches(' ')
-                            .is_empty()
-                });
-                let Some(at) = fragment_end else {
-                    search_from = end.max(opening.end());
-                    continue;
-                };
-                at
-            }
-            None if ticks.len() >= unclosed => continue,
-            None => {
-                let Some(at) = markdown[body_start..].find(&closing) else {
-                    unclosed = ticks.len();
-                    continue;
-                };
-                at
-            }
-        };
-
-        // The fragment starts after the opening line and any blank lines.
-        let mut body = &markdown[body_start..body_start + at];
-        while let Some((line, rest)) = body.split_once('\n')
+impl InlineStorageFence {
+    /// The fence that opens at `start`, whose opening line ends at
+    /// `body_start`, and whose closing line break and backticks, `closing`
+    /// bytes long, stand `at` bytes after that.
+    fn of(markdown: &str, start: usize, body_start: usize, at: usize, closing: usize) -> Self {
+        let mut storage = body_start..body_start + at;
+        while let Some((line, _)) = markdown[storage.clone()].split_once('\n')
             && line.trim().is_empty()
         {
-            body = rest;
+            storage.start += line.len() + 1;
         }
-        out.push_str(&markdown[cursor..opening.start()]);
-        out.push_str(&fragments.hold(body.to_string()));
-        cursor = body_start + at + closing.len();
-        search_from = cursor;
-        by_text_alone = true;
+        Self {
+            range: start..body_start + at + closing,
+            storage,
+        }
     }
-    out.push_str(&markdown[cursor..]);
-    out
+}
+
+/// Finds the inline storage fences of a text one after the other, each
+/// with the code blocks that the text has once the fences before it are
+/// read as the storage they are.
+///
+/// Other text stands before most fences on their line, and such a fence is
+/// one unless a code block holds that line. A run of them is written over
+/// ahead of the parser, which then reads their lines once for the whole
+/// run instead of once for each fence.
+struct InlineStorageFences {
+    search_from: usize,
+    /// The shortest fence found to have no closing line. No longer fence
+    /// that opens later has one either.
+    unclosed: usize,
+    /// The fences written over ahead of the parser, each a fence if no
+    /// code block holds the line it opens on.
+    assumed: VecDeque<InlineStorageFence>,
+    /// How many fences to write over ahead of the parser: twice as many
+    /// each time a whole run proves to be fences.
+    assume: usize,
+    /// How many to write over ahead of the parser at first, and after one
+    /// proves to be text of a code block.
+    fences_ahead: usize,
+}
+
+/// Writes over a part of a text, so that it reads as one word of its line.
+fn write_over(text: &mut Cow<'_, str>, range: &Range<usize>) {
+    text.to_mut()
+        .replace_range(range.clone(), &"x".repeat(range.len()));
+}
+
+/// Whether the part of a line before a fence holds text, and not only the
+/// markers of the block quotes, list items and definitions the line stands
+/// in. A fence after text opens no code block.
+fn holds_text_before_a_fence(before: &str) -> bool {
+    let mut rest = before;
+    loop {
+        rest = rest.trim_start_matches([' ', '\t']);
+        let after_marker = if let Some(after) = rest.strip_prefix(['>', ':']) {
+            Some(after)
+        } else if let Some(after) = rest.strip_prefix(['-', '+', '*']) {
+            Some(after)
+        } else if let Some(after) = rest.strip_prefix("[^") {
+            after.split_once("]:").map(|(_, after)| after)
+        } else {
+            rest.trim_start_matches(|ch: char| ch.is_ascii_digit())
+                .strip_prefix(['.', ')'])
+                .filter(|after| after.len() + 1 < rest.len())
+        };
+        match after_marker {
+            Some(after) if after.is_empty() || after.starts_with([' ', '\t']) => rest = after,
+            Some(_) => return true,
+            None => return !rest.is_empty(),
+        }
+    }
+}
+
+impl InlineStorageFences {
+    fn opening() -> &'static Regex {
+        static OPENING: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(`{3,})confluence-storage[\s&&[^\n]]*\n").expect("valid regex")
+        });
+        &OPENING
+    }
+
+    const FENCES_AHEAD: usize = 1;
+
+    fn new(fences_ahead: usize) -> Self {
+        Self {
+            search_from: 0,
+            unclosed: usize::MAX,
+            assumed: VecDeque::new(),
+            assume: fences_ahead,
+            fences_ahead,
+        }
+    }
+
+    /// The next fence of the text `written`, whose lines start at `starts`
+    /// and whose code blocks `parser` reads. `inert` is that text with the
+    /// fences before this one written over, and has this one written over
+    /// when it is returned.
+    fn next(
+        &mut self,
+        written: &str,
+        inert: &mut Cow<'_, str>,
+        starts: &[usize],
+        parser: &mut LineParser,
+    ) -> Option<InlineStorageFence> {
+        let line_of = |offset: usize| starts.partition_point(|start| *start <= offset) - 1;
+        if let Some(fence) = self.assumed.pop_front() {
+            if parser
+                .code_block_at(inert, starts, fence.range.start)
+                .is_none()
+            {
+                self.search_from = fence.range.end;
+                if self.assumed.is_empty() {
+                    self.assume = self.assume.saturating_mul(2);
+                    self.write_over_ahead(inert, starts, parser);
+                }
+                return Some(fence);
+            }
+            // A code block holds the line, so this one is text of it, and
+            // the ones after it are found from the text as it is written.
+            for assumed in std::iter::once(&fence).chain(&self.assumed) {
+                inert
+                    .to_mut()
+                    .replace_range(assumed.range.clone(), &written[assumed.range.clone()]);
+            }
+            self.assumed.clear();
+            parser.read_again_from(starts, line_of(fence.range.start));
+            self.search_from = fence.range.start;
+            self.assume = self.fences_ahead;
+        }
+        let fence = self.next_read(inert, starts, parser)?;
+        write_over(inert, &fence.range);
+        parser.read_again_from(starts, line_of(fence.range.start));
+        self.write_over_ahead(inert, starts, parser);
+        Some(fence)
+    }
+
+    /// Writes over the fences that follow, as many as are assumed at a
+    /// time, up to the first that may open a code block, holds a line of
+    /// tildes or has no closing line.
+    fn write_over_ahead(
+        &mut self,
+        inert: &mut Cow<'_, str>,
+        starts: &[usize],
+        parser: &mut LineParser,
+    ) {
+        let line_of = |offset: usize| starts.partition_point(|start| *start <= offset) - 1;
+        let mut from = self.search_from;
+        while self.assumed.len() < self.assume {
+            let Some(captures) = Self::opening().captures_at(inert, from) else {
+                break;
+            };
+            let opening = captures.get(0).expect("whole match").range();
+            let ticks = captures[1].len();
+            let line_start = starts[line_of(opening.start)];
+            if ticks >= self.unclosed
+                || !holds_text_before_a_fence(&inert[line_start..opening.start])
+            {
+                break;
+            }
+            let closing = format!("\n{}", "`".repeat(ticks));
+            let body_start = opening.end - 1;
+            let Some(at) = inert[body_start..].find(&closing) else {
+                break;
+            };
+            let fence = InlineStorageFence::of(inert, opening.start, body_start, at, closing.len());
+            // A line of tildes can close a block of code that opens above
+            // the fences written over here, which then holds them.
+            if inert[fence.range.clone()]
+                .lines()
+                .any(|line| line.trim_start().starts_with("~~~"))
+            {
+                break;
+            }
+            write_over(inert, &fence.range);
+            from = fence.range.end;
+            self.assumed.push_back(fence);
+        }
+        if let Some(first) = self.assumed.front() {
+            parser.read_again_from(starts, line_of(first.range.start));
+        }
+    }
+
+    /// The next fence of `markdown`, found from the code blocks that
+    /// `parser` reads in it.
+    fn next_read(
+        &mut self,
+        markdown: &str,
+        starts: &[usize],
+        parser: &mut LineParser,
+    ) -> Option<InlineStorageFence> {
+        while let Some(captures) = Self::opening().captures_at(markdown, self.search_from) {
+            let opening = captures.get(0).expect("whole match");
+            let ticks = &captures[1];
+            let closing = format!("\n{ticks}");
+            let body_start = opening.end() - 1;
+            self.search_from = opening.end();
+
+            let block = parser.code_block_at(markdown, starts, opening.start());
+            let at = match &block {
+                Some(block) if !is_container_prefix(&markdown[block.start..opening.start()]) => {
+                    // The fence is text inside another code block.
+                    self.search_from = block.end.max(opening.end());
+                    continue;
+                }
+                Some(block) => {
+                    // The fence opens a code block of its own. It is a fragment
+                    // in a paragraph when other text stands on the line before or
+                    // after it, or when something other than spaces follows the
+                    // backticks that close it, which the parser reads as one
+                    // more line of code.
+                    let end = block.end.max(body_start);
+                    let joins_other_text = !stands_apart(markdown, block);
+                    let fragment_end = markdown[body_start..end].find(&closing).filter(|at| {
+                        let after_ticks = &markdown[body_start + at + closing.len()..];
+                        let rest_of_line = after_ticks.lines().next().unwrap_or_default();
+                        joins_other_text
+                            || !rest_of_line
+                                .trim_start_matches('`')
+                                .trim_matches(' ')
+                                .is_empty()
+                    });
+                    let Some(at) = fragment_end else {
+                        self.search_from = end.max(opening.end());
+                        continue;
+                    };
+                    at
+                }
+                None if ticks.len() >= self.unclosed => continue,
+                None => {
+                    let Some(at) = markdown[body_start..].find(&closing) else {
+                        self.unclosed = ticks.len();
+                        continue;
+                    };
+                    at
+                }
+            };
+
+            let fence =
+                InlineStorageFence::of(markdown, opening.start(), body_start, at, closing.len());
+            self.search_from = fence.range.end;
+            return Some(fence);
+        }
+        None
+    }
 }
 
 /// Whether a code block stands apart from the text around it: the line
@@ -1283,11 +1433,10 @@ fn render_block_element(node: Node<'_, '_>, source: &str) -> Option<String> {
         "pre" => render_preformatted(node),
         "blockquote" => {
             let rendered = render_container_blocks(node, source)?;
-            // A macro, a layout or a task without a body is read at the
-            // start of a line only, which a quoted line never is.
-            let holds_a_block = confluence_blocks(&rendered)
-                .map_or(true, |blocks| !blocks.is_empty())
-                || rendered.lines().any(is_empty_task_line);
+            // A macro or a layout is read at the start of a line only,
+            // which a quoted line never is.
+            let holds_a_block =
+                confluence_blocks(&rendered).map_or(true, |blocks| !blocks.is_empty());
             if holds_a_block {
                 return None;
             }
@@ -3502,6 +3651,7 @@ fn prefix_markdown_block(block: &str, prefix: &str) -> String {
 /// Whether a line opens or closes a code fence, a macro block or a cell of
 /// a layout section.
 fn reads_as_block_syntax(line: &str) -> bool {
+    let line = line.trim_start_matches(' ');
     fence_line(line).is_some()
         || colon_macro(line).is_some()
         || matches!(line.trim_end(), ":::" | LAYOUT_CELL_LINE)
@@ -3921,15 +4071,25 @@ fn closes_fence(open: &str, close: &str) -> bool {
     }
 }
 
+/// The Confluence block that a tilde fence at the start of a line opens,
+/// with the text after the tildes. The name of the block follows the
+/// tildes directly: with a space between them, the line opens a code block
+/// of Markdown.
+fn tilde_block(line: &str) -> Option<(BlockKind<'_>, &str)> {
+    let (_, length, info) = fence_line(line).filter(|_| line.starts_with('~'))?;
+    let names_block = !line[length..].starts_with([' ', '\t']);
+    Some((fence_block(info).filter(|_| names_block)?, info))
+}
+
 /// Whether a line opens a code or noformat block with three tildes. Such a
 /// block holds longer runs of tildes as text, so only a line of three
 /// closes it.
 fn closes_at_three_tildes(open: &str) -> bool {
-    matches!(
-        fence_line(open),
-        Some(('~', 3, info)) if open.starts_with('~')
-            && matches!(fence_block(info), Some(BlockKind::Code(_) | BlockKind::Noformat))
-    )
+    matches!(fence_line(open), Some(('~', 3, _)))
+        && matches!(
+            tilde_block(open),
+            Some((BlockKind::Code(_) | BlockKind::Noformat, _))
+        )
 }
 
 /// Whether `close` is a line that closes the Confluence block that the
@@ -3978,9 +4138,9 @@ fn holds_text_as_written(markup: &str) -> bool {
         .any(|element| name.eq_ignore_ascii_case(element))
 }
 
-/// What the parser says about the lines of Markdown that are not read as
-/// Markdown.
-struct LinesAsWritten {
+/// What the parser says about the lines of a text.
+#[derive(Debug, PartialEq)]
+struct ParsedLines {
     /// For each line, the line after the fenced code block or the raw
     /// markup of text as written that opens on it, when one does. Markdown
     /// reads the lines of each as text, whatever they say. A fence can open
@@ -3990,27 +4150,165 @@ struct LinesAsWritten {
     /// Whether each line is part of other raw markup. A Confluence block
     /// inside it is one, and a line that opens none is text of the markup.
     markup: Vec<bool>,
+    /// Whether each line is part of a list item, a block quote, the
+    /// definition of a term or the definition of a footnote, where an
+    /// indented line is text of that container.
+    contained: Vec<bool>,
+    /// The code blocks, fenced or indented, in the order they stand in.
+    code_blocks: Vec<Range<usize>>,
 }
 
-fn lines_as_written(markdown: &str, starts: &[usize]) -> LinesAsWritten {
-    let count = starts.len() - 1;
-    let line = |index: usize| &markdown[starts[index]..starts[index + 1]];
-    let line_of = |offset: usize| starts.partition_point(|start| *start <= offset) - 1;
-    let mut literal = vec![None; count];
-    let mut markup = vec![false; count];
-    // The line the parser reads from. A block of three tildes can end
-    // after the line where Markdown closes its fence, and the lines below
-    // it are read from its own end.
-    let mut from = 0;
-    'document: while from < count {
-        let offset = starts[from];
-        let events = Parser::new_ext(&markdown[offset..], markdown_options()).into_offset_iter();
-        for (event, range) in events {
-            if range.is_empty() {
-                continue;
+#[cfg(test)]
+thread_local! {
+    /// How many bytes of text this thread has given to the parser.
+    static BYTES_PARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reads what the parser says about the lines of a text from the top down,
+/// as far as it is asked to.
+///
+/// Markdown reads a block from the lines of that block alone, so the parser
+/// is given a stretch of lines at a time, and what it says about the last
+/// block of a stretch that stops short of the end of the text is left for
+/// the next, longer stretch: that block may go on below. A text whose
+/// lines change while it is read is read again from the changed block on.
+struct LineParser {
+    parsed: ParsedLines,
+    /// The lines that open the blocks read so far, of those that stand in
+    /// no other block.
+    blocks: Vec<usize>,
+    /// The first line that is not read.
+    read_to: usize,
+    /// The lines to read past the one asked for, to find the end of its
+    /// block. Twice as many are read each time the block goes on.
+    lines_ahead: usize,
+}
+
+impl LineParser {
+    const LINES_AHEAD: usize = 64;
+
+    fn new(line_count: usize, lines_ahead: usize) -> Self {
+        Self {
+            lines_ahead,
+            parsed: ParsedLines {
+                literal: vec![None; line_count],
+                markup: vec![false; line_count],
+                contained: vec![false; line_count],
+                code_blocks: Vec::new(),
+            },
+            blocks: Vec::new(),
+            read_to: 0,
+        }
+    }
+
+    /// The code block that holds `offset` of `text`, whose lines start at
+    /// `starts`.
+    fn code_block_at(
+        &mut self,
+        text: &str,
+        starts: &[usize],
+        offset: usize,
+    ) -> Option<Range<usize>> {
+        let line = starts.partition_point(|start| *start <= offset) - 1;
+        let mut ahead = self.lines_ahead;
+        while self.read_to <= line {
+            let until = (line + 1).saturating_add(ahead).min(starts.len() - 1);
+            self.read(text, starts, until);
+            ahead = ahead.saturating_mul(2);
+        }
+        // Code blocks do not overlap.
+        let blocks = &self.parsed.code_blocks;
+        let after = blocks.partition_point(|block| block.end <= offset);
+        blocks
+            .get(after)
+            .filter(|block| block.start <= offset)
+            .cloned()
+    }
+
+    /// Reads the rest of the text.
+    fn finish(mut self, text: &str, starts: &[usize]) -> ParsedLines {
+        let count = starts.len() - 1;
+        while self.read_to < count {
+            self.read(text, starts, count);
+        }
+        self.parsed
+    }
+
+    /// Forgets what is read from the block that holds `line` on, and from
+    /// the block before it: a line that no longer opens a block of its own
+    /// can continue the paragraph of a block quote or a list item above it.
+    fn read_again_from(&mut self, starts: &[usize], line: usize) {
+        let holding = self.blocks.partition_point(|block| *block <= line);
+        let kept = holding.saturating_sub(2);
+        let from = self.blocks.get(kept).copied().unwrap_or(0);
+        if from >= self.read_to {
+            return;
+        }
+        self.blocks.truncate(kept);
+        self.parsed.literal[from..].fill(None);
+        self.parsed.markup[from..].fill(false);
+        self.parsed.contained[from..].fill(false);
+        let kept_code = self
+            .parsed
+            .code_blocks
+            .partition_point(|block| block.start < starts[from]);
+        self.parsed.code_blocks.truncate(kept_code);
+        self.read_to = from;
+    }
+
+    /// Reads the blocks of the lines up to `until` or just past it, from
+    /// the first line that is not read.
+    fn read(&mut self, text: &str, starts: &[usize], until: usize) {
+        let count = starts.len() - 1;
+        let line = |index: usize| &text[starts[index]..starts[index + 1]];
+        let line_of = |offset: usize| starts.partition_point(|start| *start <= offset) - 1;
+        let offset = starts[self.read_to];
+        // A fence written over as one word holds no line break, and a
+        // stretch ends where a line of the text as it is read does.
+        let until = (until..count)
+            .find(|until| text[..starts[*until]].ends_with('\n'))
+            .unwrap_or(count);
+
+        let mut events = Vec::new();
+        // Where the last block that stands in no other block opens.
+        let mut last_block = None;
+        let mut depth = 0usize;
+        let stretch = &text[offset..starts[until]];
+        #[cfg(test)]
+        BYTES_PARSED.set(BYTES_PARSED.get() + stretch.len());
+        for (event, range) in Parser::new_ext(stretch, markdown_options()).into_offset_iter() {
+            let opens_block = depth == 0 && !matches!(event, Event::End(_));
+            match event {
+                Event::Start(_) => depth += 1,
+                Event::End(_) => depth = depth.saturating_sub(1),
+                _ => {}
             }
             let range = offset + range.start..offset + range.end;
+            if opens_block {
+                last_block = Some((events.len(), range.start));
+            }
+            if !range.is_empty() {
+                events.push((opens_block, event, range));
+            }
+        }
+        let mut read_to = until;
+        if until < count {
+            let (event_count, start) = last_block.unwrap_or((0, offset));
+            events.truncate(event_count);
+            read_to = line_of(start);
+        }
+
+        let ParsedLines {
+            literal,
+            markup,
+            contained,
+            code_blocks,
+        } = &mut self.parsed;
+        for (opens_block, event, range) in events {
             let lines = line_of(range.start)..line_of(range.end - 1) + 1;
+            if opens_block {
+                self.blocks.push(lines.start);
+            }
             match event {
                 Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))) => {
                     let open = line(lines.start);
@@ -4021,24 +4319,244 @@ fn lines_as_written(markdown: &str, starts: &[usize]) -> LinesAsWritten {
                     })
                     .flatten();
                     match close {
+                        // A block of three tildes can end after the line
+                        // where Markdown closes its fence, and the lines
+                        // below it are read from its own end.
                         Some(close) if close + 1 != lines.end => {
                             literal[lines.start] = Some(close + 1);
-                            from = close + 1;
-                            continue 'document;
+                            code_blocks.push(range.start..starts[close + 1]);
+                            read_to = close + 1;
+                            break;
                         }
-                        _ => literal[lines.start] = Some(lines.end),
+                        _ => {
+                            literal[lines.start] = Some(lines.end);
+                            code_blocks.push(range);
+                        }
                     }
                 }
-                Event::Start(Tag::HtmlBlock) if holds_text_as_written(&markdown[range]) => {
+                Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)) => code_blocks.push(range),
+                Event::Start(Tag::HtmlBlock) if holds_text_as_written(&text[range.clone()]) => {
                     literal[lines.start] = Some(lines.end);
                 }
                 Event::Start(Tag::HtmlBlock) => markup[lines].fill(true),
+                // A `:::` line below a paragraph reads as a definition
+                // of that paragraph, and is the line of a block instead.
+                Event::Start(Tag::DefinitionListDefinition)
+                    if line(lines.start).trim_start().starts_with(":::") => {}
+                Event::Start(
+                    Tag::Item
+                    | Tag::BlockQuote(_)
+                    | Tag::DefinitionListDefinition
+                    | Tag::FootnoteDefinition(_),
+                ) => contained[lines].fill(true),
                 _ => {}
             }
         }
-        break;
+        self.read_to = read_to;
     }
-    LinesAsWritten { literal, markup }
+}
+
+/// How a Markdown text is read before it is parsed as Markdown: where its
+/// lines are text as written, and where they hold storage in the middle of
+/// a paragraph. Everything that reads the text by its lines reads it from
+/// here, so that a line means the same thing to each of them.
+///
+/// Whatever opens first holds the lines up to its end: a block of code
+/// holds a line that reads as a fence of storage, and storage holds a line
+/// that reads as a block.
+struct Reading<'a> {
+    markdown: &'a str,
+    /// The text with every inline storage fence written over as one word,
+    /// which is what the fence is to the paragraph it stands in: no line of
+    /// it reads as anything, and no line break of it ends a line. The rest
+    /// stands where it does in the text itself.
+    inert: Cow<'a, str>,
+    /// Where each line starts, and where the text ends.
+    starts: Vec<usize>,
+    parsed: ParsedLines,
+    fences: Vec<InlineStorageFence>,
+}
+
+impl<'a> Reading<'a> {
+    fn of(markdown: &'a str) -> Self {
+        Self::reading_ahead(
+            markdown,
+            LineParser::LINES_AHEAD,
+            InlineStorageFences::FENCES_AHEAD,
+        )
+    }
+
+    /// The reading of a text, which is the same however many lines the
+    /// parser reads ahead and however many fences are written over ahead
+    /// of it.
+    fn reading_ahead(markdown: &'a str, lines_ahead: usize, fences_ahead: usize) -> Self {
+        let lines: Vec<&str> = markdown.split_inclusive('\n').collect();
+        let starts = line_starts(&lines);
+        let mut inert = Cow::Borrowed(markdown);
+        let mut fences = Vec::new();
+        let mut parser = LineParser::new(lines.len(), lines_ahead);
+        if InlineStorageFences::opening().is_match(markdown) {
+            let mut finder = InlineStorageFences::new(fences_ahead);
+            // Read as storage, a fence no longer says what its lines read
+            // as, which changes what the parser makes of the lines below.
+            while let Some(fence) = finder.next(markdown, &mut inert, &starts, &mut parser) {
+                fences.push(fence);
+            }
+        }
+        let parsed = parser.finish(&inert, &starts);
+        Self {
+            markdown,
+            inert,
+            starts,
+            parsed,
+            fences,
+        }
+    }
+
+    fn line_count(&self) -> usize {
+        self.starts.len() - 1
+    }
+
+    /// A line as it is read: one that inline storage holds says nothing.
+    fn line(&self, index: usize) -> &str {
+        &self.inert[self.starts[index]..self.starts[index + 1]]
+    }
+
+    /// Whether the line that starts at `offset` is a line of raw markup.
+    fn in_markup(&self, offset: usize) -> bool {
+        let line = self.starts.partition_point(|start| *start <= offset) - 1;
+        self.parsed.markup.get(line).copied().unwrap_or(false)
+    }
+
+    /// A line as it is written.
+    fn written(&self, index: usize) -> &'a str {
+        &self.markdown[self.starts[index]..self.starts[index + 1]]
+    }
+
+    /// A line that can open or close a `:::` block, without its
+    /// indentation. Up to three spaces indent a block, except in a list
+    /// item or a block quote, where an indented line is text of it.
+    fn colon_line(&self, index: usize) -> Option<&'a str> {
+        let line = self.line(index);
+        let indentation = line.len() - line.trim_start_matches(' ').len();
+        let stands_as_a_block =
+            indentation == 0 || (indentation <= 3 && !self.parsed.contained[index]);
+        (stands_as_a_block && line[indentation..].starts_with(":::"))
+            .then(|| &self.written(index)[indentation..])
+    }
+
+    /// The Confluence blocks of the text, outermost only: a block inside
+    /// the body of another is found when that body is read.
+    ///
+    /// A fenced code block is code whatever its lines read as, so nothing
+    /// in it opens or closes a block. A `:::` block holds blocks of its
+    /// own, each closed by its own `:::` line. A tilde fence closes at the
+    /// first run of tildes at least as long as the one that opens it, which
+    /// lets a block hold shorter fences.
+    fn blocks(&self) -> Result<Vec<ConfluenceBlock<'a>>> {
+        if !self.markdown.contains("confluence-") {
+            return Ok(Vec::new());
+        }
+        let ParsedLines {
+            literal, markup, ..
+        } = &self.parsed;
+        let count = self.line_count();
+        let block = |kind, open: usize, close: usize| ConfluenceBlock {
+            kind,
+            range: self.starts[open]..self.starts[close + 1],
+            body: self.starts[open + 1]..self.starts[close],
+        };
+        let tilde_block = |index: usize| tilde_block(self.written(index));
+
+        let mut blocks = Vec::new();
+        let mut index = 0;
+        while index < count {
+            if let Some(end) = literal[index] {
+                if let Some((kind, info)) = tilde_block(index) {
+                    let close = end - 1;
+                    if !closes_block(self.line(index), self.line(close)) {
+                        match kind {
+                            BlockKind::LayoutSection(section_type) => {
+                                bail!("unterminated confluence layout section `{section_type}`")
+                            }
+                            _ => bail!("unterminated {} block", info.trim()),
+                        }
+                    }
+                    blocks.push(block(kind, index, close));
+                }
+                index = end;
+                continue;
+            }
+            // Raw markup holds no code block of Markdown, so a fence inside
+            // it closes at the first line that closes it, wherever that is.
+            if markup[index]
+                && let Some((kind, _)) = tilde_block(index)
+                && let Some(close) = (index + 1..count)
+                    .find(|close| closes_block(self.line(index), self.line(*close)))
+            {
+                blocks.push(block(kind, index, close));
+                index = close + 1;
+                continue;
+            }
+            let Some(colon) = self.colon_line(index).and_then(colon_macro) else {
+                index += 1;
+                continue;
+            };
+            let mut depth = 1;
+            let mut close = index + 1;
+            let mut holds_open_fence = false;
+            while close < count {
+                if let Some(end) = literal[close] {
+                    holds_open_fence = end == count
+                        && fence_line(self.line(close)).is_some()
+                        && !closes_fence(self.line(close).trim_start(), self.line(end - 1));
+                    close = end;
+                    continue;
+                }
+                if let Some(line) = self.colon_line(close) {
+                    if line.trim_end() == ":::" {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else if colon_macro(line).is_some() {
+                        depth += 1;
+                    }
+                }
+                close += 1;
+            }
+            if close >= count {
+                if markup[index] {
+                    index += 1;
+                    continue;
+                }
+                if holds_open_fence {
+                    bail!(
+                        "unterminated confluence {} block: a code fence inside it has no closing line",
+                        colon.label()
+                    );
+                }
+                bail!("unterminated confluence {} block", colon.label());
+            }
+            blocks.push(block(BlockKind::Colon(colon), index, close));
+            index = close + 1;
+        }
+        Ok(blocks)
+    }
+
+    /// The lines that are no line of a code block, of raw markup of text as
+    /// written or of inline storage, each with its number.
+    fn lines_read_as_markdown(&self) -> impl Iterator<Item = (usize, &str)> {
+        let mut literal_until = 0;
+        (0..self.line_count()).filter_map(move |index| {
+            if index >= literal_until
+                && let Some(end) = self.parsed.literal[index]
+            {
+                literal_until = end;
+            }
+            (index >= literal_until).then(|| (index, self.line(index)))
+        })
+    }
 }
 
 /// The macros written as `:::confluence-<name>` with a body of their own
@@ -4088,9 +4606,7 @@ const BUILT_IN_COLON_MACROS: &[&str] = &[
     "network",
 ];
 
-/// The macro a `:::confluence-...` line opens. The line starts at the first
-/// column: an indented one is text of a list item or of an indented code
-/// block.
+/// The macro a `:::confluence-...` line opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ColonMacro<'a> {
     /// An info, note, tip or warning panel. Its body is Markdown.
@@ -4177,95 +4693,12 @@ impl ConfluenceBlock<'_> {
     }
 }
 
-/// The Confluence blocks of a Markdown document, outermost only: a block
-/// inside the body of another is found when that body is read.
-///
-/// A fenced code block is code whatever its lines read as, so nothing in it
-/// opens or closes a block. A `:::` block holds blocks of its own, each
-/// closed by its own `:::` line. A tilde fence closes at the first run of
-/// tildes at least as long as the one that opens it, which lets a block
-/// hold shorter fences.
+/// The outermost Confluence blocks of a Markdown text.
 fn confluence_blocks(markdown: &str) -> Result<Vec<ConfluenceBlock<'_>>> {
     if !markdown.contains("confluence-") {
         return Ok(Vec::new());
     }
-    let lines: Vec<&str> = markdown.split_inclusive('\n').collect();
-    let starts = line_starts(&lines);
-    let LinesAsWritten { literal, markup } = lines_as_written(markdown, &starts);
-    let block = |kind, open: usize, close: usize| ConfluenceBlock {
-        kind,
-        range: starts[open]..starts[close + 1],
-        body: starts[open + 1]..starts[close],
-    };
-
-    let mut blocks = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index];
-        if let Some(end) = literal[index] {
-            let tilde_fence = fence_line(line).filter(|_| line.starts_with('~'));
-            if let Some((_, _, info)) = tilde_fence
-                && let Some(kind) = fence_block(info)
-            {
-                let close = end - 1;
-                if !closes_block(line, lines[close]) {
-                    match kind {
-                        BlockKind::LayoutSection(section_type) => {
-                            bail!("unterminated confluence layout section `{section_type}`")
-                        }
-                        _ => bail!("unterminated {} block", info.trim()),
-                    }
-                }
-                blocks.push(block(kind, index, close));
-            }
-            index = end;
-            continue;
-        }
-        // Raw markup holds no code block of Markdown, so a fence inside it
-        // closes at the first line that closes it, wherever that is.
-        if markup[index]
-            && line.starts_with('~')
-            && let Some((_, _, info)) = fence_line(line)
-            && let Some(kind) = fence_block(info)
-            && let Some(close) =
-                (index + 1..lines.len()).find(|close| closes_block(line, lines[*close]))
-        {
-            blocks.push(block(kind, index, close));
-            index = close + 1;
-            continue;
-        }
-        let Some(colon) = colon_macro(line) else {
-            index += 1;
-            continue;
-        };
-        let mut depth = 1;
-        let mut close = index + 1;
-        while close < lines.len() {
-            if let Some(end) = literal[close] {
-                close = end;
-                continue;
-            }
-            if lines[close].trim_end() == ":::" {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-            } else if colon_macro(lines[close]).is_some() {
-                depth += 1;
-            }
-            close += 1;
-        }
-        if close >= lines.len() {
-            if markup[index] {
-                index += 1;
-                continue;
-            }
-            bail!("unterminated confluence {} block", colon.label());
-        }
-        blocks.push(block(BlockKind::Colon(colon), index, close));
-        index = close + 1;
-    }
-    Ok(blocks)
+    Reading::of(markdown).blocks()
 }
 
 /// A Confluence block of a Markdown document and the parts of it that hold
@@ -4276,6 +4709,18 @@ pub(crate) struct BlockMarkdown {
     /// The lines of the block.
     pub(crate) range: Range<usize>,
     pub(crate) bodies: Vec<Range<usize>>,
+    /// The macro whose parameter lines the block holds, when it is one
+    /// whose parameters are read by their names.
+    pub(crate) parameters_of: Option<ParameterMacro>,
+}
+
+/// A macro whose block holds parameter lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParameterMacro {
+    /// A macro written as `:::confluence-<name>`.
+    BuiltIn(&'static str),
+    /// Any other macro, written as `:::confluence-macro <name>`.
+    Generic,
 }
 
 /// The outermost Confluence blocks of a Markdown document, as apply reads
@@ -4301,6 +4746,13 @@ pub(crate) fn block_markdown(markdown: &str) -> Vec<BlockMarkdown> {
             BlockMarkdown {
                 range: block.range.clone(),
                 bodies: bodies.into_iter().map(range_of).collect(),
+                parameters_of: match block.kind {
+                    BlockKind::Colon(ColonMacro::BuiltIn(name)) => {
+                        Some(ParameterMacro::BuiltIn(name))
+                    }
+                    BlockKind::Colon(ColonMacro::Generic(_)) => Some(ParameterMacro::Generic),
+                    _ => None,
+                },
             }
         })
         .collect()
@@ -4329,23 +4781,45 @@ fn colon_macro_markdown<'m>(colon: ColonMacro<'_>, body: &'m str) -> Option<&'m 
     }
 }
 
-/// Takes the Confluence blocks out of a Markdown document, each replaced by
-/// a line holding the placeholder of its storage.
-fn replace_confluence_blocks(
+/// Takes the Confluence blocks and the inline storage out of a Markdown
+/// text: each block replaced by a line holding the placeholder of its
+/// storage, and each fence of storage by its placeholder, where it stands.
+/// Storage inside a block is part of what that block holds.
+fn hold_confluence_blocks(
     markdown: &str,
     allow_lossy: bool,
     fragments: &mut StorageFragments,
 ) -> Result<String> {
-    let blocks = confluence_blocks(markdown)?;
+    if !markdown.contains("confluence-") {
+        return Ok(markdown.to_string());
+    }
+    let reading = Reading::of(markdown);
+    let blocks = reading.blocks()?;
+    let mut fences = reading.fences.iter().peekable();
+    // Copies the text up to `end`, which no fence reaches across.
+    let mut copy = |output: &mut String, start: usize, end: usize, held: &mut StorageFragments| {
+        let mut start = start;
+        while let Some(fence) = fences.next_if(|fence| fence.range.start < end) {
+            if fence.range.start < start {
+                continue;
+            }
+            output.push_str(&markdown[start..fence.range.start]);
+            output.push_str(&held.hold(markdown[fence.storage.clone()].to_string()));
+            start = fence.range.end;
+        }
+        output.push_str(&markdown[start..end]);
+    };
     let mut output = String::with_capacity(markdown.len());
     let mut last = 0;
     let mut blocks = blocks.iter().peekable();
     while let Some(block) = blocks.next() {
-        output.push_str(&markdown[last..block.range.start]);
+        copy(&mut output, last, block.range.start, fragments);
         // A block is a block of its own, whatever the lines around it
         // hold: a blank line on either side keeps Markdown from reading its
-        // placeholder into a paragraph.
-        if !output.is_empty() && !output.ends_with("\n\n") {
+        // placeholder into a paragraph. Inside raw markup its placeholder
+        // is a line of that markup, which a blank line would end.
+        let in_markup = reading.in_markup(block.range.start);
+        if !in_markup && !output.is_empty() && !output.ends_with("\n\n") {
             output.push('\n');
         }
         let mut end = block.range.end;
@@ -4386,13 +4860,13 @@ fn replace_confluence_blocks(
         if markdown[..end].ends_with('\n') {
             output.push('\n');
             let follows = markdown[end..].lines().next().unwrap_or_default();
-            if !follows.trim().is_empty() {
+            if !in_markup && !follows.trim().is_empty() {
                 output.push('\n');
             }
         }
         last = end;
     }
-    output.push_str(&markdown[last..]);
+    copy(&mut output, last, markdown.len(), fragments);
     Ok(output)
 }
 
@@ -4664,12 +5138,44 @@ fn split_rich_text_macro_block(block_body: &str) -> (Option<&str>, &str) {
 /// lines when every line before it is one, and is a rule of the body
 /// otherwise.
 fn split_at_header_end(block_body: &str) -> Option<(&str, &str)> {
-    block_body.split_once("\n---\n").or_else(|| {
-        let header = block_body.strip_suffix("\n---")?;
-        let is_header =
-            !header.is_empty() && header.lines().all(|line| parameter_of(line).is_some());
+    first_line_of_dashes(block_body).or_else(|| {
+        let (header, last) = block_body.rsplit_once('\n')?;
+        let is_header = is_header_end(last)
+            && !header.is_empty()
+            && header.lines().all(|line| parameter_of(line).is_some());
         is_header.then(|| (header, &block_body[block_body.len()..]))
     })
+}
+
+/// Whether a line, without its line break, is the `---` that ends the
+/// parameter lines of a macro block. Up to three spaces indent it, as they
+/// indent the lines of the block.
+fn is_header_end(line: &str) -> bool {
+    let dashes = line.trim_start_matches(' ');
+    line.len() - dashes.len() <= 3 && dashes == MACRO_HEADER_END
+}
+
+/// The lines before and after the first `---` line that both a line
+/// precedes and a line follows. Dashes in a code block or in a block of its
+/// own inside the text are text of that block.
+fn first_line_of_dashes(text: &str) -> Option<(&str, &str)> {
+    if !text.contains("---\n") {
+        return None;
+    }
+    let reading = Reading::of(text);
+    let blocks = reading.blocks().unwrap_or_default();
+    let dashes = reading.lines_read_as_markdown().find(|(index, line)| {
+        let start = reading.starts[*index];
+        *index > 0
+            && line.strip_suffix('\n').is_some_and(is_header_end)
+            && (line.starts_with('-') || !reading.parsed.contained[*index])
+            && !blocks.iter().any(|block| block.range.contains(&start))
+    });
+    let (index, _) = dashes?;
+    Some((
+        &text[..reading.starts[index] - 1],
+        &text[reading.starts[index + 1]..],
+    ))
 }
 
 /// The name and the value of a parameter line of a macro block.
@@ -4683,10 +5189,12 @@ fn parameter_of(line: &str) -> Option<(&str, &str)> {
 /// only after a `---` line.
 fn split_generic_macro_block(block_body: &str) -> (&str, Option<&str>) {
     let trimmed_body = block_body.trim_end_matches('\n');
-    if trimmed_body == MACRO_HEADER_END {
+    if is_header_end(trimmed_body) {
         return ("", Some(&trimmed_body[trimmed_body.len()..]));
     }
-    if let Some(body_markdown) = trimmed_body.strip_prefix("---\n") {
+    if let Some((first, body_markdown)) = trimmed_body.split_once('\n')
+        && is_header_end(first)
+    {
         return ("", Some(body_markdown));
     }
     match split_at_header_end(trimmed_body) {
@@ -4759,34 +5267,28 @@ const LAYOUT_CELL_LINE: &str = "--- cell ---";
 /// its cells: the lines before the first cell line, and the lines after
 /// each cell line.
 fn layout_section_parts(body: &str) -> (Vec<&str>, Vec<&str>) {
-    let lines: Vec<&str> = body.split_inclusive('\n').collect();
-    let mut metadata = Vec::new();
-    let mut cells = Vec::new();
-    let mut cell_start = None;
-    let literal = lines_as_written(body, &line_starts(&lines)).literal;
-    // The line after the code block or raw markup being read, whose lines
-    // belong to the cell, whatever they read as.
-    let mut literal_until = 0;
-    let mut offset = 0;
-    for (index, line) in lines.iter().enumerate() {
-        if index >= literal_until
-            && let Some(end) = literal[index]
-        {
-            literal_until = end;
-        }
-        if index >= literal_until && line.trim_end() == LAYOUT_CELL_LINE {
-            if let Some(start) = cell_start {
-                cells.push(&body[start..offset]);
-            }
-            cell_start = Some(offset + line.len());
-        } else if cell_start.is_none() {
-            metadata.push(*line);
-        }
-        offset += line.len();
-    }
-    if let Some(start) = cell_start {
-        cells.push(&body[start..]);
-    }
+    let reading = Reading::of(body);
+    // The lines of a code block, of raw markup or of inline storage belong
+    // to the cell, whatever they read as.
+    let cell_lines: Vec<usize> = reading
+        .lines_read_as_markdown()
+        .filter(|(_, line)| line.trim_end() == LAYOUT_CELL_LINE)
+        .map(|(index, _)| index)
+        .collect();
+    let first_cell = cell_lines.first().copied().unwrap_or(reading.line_count());
+    let metadata = (0..first_cell)
+        .map(|index| reading.written(index))
+        .collect();
+    let cells = cell_lines
+        .iter()
+        .enumerate()
+        .map(|(cell, line)| {
+            let end = cell_lines
+                .get(cell + 1)
+                .map_or(body.len(), |next| reading.starts[*next]);
+            &body[reading.starts[line + 1]..end]
+        })
+        .collect();
     (metadata, cells)
 }
 
@@ -5579,14 +6081,56 @@ fn open_task_list(output: &mut Vec<Event<'_>>) {
 struct TaskBody {
     start: String,
     end: String,
+    /// Stands after a checkbox that is alone on its line.
+    no_text: String,
 }
 
 impl TaskBody {
+    /// Markdown with `no_text` after every checkbox that stands alone on the
+    /// first line of its list item. Markdown reads such an item as one that
+    /// starts with a blank line: blocks below a blank line are no part of
+    /// it, and where the text ends with the checkbox, the checkbox is the
+    /// text of the item.
+    ///
+    /// The parser says what a list item is, so a line of code or of raw
+    /// markup that reads as one stays as written. The white space that ends
+    /// the line goes, which would be a line break before the text of the
+    /// task.
+    fn with_checkboxes_alone_held(&self, markdown: &str) -> String {
+        let mut output = String::with_capacity(markdown.len());
+        if !markdown.contains('[') {
+            output.push_str(markdown);
+            return output;
+        }
+        let mut rest = 0;
+        for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
+            if !matches!(event, Event::Start(Tag::Item)) {
+                continue;
+            }
+            let line = markdown[range.start..].lines().next().unwrap_or_default();
+            if is_checkbox_alone(line) {
+                output.push_str(&markdown[rest..range.start]);
+                output.push_str(line.trim_end_matches([' ', '\t']));
+                output.push(' ');
+                output.push_str(&self.no_text);
+                rest = range.start + line.len();
+            }
+        }
+        output.push_str(&markdown[rest..]);
+        output
+    }
+
     /// Rendered Markdown without the white space that the renderer lays
     /// out around the blocks of a task body. A space that does not break
     /// is part of the body.
     fn without_layout_around(&self, html: &str) -> String {
         const LAYOUT: [char; 4] = [' ', '\t', '\r', '\n'];
+        // The paragraph or the line that `no_text` stands on holds nothing
+        // else.
+        let html = html
+            .replace(&format!("<p>{}</p>", self.no_text), "")
+            .replace(&format!("{}\n", self.no_text), "")
+            .replace(&self.no_text, "");
         let mut after_starts = html.split(&self.start);
         let mut trimmed = after_starts.next().unwrap_or_default().to_string();
         for part in after_starts {
@@ -8304,6 +8848,417 @@ SELECT ']]>' AS sentinel;
                 r#"<ac:structured-macro ac:name="excerpt"><ac:rich-text-body>"#,
                 "<p>A paragraph.</p>\n<hr />",
                 "</ac:rich-text-body></ac:structured-macro>",
+            )
+        );
+    }
+
+    #[test]
+    fn inline_storage_fence_holds_its_lines_as_written() {
+        for (markdown, storage) in [
+            (
+                "text ```confluence-storage\n<span>a\n\n- [ ]\n</span>\n``` end\n",
+                "<p>text <span>a\n\n- [ ]\n</span> end</p>",
+            ),
+            (
+                "text ```confluence-storage\n<span>a\n:::confluence-info\n</span>\n``` end\n",
+                "<p>text <span>a\n:::confluence-info\n</span> end</p>",
+            ),
+            (
+                "---\ntext ```confluence-storage\n<span>a\n---\n</span>\n``` end\n",
+                "<hr />\n<p>text <span>a\n---\n</span> end</p>",
+            ),
+            (
+                concat!(
+                    ":::confluence-info\n",
+                    "text ```confluence-storage\n<span>a\n:::\n</span>\n``` end\n",
+                    ":::\n",
+                ),
+                concat!(
+                    r#"<ac:structured-macro ac:name="info"><ac:rich-text-body>"#,
+                    "<p>text <span>a\n:::\n</span> end</p>",
+                    "</ac:rich-text-body></ac:structured-macro>",
+                ),
+            ),
+            (
+                concat!(
+                    "~~~~confluence-layout-section single\n--- cell ---\n",
+                    "text ```confluence-storage\n<span>a\n--- cell ---\n</span>\n``` end\n",
+                    "~~~~\n",
+                ),
+                concat!(
+                    r#"<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell>"#,
+                    "<p>text <span>a\n--- cell ---\n</span> end</p>",
+                    "</ac:layout-cell></ac:layout-section></ac:layout>",
+                ),
+            ),
+        ] {
+            assert_eq!(storage_of(markdown), storage, "{markdown:?}");
+        }
+    }
+
+    #[test]
+    fn macro_block_indented_by_up_to_three_spaces_is_a_macro() {
+        let toc = r#"<ac:structured-macro ac:name="toc"><ac:parameter ac:name="minLevel">2</ac:parameter></ac:structured-macro>"#;
+        assert_eq!(
+            storage_of("para\n\n  :::confluence-toc\n  minLevel: 2\n  :::\n"),
+            format!("<p>para</p>\n{toc}")
+        );
+        assert_eq!(
+            storage_of("   :::confluence-info\n   text\n   :::\n"),
+            concat!(
+                r#"<ac:structured-macro ac:name="info"><ac:rich-text-body>"#,
+                "<p>text</p></ac:rich-text-body></ac:structured-macro>",
+            )
+        );
+        // Four spaces make a line of code, and a line of a list item is
+        // text of that item.
+        assert_eq!(
+            storage_of("    :::confluence-toc\n    :::\n"),
+            "<pre><code>:::confluence-toc\n:::\n</code></pre>"
+        );
+        assert!(!storage_of("- item\n\n  :::confluence-toc\n  :::\n").contains("ac:name"));
+    }
+
+    #[test]
+    fn rule_in_a_block_inside_a_macro_body_ends_no_parameter_lines() {
+        let panel = concat!(
+            r#"<ac:structured-macro ac:name="info"><ac:rich-text-body>"#,
+            "<p>a</p>\n<hr />\n<p>b</p></ac:rich-text-body></ac:structured-macro>",
+        );
+        assert_eq!(
+            storage_of(":::confluence-excerpt\n\n:::confluence-info\na\n\n---\n\nb\n:::\n\n:::\n"),
+            format!(
+                r#"<ac:structured-macro ac:name="excerpt"><ac:rich-text-body>{panel}</ac:rich-text-body></ac:structured-macro>"#
+            )
+        );
+        assert_eq!(
+            storage_of(concat!(
+                ":::confluence-excerpt\nhidden: true\n---\n",
+                "~~~confluence-code\na: 1\n---\ncode\n~~~\n:::\n",
+            )),
+            concat!(
+                r#"<ac:structured-macro ac:name="excerpt"><ac:parameter ac:name="hidden">true</ac:parameter>"#,
+                r#"<ac:rich-text-body><ac:structured-macro ac:name="code"><ac:parameter ac:name="a">1</ac:parameter>"#,
+                "<ac:plain-text-body><![CDATA[code]]></ac:plain-text-body></ac:structured-macro>",
+                "</ac:rich-text-body></ac:structured-macro>",
+            )
+        );
+    }
+
+    #[test]
+    fn task_whose_text_starts_on_the_line_after_its_checkbox_holds_that_text() {
+        for markdown in ["- [ ]  \n  continuation\n", "- [ ]\n  continuation"] {
+            assert_eq!(
+                storage_of(markdown),
+                format!(
+                    "<ac:task-list>{}</ac:task-list>",
+                    task("incomplete", "continuation")
+                ),
+                "{markdown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_below_a_checkbox_alone_on_its_line_are_the_body_of_its_task() {
+        assert_eq!(
+            storage_of("- [x]\n\n  para\n"),
+            format!(
+                "<ac:task-list>{}</ac:task-list>",
+                task("complete", "<p>para</p>")
+            )
+        );
+        assert_eq!(
+            storage_of("- [x]\n\n  - nested\n"),
+            format!(
+                "<ac:task-list>{}</ac:task-list>",
+                task("complete", "<ul>\n<li>nested</li>\n</ul>")
+            )
+        );
+        let storage = format!(
+            "<ac:task-list>{}</ac:task-list>",
+            task("incomplete", "<p>one</p><p>two</p>")
+        );
+        assert_eq!(storage_of(&storage_to_markdown(&storage)), storage);
+    }
+
+    /// How many bytes the parser is given to read a text, for each byte of
+    /// the text.
+    fn bytes_parsed_for_each_byte_of(text: &str, fences: usize) -> f64 {
+        BYTES_PARSED.set(0);
+        assert_eq!(Reading::of(text).fences.len(), fences);
+        BYTES_PARSED.get() as f64 / text.len() as f64
+    }
+
+    #[test]
+    fn reading_inline_storage_fences_takes_work_in_proportion_to_the_text() {
+        let text_with = |fragments: usize| {
+            "before ```confluence-storage\n<ac:x/>\n``` after\n\n".repeat(fragments)
+        };
+        let short = bytes_parsed_for_each_byte_of(&text_with(500), 500);
+        let long = bytes_parsed_for_each_byte_of(&text_with(4000), 4000);
+        // Each byte is parsed eight times as often in eight times the text
+        // when each fence has the whole text read again.
+        assert!(
+            long < short * 3.0,
+            "a byte is parsed {short} times among 500 fences and {long} times among 4000"
+        );
+    }
+
+    /// Texts of up to 24 lines drawn from lines that open, close and
+    /// continue every kind of block.
+    fn texts_of_mixed_lines(count: usize) -> Vec<String> {
+        const LINES: [&str; 42] = [
+            "",
+            "",
+            "text",
+            "text ```confluence-storage",
+            "``` and ```confluence-storage",
+            "| ```confluence-storage",
+            "- ```confluence-storage",
+            "- [ ] ```confluence-storage",
+            "1. ```confluence-storage",
+            ": ```confluence-storage",
+            "[^1]: ```confluence-storage",
+            ">- a ```confluence-storage",
+            "```confluence-storage",
+            "````confluence-storage",
+            "<ac:x/>",
+            "```",
+            "``` after",
+            "````",
+            "```rust",
+            "~~~",
+            "~~~confluence-code",
+            "~~~~confluence-layout-section single",
+            "~~~~",
+            ":::confluence-info",
+            ":::",
+            "- item",
+            "- [ ] task ```confluence-storage",
+            "  continued",
+            "1. numbered",
+            "> quoted",
+            "> ```confluence-storage",
+            "    indented",
+            "| a | b |",
+            "|---|---|",
+            "term",
+            ": definition",
+            "===",
+            "---",
+            "<div>",
+            "</div>",
+            "<pre>",
+            "[^1]: note",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |below: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % below as u64) as usize
+        };
+        (0..count)
+            .map(|_| {
+                let lines = 1 + next(24);
+                (0..lines)
+                    .map(|_| format!("{}\n", LINES[next(LINES.len())]))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn ranges_of(fences: &[InlineStorageFence]) -> Vec<(Range<usize>, Range<usize>)> {
+        fences
+            .iter()
+            .map(|fence| (fence.range.clone(), fence.storage.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn text_reads_the_same_however_far_ahead_it_is_read() {
+        let mut with_fences = 0;
+        for text in &texts_of_mixed_lines(20_000) {
+            let whole = Reading::reading_ahead(text, usize::MAX, 0);
+            with_fences += usize::from(!whole.fences.is_empty());
+            // The whole of the text as it is read, in one stretch.
+            let parsed =
+                LineParser::new(whole.line_count(), usize::MAX).finish(&whole.inert, &whole.starts);
+            assert_eq!(whole.parsed, parsed, "{text:?}");
+            for (lines_ahead, fences_ahead) in [(1, 0), (2, 1), (5, 3), (usize::MAX, 1)] {
+                let reading = Reading::reading_ahead(text, lines_ahead, fences_ahead);
+                let ahead = format!("{lines_ahead} lines and {fences_ahead} fences ahead");
+                assert_eq!(reading.inert, whole.inert, "{ahead}: {text:?}");
+                assert_eq!(reading.parsed, parsed, "{ahead}: {text:?}");
+                assert_eq!(
+                    ranges_of(&reading.fences),
+                    ranges_of(&whole.fences),
+                    "{ahead}: {text:?}"
+                );
+            }
+        }
+        assert!(with_fences > 1000, "{with_fences} texts hold a fence");
+    }
+
+    #[test]
+    fn reading_inline_storage_fences_of_one_paragraph_takes_work_in_proportion_to_it() {
+        let text_with =
+            |fragments: usize| "a ```confluence-storage\n<ac:x/>\n``` ".repeat(fragments) + "\n";
+        let short = bytes_parsed_for_each_byte_of(&text_with(400), 400);
+        let long = bytes_parsed_for_each_byte_of(&text_with(3200), 3200);
+        // Each byte is parsed eight times as often in eight times the text
+        // when each fence has the paragraph read again.
+        assert!(
+            long < short * 3.0,
+            "a byte is parsed {short} times among 400 fences and {long} times among 3200"
+        );
+    }
+
+    #[test]
+    fn empty_line_in_inline_storage_ends_no_list_item() {
+        let markdown = concat!(
+            "- item ```confluence-storage\n<span>\n\nx\n</span>\n``` tail\n\n",
+            "  :::confluence-info\n  body\n  :::\n"
+        );
+        assert!(Reading::of(markdown).blocks().expect("blocks").is_empty());
+        let storage = storage_of(markdown);
+        assert!(storage.starts_with("<ul>\n<li>"), "{storage}");
+        assert!(storage.ends_with("</li>\n</ul>"), "{storage}");
+        assert!(!storage.contains("ac:structured-macro"), "{storage}");
+    }
+
+    #[test]
+    fn block_indented_below_a_definition_is_text_of_the_definition() {
+        let markdown = "Term\n: def\n\n  :::confluence-info\n  body\n  :::\n";
+        assert!(Reading::of(markdown).blocks().expect("blocks").is_empty());
+        let storage = storage_of(markdown);
+        assert!(storage.ends_with("</dd>\n</dl>"), "{storage}");
+        assert!(!storage.contains("ac:structured-macro"), "{storage}");
+    }
+
+    #[test]
+    fn parameter_lines_of_an_indented_block_end_at_an_indented_line_of_dashes() {
+        assert_eq!(
+            storage_of("   :::confluence-excerpt\n   hidden: true\n   ---\n   body\n   :::\n"),
+            storage_of(":::confluence-excerpt\nhidden: true\n---\nbody\n:::\n")
+        );
+        assert_eq!(
+            storage_of("   :::confluence-macro jira\n   key: ABC-1\n   ---\n   body\n   :::\n"),
+            storage_of(":::confluence-macro jira\nkey: ABC-1\n---\nbody\n:::\n")
+        );
+        assert!(
+            storage_of("  :::confluence-excerpt\n  hidden: true\n  ---\n  body\n  :::\n")
+                .contains(r#"<ac:parameter ac:name="hidden">true</ac:parameter>"#)
+        );
+    }
+
+    #[test]
+    fn front_matter_holds_a_line_that_reads_as_the_opening_of_a_storage_fence() {
+        let body = "text\n\n```rust\nfn main() {}\n```\n";
+        let document = format!("---\ntitle: a ```confluence-storage\n---\n\n{body}");
+        assert_eq!(
+            render_markdown_storage(&document, false)
+                .expect("rendered")
+                .storage,
+            storage_of(body)
+        );
+    }
+
+    #[test]
+    fn space_that_does_not_break_after_a_checkbox_alone_is_the_body_of_its_task() {
+        assert_eq!(
+            storage_of("- [x] \u{a0}\n"),
+            format!(
+                "<ac:task-list>{}</ac:task-list>",
+                task("complete", "\u{a0}")
+            )
+        );
+    }
+
+    #[test]
+    fn lines_of_raw_markup_below_a_block_stay_raw_markup() {
+        let info = r#"<ac:structured-macro ac:name="info"><ac:rich-text-body><p>x</p></ac:rich-text-body></ac:structured-macro>"#;
+        assert_eq!(
+            storage_of("<div>\n:::confluence-info\nx\n:::\n<b>bold\n</b></div>\n"),
+            format!("<div>\n{info}\n<b>bold\n</b></div>")
+        );
+        assert_eq!(
+            storage_of("<div>\n:::confluence-info\nx\n:::\n```\n</div>\n"),
+            format!("<div>\n{info}\n```\n</div>")
+        );
+        assert_eq!(
+            storage_of("<div>\n<!--\n:::confluence-info\nx\n:::\n-->\n</div>\n"),
+            format!("<div>\n<!--\n{info}\n-->\n</div>")
+        );
+        assert_eq!(
+            storage_of("<div>\n~~~confluence-noformat\nx\n~~~\n~~~\n</div>\n"),
+            concat!(
+                "<div>\n",
+                r#"<ac:structured-macro ac:name="noformat"><ac:plain-text-body><![CDATA[x]]></ac:plain-text-body></ac:structured-macro>"#,
+                "\n~~~\n</div>"
+            )
+        );
+    }
+
+    #[test]
+    fn space_between_the_tildes_and_the_name_makes_a_code_block_of_markdown() {
+        for name in ["confluence-code py", "confluence-noformat"] {
+            let storage = storage_of(&format!("~~~ {name}\nx\n~~~\n"));
+            assert!(
+                storage.starts_with("<pre><code class=\"language-confluence-"),
+                "{storage}"
+            );
+        }
+        let storage = storage_of("~~~~ confluence-layout-section single\n--- cell ---\nx\n~~~~\n");
+        assert!(storage.starts_with("<pre><code"), "{storage}");
+    }
+
+    #[test]
+    fn block_closed_only_inside_an_open_code_fence_is_refused_naming_the_fence() {
+        let error = render_markdown_storage(":::confluence-info\n```\nopen\n:::\nafter\n", false)
+            .expect_err("the block is not closed");
+        assert_eq!(
+            error.to_string(),
+            "unterminated confluence info block: a code fence inside it has no closing line"
+        );
+        let error = render_markdown_storage(":::confluence-info\ntext\n", false)
+            .expect_err("the block is not closed");
+        assert_eq!(error.to_string(), "unterminated confluence info block");
+    }
+
+    #[test]
+    fn checkbox_indented_as_code_in_a_list_item_is_code() {
+        assert_eq!(
+            storage_of("-     [x]\n"),
+            "<ul>\n<li>\n<pre><code>[x]\n</code></pre>\n</li>\n</ul>"
+        );
+    }
+
+    #[test]
+    fn macro_lines_indented_in_markup_are_fenced_on_pull() {
+        let storage =
+            "<div class=\"example\">\n  :::confluence-info\n  keep this text\n  :::\n</div>";
+        let markdown = storage_to_markdown(storage);
+        assert_eq!(markdown, format!("```confluence-storage\n{storage}\n```"));
+        assert_eq!(storage_of(&markdown), storage);
+    }
+
+    #[test]
+    fn task_without_text_in_a_quote_round_trips() {
+        let storage = format!(
+            "<blockquote><ac:task-list>{}{}</ac:task-list></blockquote>",
+            task("incomplete", ""),
+            task("complete", "done")
+        );
+        let markdown = storage_to_markdown(&storage);
+        assert_eq!(markdown, "> - [ ]\n> - [x] done");
+        assert_eq!(
+            storage_of(&markdown),
+            format!(
+                "<blockquote>\n<ac:task-list>{}{}</ac:task-list>\n</blockquote>",
+                task("incomplete", ""),
+                task("complete", "done")
             )
         );
     }
