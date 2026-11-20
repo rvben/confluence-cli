@@ -4629,20 +4629,44 @@ fn parse_rich_text_macro_block(
 /// body. Without a `---` line the whole block is the body.
 fn split_rich_text_macro_block(block_body: &str) -> (Option<&str>, &str) {
     let trimmed_body = block_body.trim_end_matches('\n');
-    match trimmed_body.split_once("\n---\n") {
+    match split_at_header_end(trimmed_body) {
         Some((header, body_markdown)) => (Some(header), body_markdown),
         None => (None, trimmed_body),
     }
+}
+
+/// The parameter lines of a macro block and what follows the `---` line
+/// that ends them. Nothing follows that line when the body is empty, and
+/// the block then ends with it: a last line of dashes ends the parameter
+/// lines when every line before it is one, and is a rule of the body
+/// otherwise.
+fn split_at_header_end(block_body: &str) -> Option<(&str, &str)> {
+    block_body.split_once("\n---\n").or_else(|| {
+        let header = block_body.strip_suffix("\n---")?;
+        let is_header =
+            !header.is_empty() && header.lines().all(|line| parameter_of(line).is_some());
+        is_header.then(|| (header, &block_body[block_body.len()..]))
+    })
+}
+
+/// The name and the value of a parameter line of a macro block.
+fn parameter_of(line: &str) -> Option<(&str, &str)> {
+    let (name, value) = line.split_once(':')?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| (name, value.trim()))
 }
 
 /// The parameter lines and the Markdown body of a block that has a body
 /// only after a `---` line.
 fn split_generic_macro_block(block_body: &str) -> (&str, Option<&str>) {
     let trimmed_body = block_body.trim_end_matches('\n');
+    if trimmed_body == MACRO_HEADER_END {
+        return ("", Some(&trimmed_body[trimmed_body.len()..]));
+    }
     if let Some(body_markdown) = trimmed_body.strip_prefix("---\n") {
         return ("", Some(body_markdown));
     }
-    match trimmed_body.split_once("\n---\n") {
+    match split_at_header_end(trimmed_body) {
         Some((header, body_markdown)) => (header, Some(body_markdown)),
         None => (trimmed_body, None),
     }
@@ -4669,14 +4693,10 @@ fn parse_macro_parameter_lines(body: &str, context: &str) -> Result<BTreeMap<Str
         if trimmed.is_empty() {
             continue;
         }
-        let Some((name, value)) = trimmed.split_once(':') else {
+        let Some((name, value)) = parameter_of(trimmed) else {
             bail!("invalid {context} header line: {trimmed}");
         };
-        let name = name.trim();
-        if name.is_empty() {
-            bail!("invalid {context} header line: {trimmed}");
-        }
-        parameters.insert(name.to_string(), value.trim().to_string());
+        parameters.insert(name.to_string(), value.to_string());
     }
     Ok(parameters)
 }
@@ -8104,6 +8124,32 @@ SELECT ']]>' AS sentinel;
     }
 
     #[test]
+    fn empty_body_of_a_macro_block_is_a_place_in_the_document() {
+        for (markdown, at) in [
+            (":::confluence-macro sample\n---\n:::\n", 30),
+            (":::confluence-macro sample\na: 1\n---\n:::\n", 35),
+            (":::confluence-excerpt\nhidden: true\n---\n:::\n", 38),
+        ] {
+            let blocks = block_markdown(markdown);
+
+            assert_eq!(blocks.len(), 1, "{markdown:?}");
+            assert_eq!(blocks[0].bodies, vec![at..at], "{markdown:?}");
+        }
+    }
+
+    #[test]
+    fn rule_that_ends_the_body_of_a_macro_is_a_rule() {
+        assert_eq!(
+            storage_of(":::confluence-excerpt\nA paragraph.\n\n---\n:::\n"),
+            concat!(
+                r#"<ac:structured-macro ac:name="excerpt"><ac:rich-text-body>"#,
+                "<p>A paragraph.</p>\n<hr />",
+                "</ac:rich-text-body></ac:structured-macro>",
+            )
+        );
+    }
+
+    #[test]
     fn dashes_inside_a_macro_block_end_no_metadata_block() {
         assert_eq!(
             storage_of("---\n~~~confluence-code\ntitle: example\n---\ncode\n~~~\n"),
@@ -8121,6 +8167,21 @@ SELECT ']]>' AS sentinel;
                 "<ac:rich-text-body><p>body</p></ac:rich-text-body></ac:structured-macro>",
             )
         );
+    }
+
+    #[test]
+    fn macro_with_an_empty_body_keeps_its_parameters_and_its_body() {
+        for storage in [
+            r#"<ac:structured-macro ac:name="info"><ac:parameter ac:name="title">T</ac:parameter><ac:rich-text-body></ac:rich-text-body></ac:structured-macro>"#,
+            r#"<ac:structured-macro ac:name="custom"><ac:parameter ac:name="a">1</ac:parameter><ac:rich-text-body></ac:rich-text-body></ac:structured-macro>"#,
+            r#"<ac:structured-macro ac:name="custom"><ac:rich-text-body></ac:rich-text-body></ac:structured-macro>"#,
+            r#"<ac:structured-macro ac:name="custom"><ac:parameter ac:name="a">1</ac:parameter></ac:structured-macro>"#,
+            r#"<ac:structured-macro ac:name="excerpt"><ac:parameter ac:name="hidden">true</ac:parameter><ac:rich-text-body></ac:rich-text-body></ac:structured-macro>"#,
+        ] {
+            let markdown = storage_to_markdown(storage);
+
+            assert_eq!(storage_of(&markdown), storage, "pulled as {markdown:?}");
+        }
     }
 
     fn storage_of(markdown: &str) -> String {
