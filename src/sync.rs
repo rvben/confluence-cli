@@ -1373,7 +1373,7 @@ impl PulledItem<'_> {
             storage_to_markdown(self.item.body_storage.as_deref().unwrap_or_default());
         markdown = rewrite_page_links(&markdown, self.directory, link_paths, item_map);
         markdown = rewrite_macro_page_placeholders(&markdown, self.directory, link_paths, item_map);
-        rewrite_attachment_links(&markdown, &self.attachments)
+        rewrite_attachment_links(&markdown, &self.item.id, &self.attachments)
     }
 
     fn fetched_page(
@@ -2280,13 +2280,9 @@ fn rewrite_page_links(
         let index = paths.get(address.content_id)?.join("index.md");
         // Another site numbers its pages too. The site of the pull is the
         // one its pages are shown at.
-        if let Some(site) = address.site
-            && !items.values().any(|item| {
-                item.web_url
-                    .as_deref()
-                    .and_then(split_site)
-                    .is_some_and(|(shown_at, _)| shown_at.eq_ignore_ascii_case(site))
-            })
+        if !items
+            .values()
+            .any(|item| address.address.is_on_site_of(item.web_url.as_deref()))
         {
             return None;
         }
@@ -2300,12 +2296,21 @@ fn rewrite_page_links(
             local.push('?');
             local.push_str(&address.query);
         }
-        if let Some(fragment) = address.fragment {
+        if let Some(fragment) = address.address.fragment {
             local.push('#');
             local.push_str(fragment);
         }
         Some(local)
     };
+    rewrite_link_destinations(markdown, local_target)
+}
+
+/// Replaces the destination of each inline link and image that `local_target`
+/// gives a local target for.
+fn rewrite_link_destinations(
+    markdown: &str,
+    local_target: impl Fn(&str) -> Option<String>,
+) -> String {
     let mut rewritten = String::with_capacity(markdown.len());
     let mut rest = 0;
     for link in inline_links(markdown) {
@@ -2320,24 +2325,18 @@ fn rewrite_page_links(
     rewritten
 }
 
-/// The address of a page on a Confluence site, read whole: an address that
-/// goes on after the page, or names it only in passing, is not one.
-struct PageAddress<'a> {
+/// An address on a web site, taken apart. One that names no site starts at
+/// the root of whichever site it is read on.
+struct SiteAddress<'a> {
     /// The host and port, of an address that names its site.
     site: Option<&'a str>,
-    content_id: &'a str,
-    /// The query, without the parameter that names the page.
-    query: String,
+    path: &'a str,
+    query: Option<&'a str>,
     fragment: Option<&'a str>,
 }
 
-impl<'a> PageAddress<'a> {
+impl<'a> SiteAddress<'a> {
     fn parse(address: &'a str) -> Option<Self> {
-        static TITLED: LazyLock<Regex> = LazyLock::new(|| {
-            // The title after the id is for the reader: the id names the page.
-            Regex::new(r"^(?:/[^/]+)*?/spaces/[^/]+/pages/([0-9]+)(?:/[^/]*)?$")
-                .expect("valid page path regex")
-        });
         let (address, fragment) = split_target_fragment(address);
         let (location, query) = match address.split_once('?') {
             Some((location, query)) => (location, Some(query)),
@@ -2348,43 +2347,82 @@ impl<'a> PageAddress<'a> {
             None if location.starts_with('/') && !location.starts_with("//") => (None, location),
             None => return None,
         };
-        if let Some(titled) = TITLED.captures(path) {
+        Some(Self {
+            site,
+            path,
+            query,
+            fragment,
+        })
+    }
+
+    /// Whether the address is on the site that `shown_at` is an address of.
+    /// One that names no site is on any.
+    fn is_on_site_of(&self, shown_at: Option<&str>) -> bool {
+        self.site.is_none_or(|site| {
+            shown_at
+                .and_then(split_site)
+                .is_some_and(|(shown_at, _)| shown_at.eq_ignore_ascii_case(site))
+        })
+    }
+}
+
+/// The address of a page on a Confluence site, read whole: an address that
+/// goes on after the page, or names it only in passing, is not one.
+struct PageAddress<'a> {
+    address: SiteAddress<'a>,
+    content_id: &'a str,
+    /// The query, without the parameter that names the page.
+    query: String,
+}
+
+impl<'a> PageAddress<'a> {
+    fn parse(address: &'a str) -> Option<Self> {
+        static TITLED: LazyLock<Regex> = LazyLock::new(|| {
+            // The title after the id is for the reader: the id names the page.
+            Regex::new(r"^(?:/[^/]+)*?/spaces/[^/]+/pages/([0-9]+)(?:/[^/]*)?$")
+                .expect("valid page path regex")
+        });
+        let address = SiteAddress::parse(address)?;
+        if let Some(titled) = TITLED.captures(address.path) {
             return Some(Self {
-                site,
                 content_id: titled.get(1)?.as_str(),
-                query: query.unwrap_or_default().to_string(),
-                fragment,
+                query: address.query.unwrap_or_default().to_string(),
+                address,
             });
         }
-        if !path.ends_with("/pages/viewpage.action") {
+        if !address.path.ends_with("/pages/viewpage.action") {
             return None;
         }
         let mut content_id = None;
         let mut others = Vec::new();
-        for parameter in query?.split('&') {
+        for parameter in address.query?.split('&') {
             match parameter.strip_prefix("pageId=") {
                 Some(id) if content_id.is_none() => content_id = Some(id),
                 _ => others.push(parameter),
             }
         }
         Some(Self {
-            site,
             content_id: content_id?,
             query: others.join("&"),
-            fragment,
+            address,
         })
     }
 }
 
-/// The host and port of a web address, and what follows them.
+/// The host and port of a web address, and what follows them. The port
+/// that the scheme implies is left out, so a site reads the same with it
+/// and without it.
 fn split_site(address: &str) -> Option<(&str, &str)> {
-    ["http://", "https://"].iter().find_map(|scheme| {
-        let rest = address.get(scheme.len()..)?;
-        if !address[..scheme.len()].eq_ignore_ascii_case(scheme) {
-            return None;
-        }
-        Some(rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len())))
-    })
+    [("http://", ":80"), ("https://", ":443")]
+        .iter()
+        .find_map(|(scheme, implied_port)| {
+            let rest = address.get(scheme.len()..)?;
+            if !address[..scheme.len()].eq_ignore_ascii_case(scheme) {
+                return None;
+            }
+            let (site, rest) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+            Some((site.strip_suffix(implied_port).unwrap_or(site), rest))
+        })
 }
 
 /// A link or an image that Markdown writes inline, as `[label](destination)`.
@@ -2568,23 +2606,10 @@ fn name_user_mentions(markdown: &str, names: &BTreeMap<UserReference, Option<Str
     named
 }
 
-/// Applies a rewrite to the Markdown around raw storage blocks, comments
-/// and links written as inline tags. They hold markup that apply writes
-/// back as it stands, so an address inside them stays as pulled.
-fn rewrite_outside_raw_markup(markdown: &str, rewrite: impl Fn(&str) -> String) -> String {
-    let mut rewritten = String::with_capacity(markdown.len());
-    let mut rest = 0;
-    for raw in raw_markup_ranges(markdown) {
-        rewritten.push_str(&rewrite(&markdown[rest..raw.start]));
-        rewritten.push_str(&markdown[raw.clone()]);
-        rest = raw.end;
-    }
-    rewritten
-}
-
 /// Ranges of the raw storage blocks, the comments and the links written as
 /// inline tags in pulled Markdown, in order, followed by the empty range at
-/// the end of the text.
+/// the end of the text. They hold markup that apply writes back as it
+/// stands, so an address inside them stays as pulled.
 fn raw_markup_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
     static LINK_TAG: LazyLock<Regex> = LazyLock::new(|| {
         // A blank line ends the Markdown block that holds the tag, so a
@@ -2707,27 +2732,95 @@ fn find_item_by_title<'a>(
     })
 }
 
+/// Points the links and images that name an attachment of the page
+/// `content_id` at its local file.
 fn rewrite_attachment_links(
     markdown: &str,
+    content_id: &str,
     attachments: &[crate::model::AttachmentInfo],
 ) -> String {
-    let mut rewritten = markdown.to_string();
-    for attachment in attachments {
+    rewrite_link_destinations(markdown, |destination| {
+        // The address the site lists a file at is that file, whatever the
+        // address looks like.
+        if let Some(listed) = attachments
+            .iter()
+            .find(|attachment| attachment.download_url.as_deref() == Some(destination))
+        {
+            return Some(format!(
+                "attachments/{}",
+                encode_target_segment(&listed.title)
+            ));
+        }
+        let address = AttachmentAddress::parse(destination)?;
+        let attachment = attachments
+            .iter()
+            .find(|attachment| address.names(content_id, attachment))?;
         // The file name is one segment of a link destination, where a
         // literal `%` or space would be read as something else.
-        let replacement = format!("attachments/{}", encode_target_segment(&attachment.title));
-        let escaped = regex::escape(&attachment.title);
-        let re = Regex::new(&format!(r#"download/attachments/[^\s\)]+/{escaped}"#))
-            .expect("valid attachment regex");
-        rewritten = rewrite_outside_raw_markup(&rewritten, |text| {
-            let text = match &attachment.download_url {
-                Some(url) => text.replace(url, &replacement),
-                None => text.to_string(),
-            };
-            re.replace_all(&text, replacement.as_str()).to_string()
+        let mut local = format!("attachments/{}", encode_target_segment(&attachment.title));
+        // The address the site lists the file at carries a query of its
+        // own, which says nothing about the link. Any other query asks for
+        // the file in some way, and apply writes it back.
+        if let Some(query) = address.address.query
+            && !address.is_listed_address_of(attachment)
+        {
+            local.push('?');
+            local.push_str(query);
+        }
+        if let Some(fragment) = address.address.fragment {
+            local.push('#');
+            local.push_str(fragment);
+        }
+        Some(local)
+    })
+}
+
+/// The address a Confluence site downloads an attachment from, read whole.
+struct AttachmentAddress<'a> {
+    address: SiteAddress<'a>,
+    content_id: &'a str,
+    file_name: String,
+}
+
+impl<'a> AttachmentAddress<'a> {
+    fn parse(address: &'a str) -> Option<Self> {
+        static DOWNLOAD: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"^(?:/[^/]+)*?/download/attachments/([0-9]+)/([^/]+)$")
+                .expect("valid attachment path regex")
         });
+        let address = SiteAddress::parse(address)?;
+        let download = DOWNLOAD.captures(address.path)?;
+        Some(Self {
+            content_id: download.get(1)?.as_str(),
+            file_name: urlencoding::decode(download.get(2)?.as_str())
+                .ok()?
+                .into_owned(),
+            address,
+        })
     }
-    rewritten
+
+    /// Whether this is an address of `attachment`, a file of the page
+    /// `content_id`. Another page and another site have files of their own
+    /// under the same name.
+    fn names(&self, content_id: &str, attachment: &crate::model::AttachmentInfo) -> bool {
+        self.content_id == content_id
+            && self.file_name == attachment.title
+            && self
+                .address
+                .is_on_site_of(attachment.download_url.as_deref())
+    }
+
+    /// Whether this is the address the site lists `attachment` at, query
+    /// included.
+    fn is_listed_address_of(&self, attachment: &crate::model::AttachmentInfo) -> bool {
+        attachment
+            .download_url
+            .as_deref()
+            .and_then(SiteAddress::parse)
+            .is_some_and(|listed| {
+                listed.path == self.address.path && listed.query == self.address.query
+            })
+    }
 }
 
 /// Points the parameters of macro blocks that name a page of the pull at
@@ -5945,6 +6038,31 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn port_that_a_scheme_implies_is_the_port_of_an_address_that_names_none() {
+        let on_site = |address: &str, shown_at: &str| {
+            SiteAddress::parse(address)
+                .expect("address")
+                .is_on_site_of(Some(shown_at))
+        };
+
+        assert!(on_site(
+            "https://example.org:443/wiki/x",
+            "https://example.org/wiki"
+        ));
+        assert!(on_site(
+            "https://example.org/wiki/x",
+            "https://EXAMPLE.org:443"
+        ));
+        assert!(on_site("http://example.org/x", "http://example.org:80/"));
+        assert!(!on_site(
+            "https://example.org:8443/x",
+            "https://example.org/"
+        ));
+        assert!(!on_site("http://example.org:443/x", "http://example.org/"));
+        assert!(!on_site("https://example.org:80/x", "https://example.org/"));
+    }
+
+    #[test]
     fn address_on_another_site_is_not_the_address_of_a_pulled_page() {
         let paths = BTreeMap::from([("12".to_string(), PathBuf::from("/tmp/root/short--12"))]);
         let current = PathBuf::from("/tmp/root/current--1");
@@ -5978,6 +6096,120 @@ mod round_trip_tests {
         assert_eq!(
             rewrite("/wiki/spaces/S/pages/12/Short", &unknown_site),
             local
+        );
+    }
+
+    /// An attachment of a page, as the site lists it.
+    fn attachment_at(title: &str, download_url: Option<&str>) -> crate::model::AttachmentInfo {
+        crate::model::AttachmentInfo {
+            id: "att1".to_string(),
+            title: title.to_string(),
+            version: None,
+            media_type: None,
+            file_size: None,
+            download_url: download_url.map(str::to_string),
+            comment: None,
+        }
+    }
+
+    #[test]
+    fn address_of_an_attachment_is_read_whole_and_only_where_markdown_reads_a_link() {
+        let listed =
+            "https://example.atlassian.net/wiki/download/attachments/123/plan.pdf?version=1&api=v2";
+        let attachments = [
+            attachment_at("plan.pdf", Some(listed)),
+            attachment_at(
+                "my file.pdf",
+                Some("https://example.atlassian.net/wiki/download/attachments/123/my%20file.pdf"),
+            ),
+        ];
+        let rewrite = |markdown: &str| rewrite_attachment_links(markdown, "123", &attachments);
+        let with_fragment = format!("{listed}#page=2");
+        for (address, local) in [
+            // The address the site lists the file at is the file.
+            (listed, "attachments/plan.pdf"),
+            (with_fragment.as_str(), "attachments/plan.pdf#page=2"),
+            (
+                "https://example.atlassian.net/wiki/download/attachments/123/plan.pdf",
+                "attachments/plan.pdf",
+            ),
+            (
+                "HTTP://Example.Atlassian.NET/wiki/download/attachments/123/plan.pdf?version=2",
+                "attachments/plan.pdf?version=2",
+            ),
+            (
+                "/wiki/download/attachments/123/plan.pdf",
+                "attachments/plan.pdf",
+            ),
+            (
+                "/download/attachments/123/plan.pdf?download=true#page=2",
+                "attachments/plan.pdf?download=true#page=2",
+            ),
+            (
+                "/wiki/download/attachments/123/my%20file.pdf",
+                "attachments/my%20file.pdf",
+            ),
+        ] {
+            assert_eq!(
+                rewrite(&format!("[a]({address})")),
+                format!("[a]({local})"),
+                "{address}"
+            );
+            assert_eq!(
+                rewrite(&format!("![i]({address})")),
+                format!("![i]({local})"),
+                "{address}"
+            );
+        }
+        for address in [
+            // A file of another page, of another site, or another file.
+            "/wiki/download/attachments/999/plan.pdf",
+            "https://other.example.org/wiki/download/attachments/123/plan.pdf",
+            "https://example.atlassian.net.example.org/wiki/download/attachments/123/plan.pdf",
+            "/wiki/download/attachments/123/plan.pdf.sig",
+            "/wiki/download/attachments/123/old-plan.pdf",
+            "/wiki/download/attachments/123/sub/plan.pdf",
+            "/wiki/download/attachments/123/plan.pdf/more",
+            "/wiki/download/thumbnails/123/plan.pdf",
+            "//example.atlassian.net/wiki/download/attachments/123/plan.pdf",
+            "wiki/download/attachments/123/plan.pdf",
+        ] {
+            let markdown = format!("[a]({address})");
+            assert_eq!(rewrite(&markdown), markdown);
+        }
+        for text in [
+            "`TARGET`",
+            "see TARGET now",
+            "```\n[a](TARGET)\n```\n",
+            "[a]: TARGET\n",
+            ":::confluence-macro custom\nurl: TARGET\n:::\n",
+        ] {
+            for target in [listed, "/wiki/download/attachments/123/plan.pdf"] {
+                let markdown = text.replace("TARGET", target);
+                assert_eq!(rewrite(&markdown), markdown);
+            }
+        }
+    }
+
+    #[test]
+    fn address_of_an_attachment_on_a_site_that_is_not_known_stays_as_pulled() {
+        let attachments = [attachment_at("plan.pdf", None)];
+        let rewrite = |markdown: &str| rewrite_attachment_links(markdown, "123", &attachments);
+        let absolute = "[a](https://example.atlassian.net/wiki/download/attachments/123/plan.pdf)";
+        assert_eq!(rewrite(absolute), absolute);
+        assert_eq!(
+            rewrite("[a](/wiki/download/attachments/123/plan.pdf)"),
+            "[a](attachments/plan.pdf)"
+        );
+    }
+
+    #[test]
+    fn address_the_site_lists_an_attachment_at_is_that_attachment_whatever_its_form() {
+        let listed = "https://example.atlassian.net/wiki/rest/api/content/123/child/attachment/att1/download";
+        let attachments = [attachment_at("plan.pdf", Some(listed))];
+        assert_eq!(
+            rewrite_attachment_links(&format!("[a]({listed})"), "123", &attachments),
+            "[a](attachments/plan.pdf)"
         );
     }
 
@@ -6243,6 +6475,7 @@ mod round_trip_tests {
         let url = "https://example.com/download/attachments/123/budget%2520final.pdf";
         let pulled = rewrite_attachment_links(
             &storage_to_markdown(&format!(r#"<p><a href="{url}">Budget</a></p>"#)),
+            "123",
             &[crate::model::AttachmentInfo {
                 id: "att1".to_string(),
                 title: "budget%20final.pdf".to_string(),
@@ -7609,6 +7842,7 @@ mod round_trip_tests {
         );
         let pulled = rewrite_attachment_links(
             &storage_to_markdown(&storage),
+            "123",
             &[crate::model::AttachmentInfo {
                 id: "att1".to_string(),
                 title: "plan.pdf".to_string(),
