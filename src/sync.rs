@@ -1372,12 +1372,7 @@ impl PulledItem<'_> {
         let mut markdown =
             storage_to_markdown(self.item.body_storage.as_deref().unwrap_or_default());
         markdown = rewrite_page_links(&markdown, self.directory, link_paths, item_map);
-        markdown = rewrite_generic_macro_page_placeholders(
-            &markdown,
-            self.directory,
-            link_paths,
-            item_map,
-        );
+        markdown = rewrite_macro_page_placeholders(&markdown, self.directory, link_paths, item_map);
         rewrite_attachment_links(&markdown, &self.attachments)
     }
 
@@ -1810,22 +1805,7 @@ fn rewrite_macro_page_references(
         output.push_str(lines[index]);
         output.push('\n');
 
-        let macro_mode = match lines[index].trim() {
-            line if line.starts_with(":::confluence-macro ") => {
-                Some(MacroPageReferenceMode::Generic)
-            }
-            ":::confluence-children" => Some(MacroPageReferenceMode::Children),
-            ":::confluence-excerpt-include" => Some(MacroPageReferenceMode::ExcerptInclude),
-            ":::confluence-include-page" => Some(MacroPageReferenceMode::IncludePage),
-            ":::confluence-page-tree" => Some(MacroPageReferenceMode::PageTree),
-            ":::confluence-page-tree-search" => Some(MacroPageReferenceMode::PageTreeSearch),
-            ":::confluence-view-file" => Some(MacroPageReferenceMode::AttachmentPreview),
-            ":::confluence-view-doc" => Some(MacroPageReferenceMode::AttachmentPreview),
-            ":::confluence-view-xls" => Some(MacroPageReferenceMode::AttachmentPreview),
-            ":::confluence-view-ppt" => Some(MacroPageReferenceMode::AttachmentPreview),
-            _ => None,
-        };
-        let Some(macro_mode) = macro_mode else {
+        let Some(macro_mode) = MacroPageReferenceMode::of_block(lines[index]) else {
             index += 1;
             continue;
         };
@@ -1868,6 +1848,38 @@ enum MacroPageReferenceMode {
     AttachmentPreview,
 }
 
+impl MacroPageReferenceMode {
+    /// The mode of the macro block that a line opens, for a macro whose
+    /// parameters can name a page.
+    fn of_block(line: &str) -> Option<Self> {
+        match line.trim() {
+            line if line.starts_with(":::confluence-macro ") => Some(Self::Generic),
+            ":::confluence-children" => Some(Self::Children),
+            ":::confluence-excerpt-include" => Some(Self::ExcerptInclude),
+            ":::confluence-include-page" => Some(Self::IncludePage),
+            ":::confluence-page-tree" => Some(Self::PageTree),
+            ":::confluence-page-tree-search" => Some(Self::PageTreeSearch),
+            ":::confluence-view-file"
+            | ":::confluence-view-doc"
+            | ":::confluence-view-xls"
+            | ":::confluence-view-ppt" => Some(Self::AttachmentPreview),
+            _ => None,
+        }
+    }
+
+    /// The parameter that names a page. A generic macro has none: it marks
+    /// each value that names a page instead.
+    fn page_parameter(self) -> Option<&'static str> {
+        match self {
+            Self::Generic => None,
+            Self::PageTree | Self::PageTreeSearch => Some("root"),
+            Self::Children | Self::ExcerptInclude | Self::IncludePage | Self::AttachmentPreview => {
+                Some("page")
+            }
+        }
+    }
+}
+
 fn rewrite_page_reference_parameter_line(
     line: &str,
     current_dir: &Path,
@@ -1877,20 +1889,13 @@ fn rewrite_page_reference_parameter_line(
     let Some((name, value)) = line.split_once(':') else {
         return line.to_string();
     };
-    if mode == MacroPageReferenceMode::Generic {
+    let Some(expected_parameter) = mode.page_parameter() else {
         return rewrite_generic_macro_page_reference_parameter_line(
             name,
             value,
             current_dir,
             link_index,
         );
-    }
-    let expected_parameter = match mode {
-        MacroPageReferenceMode::Generic => unreachable!("generic mode is handled before matching"),
-        MacroPageReferenceMode::Children => "page",
-        MacroPageReferenceMode::PageTree | MacroPageReferenceMode::PageTreeSearch => "root",
-        MacroPageReferenceMode::AttachmentPreview => "page",
-        MacroPageReferenceMode::ExcerptInclude | MacroPageReferenceMode::IncludePage => "page",
     };
     if name.trim() != expected_parameter {
         return line.to_string();
@@ -2276,27 +2281,149 @@ fn rewrite_page_links(
             remote_links.push((re, replacement.clone()));
         }
     }
-    let placeholder_re =
-        Regex::new(r#"confluence-page://page[^\s\)"]+"#).expect("valid page placeholder regex");
-    rewrite_outside_raw_markup(markdown, |text| {
-        let mut rewritten = text.to_string();
+    let local_target = |destination: &str| {
+        if destination.starts_with("confluence-page://") {
+            // A link pulled without a body keeps its placeholder, which is
+            // what lets apply write it without a body again. So does one
+            // whose placeholder says how the link is displayed.
+            if has_generated_label(destination) || !link_display_attributes(destination).is_empty()
+            {
+                return None;
+            }
+            return resolve_placeholder_to_local_path(destination, current_dir, paths, items);
+        }
+        let mut rewritten = destination.to_string();
         for (re, replacement) in &remote_links {
             rewritten = re.replace_all(&rewritten, replacement.as_str()).to_string();
         }
-        placeholder_re
-            .replace_all(&rewritten, |captures: &regex::Captures<'_>| {
-                let target = captures.get(0).map(|m| m.as_str()).unwrap_or_default();
-                // A link pulled without a body keeps its placeholder, which
-                // is what lets apply write it without a body again. So does
-                // one whose placeholder says how the link is displayed.
-                if has_generated_label(target) || !link_display_attributes(target).is_empty() {
-                    return target.to_string();
+        (rewritten != destination).then_some(rewritten)
+    };
+    let mut rewritten = String::with_capacity(markdown.len());
+    let mut rest = 0;
+    for link in inline_links(markdown) {
+        let Some(local) = local_target(&markdown[link.destination.clone()]) else {
+            continue;
+        };
+        rewritten.push_str(&markdown[rest..link.destination.start]);
+        rewritten.push_str(&local);
+        rest = link.destination.end;
+    }
+    rewritten.push_str(&markdown[rest..]);
+    rewritten
+}
+
+/// A link or an image that Markdown writes inline, as `[label](destination)`.
+struct InlineLink {
+    /// The link, from its opening bracket through its closing parenthesis.
+    range: std::ops::Range<usize>,
+    /// The destination as written, without angle brackets around it.
+    destination: std::ops::Range<usize>,
+}
+
+/// The inline links and images of pulled Markdown, in the order of their
+/// destinations. Only what Markdown reads as one counts: the same characters
+/// in code or in a raw block are text of the page. A Confluence block is
+/// searched where it holds Markdown of its own. A destination written with
+/// an escape or a character reference is not what it reads as, and a link
+/// with one is left out.
+fn inline_links(markdown: &str) -> Vec<InlineLink> {
+    use pulldown_cmark::{Event, LinkType, Tag, TagEnd};
+
+    struct Open<'a> {
+        range: std::ops::Range<usize>,
+        /// Where the label read so far ends.
+        label_end: usize,
+        destination: Option<pulldown_cmark::CowStr<'a>>,
+    }
+
+    let blocks = crate::markdown::block_markdown(markdown);
+    let mut raw = raw_markup_ranges(markdown);
+    raw.extend(blocks.iter().map(|block| block.range.clone()));
+    let mut links = Vec::new();
+    let mut open: Vec<Open<'_>> = Vec::new();
+    for (event, range) in
+        pulldown_cmark::Parser::new_ext(markdown, crate::markdown::markdown_options())
+            .into_offset_iter()
+    {
+        match event {
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            }) => open.push(Open {
+                label_end: range.start + "[".len(),
+                range,
+                destination: (link_type == LinkType::Inline).then_some(dest_url),
+            }),
+            Event::Start(Tag::Image {
+                link_type,
+                dest_url,
+                ..
+            }) => open.push(Open {
+                label_end: range.start + "![".len(),
+                range,
+                destination: (link_type == LinkType::Inline).then_some(dest_url),
+            }),
+            Event::End(TagEnd::Link | TagEnd::Image) => {
+                let Some(link) = open.pop() else { continue };
+                if let Some(outer) = open.last_mut() {
+                    outer.label_end = outer.label_end.max(link.range.end);
                 }
-                resolve_placeholder_to_local_path(target, current_dir, paths, items)
-                    .unwrap_or_else(|| target.to_string())
-            })
-            .to_string()
-    })
+                let destination = link.destination.as_deref().and_then(|destination| {
+                    written_destination(markdown, &link.range, link.label_end, destination)
+                });
+                if let Some(destination) = destination
+                    && !raw
+                        .iter()
+                        .any(|raw| raw.start < link.range.end && link.range.start < raw.end)
+                {
+                    links.push(InlineLink {
+                        range: link.range,
+                        destination,
+                    });
+                }
+            }
+            _ => {
+                if let Some(link) = open.last_mut() {
+                    link.label_end = link.label_end.max(range.end);
+                }
+            }
+        }
+    }
+    for body in blocks.iter().flat_map(|block| &block.bodies) {
+        links.extend(
+            inline_links(&markdown[body.clone()])
+                .into_iter()
+                .map(|link| InlineLink {
+                    range: body.start + link.range.start..body.start + link.range.end,
+                    destination: body.start + link.destination.start
+                        ..body.start + link.destination.end,
+                }),
+        );
+    }
+    links.sort_by_key(|link| link.destination.start);
+    links
+}
+
+/// Where an inline link writes its destination, given where its label ends
+/// and what Markdown reads the destination as. None when the two differ.
+fn written_destination(
+    markdown: &str,
+    link: &std::ops::Range<usize>,
+    label_end: usize,
+    destination: &str,
+) -> Option<std::ops::Range<usize>> {
+    let after_label = markdown.get(label_end..link.end)?.strip_prefix("](")?;
+    let rest = after_label.trim_start();
+    let start = link.end - rest.len();
+    let (start, written) = match rest.strip_prefix('<') {
+        Some(angled) => (start + 1, angled.split('>').next()?),
+        None => (
+            start,
+            rest.strip_suffix(')')?.split(char::is_whitespace).next()?,
+        ),
+    };
+    (written == destination).then(|| start..start + written.len())
 }
 
 /// A mention pulled without a link body, as Markdown writes it: the generated
@@ -2321,44 +2448,11 @@ fn unnamed_mention_user(target: &str) -> Option<UserReference> {
 /// a link counts: the same characters in code or in a raw block are text of
 /// the page. The cells of a layout section hold Markdown of their own.
 fn user_mention_links(markdown: &str) -> Vec<(std::ops::Range<usize>, &str)> {
-    let blocks = crate::markdown::block_markdown(markdown);
-    let mut raw = raw_markup_ranges(markdown);
-    raw.extend(blocks.iter().map(|block| block.range.clone()));
-    let mut links = Vec::new();
-    for (event, range) in
-        pulldown_cmark::Parser::new_ext(markdown, crate::markdown::markdown_options())
-            .into_offset_iter()
-    {
-        match event {
-            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link { dest_url, .. })
-                if dest_url.starts_with("confluence-user://")
-                    && !raw
-                        .iter()
-                        .any(|raw| raw.start < range.end && range.start < raw.end) =>
-            {
-                let Some(target) = USER_MENTION
-                    .captures(&markdown[range.clone()])
-                    .and_then(|captures| captures.get(2))
-                else {
-                    continue;
-                };
-                links.push((
-                    range.clone(),
-                    &markdown[range.start + target.start()..range.start + target.end()],
-                ));
-            }
-            _ => {}
-        }
-    }
-    for body in blocks.iter().flat_map(|block| &block.bodies) {
-        links.extend(
-            user_mention_links(&markdown[body.clone()])
-                .into_iter()
-                .map(|(link, target)| (body.start + link.start..body.start + link.end, target)),
-        );
-    }
-    links.sort_by_key(|(link, _)| link.start);
-    links
+    inline_links(markdown)
+        .into_iter()
+        .filter(|link| USER_MENTION.is_match(&markdown[link.range.clone()]))
+        .map(|link| (link.range, &markdown[link.destination]))
+        .collect()
 }
 
 /// The users mentioned in pulled Markdown whose mention shows an identifier.
@@ -2561,7 +2655,10 @@ fn rewrite_attachment_links(
     rewritten
 }
 
-fn rewrite_generic_macro_page_placeholders(
+/// Points the parameters of macro blocks that name a page of the pull at
+/// its local file, in the macros whose parameters apply reads a local file
+/// from.
+fn rewrite_macro_page_placeholders(
     markdown: &str,
     current_dir: &Path,
     paths: &BTreeMap<String, PathBuf>,
@@ -2575,15 +2672,16 @@ fn rewrite_generic_macro_page_placeholders(
         output.push_str(lines[index]);
         output.push('\n');
 
-        if !lines[index].trim().starts_with(":::confluence-macro ") {
+        let Some(mode) = MacroPageReferenceMode::of_block(lines[index]) else {
             index += 1;
             continue;
-        }
+        };
 
         index += 1;
         while index < lines.len() && lines[index].trim() != ":::" {
-            output.push_str(&rewrite_generic_macro_page_placeholder_line(
+            output.push_str(&rewrite_macro_page_placeholder_line(
                 lines[index],
+                mode,
                 current_dir,
                 paths,
                 items,
@@ -2606,8 +2704,9 @@ fn rewrite_generic_macro_page_placeholders(
     output
 }
 
-fn rewrite_generic_macro_page_placeholder_line(
+fn rewrite_macro_page_placeholder_line(
     line: &str,
+    mode: MacroPageReferenceMode,
     current_dir: &Path,
     paths: &BTreeMap<String, PathBuf>,
     items: &BTreeMap<String, ContentItem>,
@@ -2616,6 +2715,12 @@ fn rewrite_generic_macro_page_placeholder_line(
         return line.to_string();
     };
     let trimmed = value.trim();
+    if let Some(parameter) = mode.page_parameter() {
+        return match resolve_placeholder_to_local_path(trimmed, current_dir, paths, items) {
+            Some(local) if name.trim() == parameter => format!("{}: {local}", name.trim_end()),
+            _ => line.to_string(),
+        };
+    }
     let (prefix, target) = if let Some(target) = trimmed.strip_prefix("!page-link ") {
         ("!page-link", target.trim())
     } else if let Some(target) = trimmed.strip_prefix("!page ") {
@@ -3928,8 +4033,7 @@ mod tests {
             },
         );
 
-        let rewritten =
-            rewrite_generic_macro_page_placeholders(&markdown, &current_dir, &paths, &items);
+        let rewritten = rewrite_macro_page_placeholders(&markdown, &current_dir, &paths, &items);
         assert_eq!(
             rewritten,
             ":::confluence-macro userlister\nsource: !page ../sibling-page--456/index.md\nrelated: !page-link ../sibling-page--456/index.md\n:::\n"
@@ -5578,6 +5682,89 @@ mod round_trip_tests {
             "<div></div><p>a</p>",
         ] {
             assert_keeps(storage);
+        }
+    }
+
+    #[test]
+    fn address_of_a_page_is_rewritten_only_where_markdown_reads_a_link() {
+        let paths = BTreeMap::from([("12".to_string(), PathBuf::from("/tmp/root/short--12"))]);
+        let current = PathBuf::from("/tmp/root/current--1");
+        let rewrite =
+            |markdown: &str| rewrite_page_links(markdown, &current, &paths, &BTreeMap::new());
+        let address = "https://example.atlassian.net/wiki/spaces/S/pages/12/Short";
+        let placeholder = build_page_placeholder_url(&PageLinkPlaceholder {
+            content_id: Some("12".to_string()),
+            ..PageLinkPlaceholder::default()
+        });
+        let local = "../short--12/index.md";
+        for target in [address, placeholder.as_str()] {
+            for text in [
+                "`TARGET`",
+                "`[a](TARGET)`",
+                "see TARGET now",
+                "```\n[a](TARGET)\n```\n",
+                "    [a](TARGET)\n",
+                "\\[a\\](TARGET)",
+                "[a]: TARGET\n",
+                ":::confluence-macro custom\nurl: [a](TARGET)\n:::\n",
+                "~~~confluence-code\n[a](TARGET)\n~~~\n",
+            ] {
+                let markdown = text.replace("TARGET", target);
+                assert_eq!(rewrite(&markdown), markdown);
+            }
+            for text in [
+                "[a](TARGET)",
+                "[a](TARGET \"title\")",
+                "[a]( TARGET 'title' )",
+                "[a](<TARGET>)",
+                "[](TARGET)",
+                "![i](TARGET)",
+                "[![i](i.png)](TARGET)",
+                "[a `]` \\] b](TARGET)",
+                "see [a](TARGET) and [b](TARGET).",
+                "- [a](TARGET)\n",
+                "> [a](TARGET)\n",
+                "| h |\n| --- |\n| [a](TARGET) |\n",
+                ":::confluence-info\n[a](TARGET)\n:::\n",
+                ":::confluence-macro custom\n---\n[a](TARGET)\n:::\n",
+                "~~~~confluence-layout-section single\n--- cell ---\n[a](TARGET)\n~~~~\n",
+            ] {
+                let markdown = text.replace("TARGET", target);
+                assert_eq!(rewrite(&markdown), text.replace("TARGET", local));
+            }
+        }
+    }
+
+    #[test]
+    fn parameter_that_names_a_page_of_the_pull_points_at_its_local_file() {
+        let paths = BTreeMap::from([("12".to_string(), PathBuf::from("/tmp/root/short--12"))]);
+        let current = PathBuf::from("/tmp/root/current--1");
+        let placeholder = build_page_placeholder_url(&PageLinkPlaceholder {
+            content_id: Some("12".to_string()),
+            ..PageLinkPlaceholder::default()
+        });
+        for (text, rewritten) in [
+            (
+                ":::confluence-children\npage: TARGET\nsort: creation\n:::\n",
+                Some(":::confluence-children\npage: ../short--12/index.md\nsort: creation\n:::\n"),
+            ),
+            (
+                ":::confluence-page-tree\nroot: TARGET\n:::\n",
+                Some(":::confluence-page-tree\nroot: ../short--12/index.md\n:::\n"),
+            ),
+            (":::confluence-page-tree\npage: TARGET\n:::\n", None),
+            (":::confluence-children\nsort: TARGET\n:::\n", None),
+            (":::confluence-info\npage: TARGET\n:::\n", None),
+        ] {
+            let markdown = text.replace("TARGET", &placeholder);
+            assert_eq!(
+                rewrite_macro_page_placeholders(&markdown, &current, &paths, &BTreeMap::new()),
+                rewritten.map(str::to_string).unwrap_or(markdown.clone()),
+            );
+            assert_eq!(
+                rewrite_page_links(&markdown, &current, &paths, &BTreeMap::new()),
+                markdown
+            );
         }
     }
 
