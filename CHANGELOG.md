@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.40](https://github.com/rvben/confluence-cli/compare/v0.1.39...v0.1.40) - 2026-11-20
+
+### Fixed
+
+- **sync**: leave addresses inside raw storage blocks as pulled ([cf33617](https://github.com/rvben/confluence-cli/commit/cf3361797c9c38771677c94bb2599c023cb42c2f))
+- **markdown**: keep a link to a page that it does not name ([61b2131](https://github.com/rvben/confluence-cli/commit/61b2131ad6fcbd736f84594ec609b227f3157e47))
+- **markdown**: keep how a link is displayed ([0e0d740](https://github.com/rvben/confluence-cli/commit/0e0d7402183282f29e0474efdf68b645ae73118c))
+- **markdown**: restore Confluence markup when storage is not well formed ([01fb491](https://github.com/rvben/confluence-cli/commit/01fb4913ee8cd54cc3f385617cf9d1446937580d))
+- **markdown**: keep preformatted text that holds a line of backticks ([b15176c](https://github.com/rvben/confluence-cli/commit/b15176cd0b3df2b05b1b8d552f1e0387aa1fd98d))
+- **markdown**: keep raw storage blocks whole on apply ([20e8963](https://github.com/rvben/confluence-cli/commit/20e89637587024ce413b1b158fd19f6c7bd34fda))
+- **markdown**: escape a leading colon that has no space after it ([73a7c26](https://github.com/rvben/confluence-cli/commit/73a7c2635320dc965735711b25412c9c19261dd9))
+- **markdown**: keep the paragraphs of a list item apart ([f2ef33f](https://github.com/rvben/confluence-cli/commit/f2ef33fff197d04ad99445dcd269c21aaaad8a72))
+
 ## [0.1.39](https://github.com/rvben/confluence-cli/compare/v0.1.38...v0.1.39) - 2026-11-19
 
 ### Fixed
