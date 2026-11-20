@@ -366,19 +366,27 @@ fn lines_of_invalid_block(
     reason: &str,
     at_end: bool,
 ) -> Option<(usize, usize)> {
+    // A macro or layout block is one block, whatever its lines read as:
+    // the Markdown up to a line inside it does not convert at all. The
+    // text before it and after it is read apart from its lines.
     let mut blocks = Vec::new();
-    let mut depth = 0usize;
-    for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
-        match event {
-            Event::Start(_) => {
-                if depth == 0 {
-                    blocks.push(range);
-                }
-                depth += 1;
-            }
-            Event::End(_) => depth = depth.saturating_sub(1),
-            _ if depth == 0 => blocks.push(range),
-            _ => {}
+    let mut text_start = 0;
+    let end = markdown.len()..markdown.len();
+    for block in confluence_blocks(markdown)
+        .ok()?
+        .into_iter()
+        .map(|block| block.range)
+        .chain([end])
+    {
+        let text = &markdown[text_start..block.start];
+        blocks.extend(
+            top_level_blocks(text)
+                .into_iter()
+                .map(|range| text_start + range.start..text_start + range.end),
+        );
+        text_start = block.end;
+        if !block.is_empty() {
+            blocks.push(block);
         }
     }
     let invalid_through = |block: &Range<usize>| {
@@ -412,6 +420,27 @@ fn lines_of_invalid_block(
     let text = &markdown[block.clone()];
     let last = block.start + text.trim_end().len();
     Some((line_of(block.start), line_of(last)))
+}
+
+/// Where each block that Markdown text holds at its top level starts and
+/// ends.
+fn top_level_blocks(markdown: &str) -> Vec<Range<usize>> {
+    let mut blocks = Vec::new();
+    let mut depth = 0usize;
+    for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
+        match event {
+            Event::Start(_) => {
+                if depth == 0 {
+                    blocks.push(range);
+                }
+                depth += 1;
+            }
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ if depth == 0 => blocks.push(range),
+            _ => {}
+        }
+    }
+    blocks
 }
 
 /// Render a diagnostic artifact even if its embedded storage XML is malformed.
@@ -5603,6 +5632,30 @@ mod tests {
     }
 
     #[test]
+    fn invalid_text_on_the_lines_next_to_a_macro_block_is_named_by_its_own_lines() {
+        for (markdown, line) in [
+            ("first\n\n<b>open\n:::confluence-info\nx\n:::\n\nlast\n", 3),
+            ("first\n\n:::confluence-info\nx\n:::\n<b>open\n", 6),
+            ("first\n\n:::confluence-info\nx\n:::\n<b>open\n\nlast\n", 6),
+            (
+                "first\n:::confluence-info\nx\n:::\n<b>open\n:::confluence-note\ny\n:::\nlast\n",
+                5,
+            ),
+        ] {
+            let error = conversion_error(markdown);
+            let details = error.details.as_ref().expect("details");
+            assert_eq!(
+                details["markdown_start_line"], line,
+                "{markdown:?}: {details}"
+            );
+            assert_eq!(
+                details["markdown_end_line"], line,
+                "{markdown:?}: {details}"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_conversion_names_the_markdown_line_of_the_tag_left_open() {
         let error = conversion_error(
             "# Title\n\nA first paragraph\nof two lines.\n\nUse the <medallion> architecture.\n\nA last paragraph.\n",
@@ -5671,6 +5724,19 @@ mod tests {
             "{}",
             error.message
         );
+    }
+
+    #[test]
+    fn invalid_conversion_names_the_macro_block_that_holds_what_breaks_it() {
+        for broken in ["An <b>open tag.", "```confluence-storage\n<p></wrong>\n```"] {
+            let error = conversion_error(&format!(
+                "Intro.\n\n:::confluence-info\nfirst\n\n{broken}\n\nlast\n:::\n\nOutro.\n\n:::confluence-note\nfine\n:::\n"
+            ));
+            let details = error.details.as_ref().expect("details");
+            let last = 8 + broken.lines().count();
+            assert_eq!(details["markdown_start_line"], 3, "{details}");
+            assert_eq!(details["markdown_end_line"], last, "{details}");
+        }
     }
 
     #[test]
