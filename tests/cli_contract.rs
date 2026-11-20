@@ -721,6 +721,44 @@ fn offline_conversion_writes_placeholder_links_as_apply_writes_them() {
 }
 
 #[test]
+fn conversion_error_names_the_markdown_line_that_breaks_the_storage() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("page.md");
+    std::fs::write(
+        &source,
+        "Intro\n\nUse the <medallion> architecture.\n\nOutro\n",
+    )
+    .unwrap();
+    let output = confluence(&[
+        "convert",
+        "--body-file",
+        source.to_str().unwrap(),
+        "--output-file",
+        root.path().join("generated.xml").to_str().unwrap(),
+        "-o",
+        "json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    let details = &error["error"]["details"];
+    assert_eq!(details["markdown_start_line"], 3, "{error}");
+    assert_eq!(details["markdown_end_line"], 3, "{error}");
+    assert_eq!(details["reason"], "expected 'medallion' tag, not 'p'");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Markdown line 3"),
+        "{error}"
+    );
+}
+
+#[test]
 fn conversion_retains_invalid_xml_for_inspection_even_inside_nested_macros() {
     for markdown in [
         "```confluence-storage\n<p></wrong>\n```",
@@ -757,6 +795,38 @@ fn conversion_retains_invalid_xml_for_inspection_even_inside_nested_macros() {
                 .contains("<p></wrong>")
         );
     }
+}
+
+#[test]
+fn conversion_refuses_a_body_that_validation_refuses() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("page.md");
+    let artifact = root.path().join("generated.xml");
+    let link = r#"<a href="confluence-user://user?username=ada" bad>Ada</a>"#;
+    std::fs::write(
+        &source,
+        format!("Text\n\n```confluence-storage\n<p>{link}</p>\n```\n"),
+    )
+    .unwrap();
+    let validated = confluence(&["validate", "--body-file", source.to_str().unwrap()]);
+    assert_eq!(validated.status.code(), Some(2));
+    let converted = confluence(&[
+        "convert",
+        "--body-file",
+        source.to_str().unwrap(),
+        "--output-file",
+        artifact.to_str().unwrap(),
+        "-o",
+        "json",
+    ]);
+    assert_eq!(converted.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&converted.stderr).unwrap();
+    assert_eq!(error["error"]["details"]["artifact_saved"], true);
+    assert_eq!(error["error"]["details"]["markdown_start_line"], 3);
+    assert!(
+        std::fs::read_to_string(&artifact).unwrap().contains(link),
+        "the artifact is the storage the reported line and column refer to"
+    );
 }
 
 #[test]

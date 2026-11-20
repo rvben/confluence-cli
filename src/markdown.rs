@@ -270,9 +270,142 @@ fn confluence_element_ranges(storage: &str) -> Vec<Range<usize>> {
 }
 
 pub fn markdown_to_storage(markdown: &str, allow_lossy: bool) -> Result<ConversionOutput> {
+    markdown_to_storage_in_file(markdown, allow_lossy, Some(0))
+}
+
+/// Converts Markdown that follows `lines_before` lines of its file, so that
+/// an invalid body is reported with the lines of that file. Without a known
+/// number of lines, no Markdown lines are reported.
+pub(crate) fn markdown_to_storage_in_file(
+    markdown: &str,
+    allow_lossy: bool,
+    lines_before: Option<usize>,
+) -> Result<ConversionOutput> {
     let converted = render_markdown_storage(markdown, allow_lossy)?;
-    crate::storage::validate_generated_storage(&converted.storage)?;
+    validate_converted_markdown(&converted.storage, markdown, allow_lossy, lines_before)?;
     Ok(converted)
+}
+
+/// Validates the storage `markdown` converts to. An invalid body is reported
+/// with the lines of the Markdown block at which it goes wrong, counted from
+/// one after `lines_before` lines.
+pub(crate) fn validate_converted_markdown(
+    storage: &str,
+    markdown: &str,
+    allow_lossy: bool,
+    lines_before: Option<usize>,
+) -> Result<()> {
+    crate::storage::validate_generated_storage(storage).map_err(|error| {
+        let mut error = match error.downcast::<crate::output::CliError>() {
+            Ok(error) => error,
+            Err(error) => return error,
+        };
+        let lines = lines_before.and_then(|lines_before| {
+            let details = error.details.as_ref()?;
+            let reason = details.get("reason")?.as_str()?;
+            let (end_line, end_column) = crate::storage::end_line_and_column(storage);
+            let at_end = details.get("line")?.as_u64()? == u64::from(end_line)
+                && details.get("column")?.as_u64()? == u64::from(end_column);
+            let (first, last) = lines_of_invalid_block(markdown, allow_lossy, reason, at_end)?;
+            Some((lines_before + first, lines_before + last))
+        });
+        if let Some((first, last)) = lines {
+            let lines = if first == last {
+                format!("Markdown line {first}")
+            } else {
+                format!("Markdown lines {first}-{last}")
+            };
+            if let Some(details) = &error.details {
+                error.message = format!(
+                    "invalid storage generated from {lines}: {} (line {}, column {} of the generated storage)",
+                    details["reason"].as_str().unwrap_or_default(),
+                    details["line"],
+                    details["column"],
+                );
+            }
+            error.hint = Some("Check raw HTML and confluence-storage blocks in the named Markdown lines. The other line and column refer to the generated storage XML. --allow-lossy does not permit malformed XML.".to_string());
+            if let Some(details) = &mut error.details {
+                details["markdown_start_line"] = serde_json::json!(first);
+                details["markdown_end_line"] = serde_json::json!(last);
+            }
+        }
+        error.into()
+    })
+}
+
+/// How many conversions of the whole Markdown the search for a block left
+/// open may cost before it names no block.
+const END_SEARCH_CONVERSIONS: usize = 64;
+
+/// The first and last line, counted from one, of the top-level block of
+/// `markdown` with which the converted storage becomes invalid for `reason`
+/// and stays so: the storage of the Markdown up to that block and up to every
+/// later block is invalid for the same reason, and the storage of the
+/// Markdown before it is not.
+///
+/// `at_end` says that the storage is invalid where it ends, which is how an
+/// element that is never closed is reported. Markup left open in one block
+/// and closed in a later one leaves the storage open for the blocks between
+/// them only, so the block named is the one after the last block up to which
+/// nothing is open, whichever element the storage up to a block in between
+/// reports. Finding it converts the Markdown up to each block from the last
+/// one back.
+/// That work is bounded to `END_SEARCH_CONVERSIONS` conversions of the whole
+/// Markdown, beyond which no block is named. Any other reason stays once the
+/// block that holds its cause is reached, and a search by halves finds that
+/// block.
+fn lines_of_invalid_block(
+    markdown: &str,
+    allow_lossy: bool,
+    reason: &str,
+    at_end: bool,
+) -> Option<(usize, usize)> {
+    let mut blocks = Vec::new();
+    let mut depth = 0usize;
+    for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
+        match event {
+            Event::Start(_) => {
+                if depth == 0 {
+                    blocks.push(range);
+                }
+                depth += 1;
+            }
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ if depth == 0 => blocks.push(range),
+            _ => {}
+        }
+    }
+    let invalid_through = |block: &Range<usize>| {
+        render_markdown_storage(&markdown[..block.end], allow_lossy)
+            .ok()
+            .and_then(|converted| crate::storage::invalid_reason(&converted.storage))
+            .as_deref()
+            == Some(reason)
+    };
+    let valid_blocks = if at_end {
+        let mut converted_bytes = 0;
+        let mut valid_blocks = 0;
+        for (index, block) in blocks.iter().enumerate().rev() {
+            converted_bytes += block.end;
+            if converted_bytes > END_SEARCH_CONVERSIONS * markdown.len() {
+                return None;
+            }
+            let open_through = render_markdown_storage(&markdown[..block.end], allow_lossy)
+                .is_ok_and(|converted| crate::storage::is_invalid_at_end(&converted.storage));
+            if !open_through {
+                valid_blocks = index + 1;
+                break;
+            }
+        }
+        valid_blocks
+    } else {
+        blocks.partition_point(|block| !invalid_through(block))
+    };
+    let block = blocks.get(valid_blocks)?.clone();
+    let line_of = |offset: usize| markdown[..offset].matches('\n').count() + 1;
+    let text = &markdown[block.clone()];
+    let last = block.start + text.trim_end().len();
+    Some((line_of(block.start), line_of(last)))
 }
 
 /// Render a diagnostic artifact even if its embedded storage XML is malformed.
@@ -4797,6 +4930,117 @@ pub fn scan_local_documents(root: &Path) -> Result<Vec<LocalContentIndex>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conversion_error(markdown: &str) -> crate::output::CliError {
+        markdown_to_storage(markdown, false)
+            .expect_err("Markdown that does not convert")
+            .downcast::<crate::output::CliError>()
+            .expect("conversion error")
+    }
+
+    #[test]
+    fn invalid_conversion_names_the_markdown_line_of_the_tag_left_open() {
+        let error = conversion_error(
+            "# Title\n\nA first paragraph\nof two lines.\n\nUse the <medallion> architecture.\n\nA last paragraph.\n",
+        );
+        let details = error.details.as_ref().expect("details");
+        assert_eq!(details["markdown_start_line"], 6, "{details}");
+        assert_eq!(details["markdown_end_line"], 6, "{details}");
+        assert_eq!(details["reason"], "expected 'medallion' tag, not 'p'");
+        assert_eq!(
+            error.message,
+            "invalid storage generated from Markdown line 6: expected 'medallion' tag, not 'p' (line 4, column 37 of the generated storage)"
+        );
+    }
+
+    #[test]
+    fn invalid_conversion_names_the_block_left_open_not_an_earlier_one_that_is_closed() {
+        let markdown = "<div>\n\nfirst\n\n</div>\n\ntext\n\n<div>\n\nsecond\n";
+        let error = markdown_to_storage(markdown, false).expect_err("a div is left open");
+        let error = error
+            .downcast::<crate::output::CliError>()
+            .expect("typed error");
+        let details = error.details.expect("details");
+        assert_eq!(details["markdown_start_line"], 9, "{}", error.message);
+        assert_eq!(details["markdown_end_line"], 9, "{}", error.message);
+    }
+
+    #[test]
+    fn invalid_conversion_names_no_block_when_finding_it_costs_too_much() {
+        let details_of = |paragraphs: usize| {
+            let markdown = format!("<div>\n\n{}", "text\n\n".repeat(paragraphs));
+            let error = markdown_to_storage(&markdown, false).expect_err("a div is left open");
+            let error = error
+                .downcast::<crate::output::CliError>()
+                .expect("typed error");
+            error.details.expect("details")
+        };
+
+        let near = details_of(50);
+        assert_eq!(near["markdown_start_line"], 1, "{near}");
+
+        let far = details_of(400);
+        assert!(far.get("markdown_start_line").is_none(), "{far}");
+        assert!(far.get("line").is_some(), "{far}");
+    }
+
+    #[test]
+    fn invalid_conversion_names_every_line_of_the_block_that_breaks_it() {
+        let error = conversion_error("Intro.\n\n- one\n- two <b>bold\n- three\n\nOutro.\n");
+        let details = error.details.as_ref().expect("details");
+        assert_eq!(details["markdown_start_line"], 3, "{details}");
+        assert_eq!(details["markdown_end_line"], 5, "{details}");
+        assert!(
+            error.message.contains("Markdown lines 3-5"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn invalid_conversion_names_the_block_left_open_around_one_that_is_closed() {
+        let markdown = "<div>\n\n<section>\n\nx\n\n</section>\n";
+        let error = markdown_to_storage(markdown, false).expect_err("a div is left open");
+        let error = error
+            .downcast::<crate::output::CliError>()
+            .expect("typed error");
+        let details = error.details.expect("details");
+        assert_eq!(details["markdown_start_line"], 1, "{}", error.message);
+        assert_eq!(details["markdown_end_line"], 1, "{}", error.message);
+    }
+
+    #[test]
+    fn invalid_conversion_names_the_storage_block_that_is_not_well_formed() {
+        let error =
+            conversion_error("Intro.\n\n```confluence-storage\n<p></wrong>\n```\n\nOutro.\n");
+        let details = error.details.as_ref().expect("details");
+        assert_eq!(details["markdown_start_line"], 3, "{details}");
+        assert_eq!(details["markdown_end_line"], 5, "{details}");
+    }
+
+    #[test]
+    fn markdown_lines_count_from_the_start_of_the_file_that_holds_the_body() {
+        let error = markdown_to_storage_in_file("Fine.\n\nAn <open> tag.\n", false, Some(7))
+            .expect_err("Markdown that does not convert")
+            .downcast::<crate::output::CliError>()
+            .expect("conversion error");
+        assert_eq!(error.details.expect("details")["markdown_start_line"], 10);
+    }
+
+    #[test]
+    fn invalid_conversion_without_a_known_file_position_names_no_markdown_line() {
+        let error = markdown_to_storage_in_file("An <open> tag.\n", false, None)
+            .expect_err("Markdown that does not convert")
+            .downcast::<crate::output::CliError>()
+            .expect("conversion error");
+        let details = error.details.expect("details");
+        assert!(details.get("markdown_start_line").is_none(), "{details}");
+        assert!(
+            !error.message.contains("Markdown line"),
+            "{}",
+            error.message
+        );
+    }
 
     #[test]
     fn remote_content_ids_cannot_escape_document_directory_names() {

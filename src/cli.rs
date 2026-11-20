@@ -122,7 +122,7 @@ enum Commands {
     Validate(BodyInput),
     /// Save a body's storage XML locally for inspection, then validate it
     #[command(
-        after_help = "No credentials or API requests are needed. If XML validation fails, the saved artifact is retained and the command exits 2; inspect its reported line and column. Existing output files are preserved unless --force is passed.\n\nExamples:\n  confluence convert --body-file page.md --output-file generated.xml\n  confluence convert --body-file - --output-file generated.xml -o json"
+        after_help = "No credentials or API requests are needed. If XML validation fails, the saved artifact is retained and the command exits 2; the error names the Markdown lines that break it, and the line and column of the saved storage. Existing output files are preserved unless --force is passed.\n\nExamples:\n  confluence convert --body-file page.md --output-file generated.xml\n  confluence convert --body-file - --output-file generated.xml -o json"
     )]
     Convert(ConvertArgs),
     /// Print a known-good Confluence storage macro template without API requests
@@ -2622,11 +2622,28 @@ fn handle_convert(args: ConvertArgs, output: OutputFormat) -> Result<()> {
         ));
     }
     let raw = read_body_text(&args.body)?;
-    let storage = match args.body.format {
-        BodyFormat::Markdown => crate::sync::resolve_placeholder_links(
-            &crate::markdown::render_markdown_storage(&raw, args.body.allow_lossy)?.storage,
-        ),
-        BodyFormat::Storage => raw,
+    // The artifact is what a write would send. A body that is invalid before
+    // its placeholder links resolve is saved as converted, since a write
+    // refuses it there.
+    let (storage, validation) = match args.body.format {
+        BodyFormat::Markdown => {
+            let converted =
+                crate::markdown::render_markdown_storage(&raw, args.body.allow_lossy)?.storage;
+            match crate::markdown::validate_converted_markdown(
+                &converted,
+                &raw,
+                args.body.allow_lossy,
+                Some(0),
+            ) {
+                Ok(()) => {
+                    let resolved = crate::sync::resolve_placeholder_links(&converted);
+                    let validation = crate::storage::validate_generated_storage(&resolved);
+                    (resolved, validation)
+                }
+                Err(error) => (converted, Err(error)),
+            }
+        }
+        BodyFormat::Storage => (raw.clone(), crate::storage::validate_storage(&raw)),
     };
     let parent = args
         .output_file
@@ -2657,10 +2674,6 @@ fn handle_convert(args: ConvertArgs, output: OutputFormat) -> Result<()> {
             "Choose a writable output path whose parent directory exists.",
         )
     })?;
-    let validation = match args.body.format {
-        BodyFormat::Markdown => crate::storage::validate_generated_storage(&storage),
-        BodyFormat::Storage => crate::storage::validate_storage(&storage),
-    };
     let validation =
         validation.map_err(|error| match error.downcast::<crate::output::CliError>() {
             Ok(mut error) => {

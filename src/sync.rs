@@ -15,10 +15,10 @@ use crate::markdown::{
     Frontmatter, LocalDocument, PageLinkPlaceholder, Sidecar, UserMentionPlaceholder,
     build_page_placeholder_url, build_storage_link_body, decode_character_references,
     document_dir_name, encode_target_segment, has_generated_label, is_local_target,
-    link_body_unless_default, link_display_attributes, load_document, markdown_to_storage,
-    parse_page_placeholder_url, parse_status_placeholder_url, parse_user_placeholder_url,
-    rewrite_outside_cdata, rewrite_outside_literal_sections, save_document, scan_local_documents,
-    sha256_hex, split_target_fragment, storage_to_markdown,
+    link_body_unless_default, link_display_attributes, load_document, parse_page_placeholder_url,
+    parse_status_placeholder_url, parse_user_placeholder_url, rewrite_outside_cdata,
+    rewrite_outside_literal_sections, save_document, scan_local_documents, sha256_hex,
+    split_target_fragment, storage_to_markdown,
 };
 use crate::model::{AttachmentState, ContentItem, ContentKind, PlanActionKind, PlanItem, SyncPlan};
 use crate::provider::ConfluenceProvider;
@@ -1268,11 +1268,20 @@ fn stamp_storage_hashes(
     let mut stamped = Vec::with_capacity(fetched.len());
     let mut failures = Vec::new();
     for mut page in fetched {
-        match render_body_storage(
+        let generated = crate::markdown::render_document(
+            &page.document.frontmatter,
+            &page.document.body_markdown,
+        )
+        .ok();
+        let lines_before = generated
+            .as_deref()
+            .and_then(|file| lines_before_body(file, &page.document.body_markdown));
+        match render_storage_of_body(
             &page.document,
             &link_index,
             false,
             effective_web_path_prefix(&page.document.sidecar, None),
+            lines_before,
         ) {
             Ok(storage) => {
                 let sidecar = &mut page.document.sidecar;
@@ -1436,15 +1445,52 @@ fn build_link_index<'a>(docs: impl IntoIterator<Item = &'a LocalDocument>) -> Li
     index
 }
 
+/// The storage a document on disk converts to. A body that does not convert
+/// is reported with the document's file and the lines of that file.
 fn render_body_storage(
     doc: &LocalDocument,
     link_index: &LinkIndex,
     allow_lossy: bool,
     web_path_prefix: impl AsRef<str>,
 ) -> Result<String> {
+    let file = fs::read_to_string(&doc.markdown_path).ok();
+    let lines_before = file
+        .as_deref()
+        .and_then(|file| lines_before_body(file, &doc.body_markdown));
+    render_storage_of_body(doc, link_index, allow_lossy, web_path_prefix, lines_before).map_err(
+        |error| {
+            let path = doc.markdown_path.display().to_string();
+            let mut error = match error.downcast::<crate::output::CliError>() {
+                Ok(error) => error,
+                Err(error) => return error.context(path),
+            };
+            error.message = format!("{path}: {}", error.message);
+            match &mut error.details {
+                Some(details) if details.is_object() => details["path"] = serde_json::json!(path),
+                Some(_) => {}
+                None => error.details = Some(serde_json::json!({ "path": path })),
+            }
+            error.into()
+        },
+    )
+}
+
+/// The storage a document's body converts to, with the body's Markdown
+/// following `lines_before` lines of the file an error names lines of.
+fn render_storage_of_body(
+    doc: &LocalDocument,
+    link_index: &LinkIndex,
+    allow_lossy: bool,
+    web_path_prefix: impl AsRef<str>,
+    lines_before: Option<usize>,
+) -> Result<String> {
     let rewritten_markdown =
         rewrite_macro_page_references(&doc.body_markdown, &doc.directory, link_index);
-    let converted = markdown_to_storage(&rewritten_markdown, allow_lossy)?;
+    let converted = crate::markdown::markdown_to_storage_in_file(
+        &rewritten_markdown,
+        allow_lossy,
+        lines_before,
+    )?;
     let storage = rewrite_local_links_to_remote(
         &converted.storage,
         &doc.directory,
@@ -1453,6 +1499,17 @@ fn render_body_storage(
     );
     crate::storage::validate_generated_storage(&storage)?;
     Ok(storage)
+}
+
+/// The number of lines of `file` that precede the first line of `body`, when
+/// the file ends with that body.
+fn lines_before_body(file: &str, body: &str) -> Option<usize> {
+    let before = file.trim_end().strip_suffix(body.trim())?;
+    let leading = &body[..body.len() - body.trim_start().len()];
+    before
+        .matches('\n')
+        .count()
+        .checked_sub(leading.matches('\n').count())
 }
 
 fn rewrite_macro_page_references(
@@ -2408,6 +2465,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::markdown::markdown_to_storage;
     use crate::markdown::{
         Frontmatter, PageLinkPlaceholder, Sidecar, StatusMacroPlaceholder, UserMentionPlaceholder,
         build_page_placeholder_url, build_status_placeholder_url, build_user_placeholder_url,
@@ -2510,6 +2568,61 @@ mod tests {
         assert_eq!(
             plan.items[0].details,
             "changed: body, markdown; also rewrites markup of this page that Markdown does not carry as it is stored"
+        );
+    }
+
+    #[test]
+    fn plan_names_the_file_and_line_of_markdown_that_does_not_convert() {
+        let dir = tempdir().expect("tempdir");
+        let page_dir = write_clean_managed_document(dir.path(), "# Root");
+        let markdown_path = page_dir.join("index.md");
+        let edited = fs::read_to_string(&markdown_path)
+            .expect("read markdown")
+            .replace("# Root", "# Root\n\nUse the <medallion> architecture.");
+        fs::write(&markdown_path, &edited).expect("edit markdown");
+        let line = edited
+            .lines()
+            .position(|line| line.contains("<medallion>"))
+            .expect("edited line")
+            + 1;
+
+        let error = plan_path(dir.path(), false, false, false)
+            .expect_err("plan of Markdown that does not convert")
+            .downcast::<crate::output::CliError>()
+            .expect("conversion error");
+        let details = error.details.as_ref().expect("details");
+        assert_eq!(details["path"], markdown_path.display().to_string());
+        assert_eq!(details["markdown_start_line"], line, "{details}");
+        assert_eq!(details["markdown_end_line"], line, "{details}");
+        assert!(
+            error.message.starts_with(&format!(
+                "{}: invalid storage generated from Markdown line {line}: expected 'medallion' tag, not 'p'",
+                markdown_path.display()
+            )),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn plan_names_the_file_of_a_macro_block_that_does_not_convert() {
+        let dir = tempdir().expect("tempdir");
+        let page_dir = write_clean_managed_document(dir.path(), "# Root");
+        let markdown_path = page_dir.join("index.md");
+        let edited = fs::read_to_string(&markdown_path)
+            .expect("read markdown")
+            .replace(
+                "# Root",
+                "# Root\n\n:::confluence-macro name=info\nnever closed\n",
+            );
+        fs::write(&markdown_path, &edited).expect("edit markdown");
+
+        let error = plan_path(dir.path(), false, false, false)
+            .expect_err("plan of a macro block that is not closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with(&format!("{}: ", markdown_path.display())),
+            "{message}"
         );
     }
 

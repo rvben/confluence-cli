@@ -368,6 +368,7 @@ fn write_canonical_text(node: Node<'_, '_>, preformatted: bool, out: &mut String
 }
 
 /// Coordinates here refer to converted storage, not to the Markdown source.
+/// `validate_converted_markdown` also names the Markdown lines.
 pub(crate) fn validate_generated_storage(storage: &str) -> Result<()> {
     validate_storage(storage).map_err(|error| match error.downcast::<crate::output::CliError>() {
         Ok(mut error) => {
@@ -380,6 +381,13 @@ pub(crate) fn validate_generated_storage(storage: &str) -> Result<()> {
         }
         Err(error) => error,
     })
+}
+
+/// The line and column, counted from one, just past the end of `storage`,
+/// which is where an element that is never closed is reported.
+pub(crate) fn end_line_and_column(storage: &str) -> (u32, u32) {
+    let end = end_position(storage);
+    (end.row, end.col)
 }
 
 fn end_position(storage: &str) -> TextPos {
@@ -409,8 +417,31 @@ fn invalid_storage(position: TextPos, reason: &str) -> anyhow::Error {
         ErrorKind::InvalidInput,
         format!("invalid Confluence storage body at line {}, column {}: {reason}", position.row, position.col),
         Some("Fix the storage XML locally before retrying. Check closing tags, macro body types, CDATA terminators, and escaped text. Use --format markdown for Markdown input.".to_string()),
-        json!({"line": position.row, "column": position.col}),
+        json!({"line": position.row, "column": position.col, "reason": reason}),
     )
+}
+
+/// Whether a storage body is invalid where it ends, which is how an element
+/// that is never closed is reported.
+pub(crate) fn is_invalid_at_end(storage: &str) -> bool {
+    let Err(error) = validate_storage(storage) else {
+        return false;
+    };
+    let (line, column) = end_line_and_column(storage);
+    error
+        .downcast_ref::<crate::output::CliError>()
+        .and_then(|error| error.details.as_ref())
+        .is_some_and(|details| {
+            details["line"].as_u64() == Some(u64::from(line))
+                && details["column"].as_u64() == Some(u64::from(column))
+        })
+}
+
+/// Why a storage body is invalid, without where.
+pub(crate) fn invalid_reason(storage: &str) -> Option<String> {
+    let error = validate_storage(storage).err()?;
+    let error = error.downcast_ref::<crate::output::CliError>()?;
+    Some(error.details.as_ref()?.get("reason")?.as_str()?.to_string())
 }
 
 #[cfg(test)]
@@ -474,7 +505,7 @@ mod tests {
         let error = error.downcast_ref::<crate::output::CliError>().unwrap();
         assert_eq!(
             error.details.as_ref().unwrap(),
-            &json!({"line": 2, "column": 4})
+            &json!({"line": 2, "column": 4, "reason": "expected 'p' tag, not 'wrong'"})
         );
         let error = validate_storage("<p><![CDATA[broken").unwrap_err();
         let error = error.downcast_ref::<crate::output::CliError>().unwrap();
@@ -702,9 +733,10 @@ mod tests {
         ] {
             let error = validate_storage(body).unwrap_err();
             let error = error.downcast_ref::<crate::output::CliError>().unwrap();
+            let details = error.details.as_ref().unwrap();
             assert_eq!(
-                error.details.as_ref().unwrap(),
-                &json!({"line": line, "column": column}),
+                (&details["line"], &details["column"]),
+                (&json!(line), &json!(column)),
                 "{body}"
             );
         }
