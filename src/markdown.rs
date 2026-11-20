@@ -523,6 +523,13 @@ impl StorageFragments {
     }
 }
 
+/// Whether a line is a list item that is a checkbox and nothing else.
+fn is_empty_task_line(line: &str) -> bool {
+    line.trim()
+        .strip_prefix(['-', '*', '+'])
+        .is_some_and(|checkbox| matches!(checkbox, " [ ]" | " [x]" | " [X]"))
+}
+
 /// Gives a task without a body the placeholder of an empty one. Markdown
 /// reads a list item that is a checkbox and nothing else as an item with
 /// the text of the checkbox, not as a task.
@@ -541,13 +548,8 @@ fn hold_empty_task_bodies(markdown: &str, fragments: &mut StorageFragments) -> S
             continue;
         }
         let line = markdown[range.start..].lines().next().unwrap_or_default();
-        let task = line.trim_end();
-        let is_empty_task = task
-            .trim_start()
-            .strip_prefix(['-', '*', '+'])
-            .is_some_and(|checkbox| matches!(checkbox, " [ ]" | " [x]" | " [X]"));
-        if is_empty_task {
-            let end = range.start + task.len();
+        if is_empty_task_line(line) {
+            let end = range.start + line.trim_end().len();
             output.push_str(&markdown[rest..end]);
             output.push(' ');
             output.push_str(&fragments.hold(String::new()));
@@ -1189,6 +1191,14 @@ fn render_block_element(node: Node<'_, '_>, source: &str) -> Option<String> {
         "pre" => render_preformatted(node),
         "blockquote" => {
             let rendered = render_container_blocks(node, source)?;
+            // A macro, a layout or a task without a body is read at the
+            // start of a line only, which a quoted line never is.
+            let holds_a_block = confluence_blocks(&rendered)
+                .map_or(true, |blocks| !blocks.is_empty())
+                || rendered.lines().any(is_empty_task_line);
+            if holds_a_block {
+                return None;
+            }
             Some(prefix_markdown_block(&rendered, "> "))
         }
         "ul" => render_list(node, source, 0, false),

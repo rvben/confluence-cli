@@ -5440,6 +5440,28 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn quote_keeps_a_macro_a_layout_or_an_empty_task() {
+        for quoted in [
+            r#"<ac:structured-macro ac:name="info"><ac:rich-text-body><p>b</p></ac:rich-text-body></ac:structured-macro>"#,
+            r#"<p>a</p><ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[x]]></ac:plain-text-body></ac:structured-macro>"#,
+            r#"<ac:structured-macro ac:name="toc" />"#,
+            r#"<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell><p>a</p></ac:layout-cell></ac:layout-section></ac:layout>"#,
+            "<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body></ac:task-body></ac:task></ac:task-list>",
+            "<ul><li>a<ac:task-list><ac:task><ac:task-status>complete</ac:task-status><ac:task-body></ac:task-body></ac:task></ac:task-list></li></ul>",
+        ] {
+            assert_keeps(&format!("<blockquote>{quoted}</blockquote><p>after</p>"));
+        }
+        // A quote of text, a list and a task with a body is still a quote.
+        let quote = "<blockquote><p>a</p><ul><li>b</li></ul><ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>t</ac:task-body></ac:task></ac:task-list></blockquote>";
+        assert_keeps(quote);
+        assert!(
+            storage_to_markdown(quote)
+                .lines()
+                .all(|line| line.starts_with('>'))
+        );
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");
