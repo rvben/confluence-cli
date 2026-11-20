@@ -2701,9 +2701,13 @@ pub fn resolve_placeholder_links(storage: &str) -> String {
 
 fn rewrite_placeholder_links_to_storage(storage: &str) -> String {
     static LINK: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r#"(?s)<a(\s(?:[^>]*?\s)?)href="(confluence-(?:page|user|status)://[^"]+)"([^>]*)>"#,
-        )
+        // The other attributes are read whole, so that an address quoted in
+        // the value of one is text of that value, and a `>` in a value does
+        // not end the tag.
+        const ATTRIBUTE: &str = r#"\s+[^\s=<>"'/]+\s*=\s*(?:"[^"]*"|'[^']*')"#;
+        Regex::new(&format!(
+            r#"<a(?:{ATTRIBUTE})*?\s+href="(confluence-(?:page|user|status)://[^"]+)"(?:{ATTRIBUTE})*\s*>"#,
+        ))
         .expect("valid placeholder link regex")
     });
     const CLOSE: &str = "</a>";
@@ -2747,7 +2751,7 @@ fn rewrite_placeholder_links_to_storage(storage: &str) -> String {
             continue;
         };
         let end = close + CLOSE.len();
-        let target = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let target = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
         rewritten.push_str(&storage[copied..open.start()]);
         match placeholder_to_storage_macro(target, &storage[open.end()..close]) {
             Some(element) => rewritten.push_str(&element),
@@ -4155,6 +4159,29 @@ mod tests {
         let storage = r#"<p>a</p><!-- <a href="confluence-user://user?userkey=foo"> --><p><a href="https://example.com">site</a> end</p>"#;
 
         assert_eq!(resolve_placeholder_links(storage), storage);
+    }
+
+    #[test]
+    fn placeholder_address_inside_another_attribute_is_text_of_that_attribute() {
+        for storage in [
+            r#"<p><a title='see href="confluence-user://user?userkey=foo"' href="https://example.com">site</a></p>"#,
+            r#"<p><a href="https://example.com" title='see href="confluence-user://user?userkey=foo"'>site</a></p>"#,
+            r#"<p><a title="a > b" data-x=' href="confluence-page://page?content-id=7"'>site</a></p>"#,
+        ] {
+            assert_eq!(resolve_placeholder_links(storage), storage);
+        }
+    }
+
+    #[test]
+    fn placeholder_link_is_written_whatever_its_other_attributes_hold() {
+        let storage = resolve_placeholder_links(
+            r#"<p><a title="a > b" href="confluence-user://user?userkey=bar" data-x='c > d'>one</a> end</p>"#,
+        );
+
+        assert_eq!(
+            storage,
+            r#"<p><ac:link><ri:user ri:userkey="bar" /><ac:plain-text-link-body><![CDATA[one]]></ac:plain-text-link-body></ac:link> end</p>"#
+        );
     }
 
     #[test]
