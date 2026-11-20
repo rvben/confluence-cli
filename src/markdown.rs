@@ -930,7 +930,31 @@ fn render_block_element(node: Node<'_, '_>, source: &str) -> Option<String> {
         return render_confluence_block(node, source);
     }
 
-    match node.tag_name().name() {
+    let name = node.tag_name().name();
+    // Markdown writes these elements as syntax that has no place for an
+    // attribute. A list checks its own, since it also nests.
+    let written_as_syntax = matches!(
+        name,
+        "p" | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "pre"
+            | "blockquote"
+            | "table"
+            | "hr"
+            | "div"
+            | "section"
+            | "article"
+            | "main"
+    );
+    if written_as_syntax && has_attributes_besides(node, &[]) {
+        return None;
+    }
+
+    match name {
         "p" => {
             if node.children().any(is_block_like_confluence_node) {
                 return render_container_blocks(node, source);
@@ -1092,48 +1116,76 @@ fn render_container_blocks(node: Node<'_, '_>, source: &str) -> Option<String> {
     }
 }
 
+/// Renders preformatted text as a fenced code block when it has the shape a
+/// fenced block converts back to: a `<pre>` holding a single `<code>` that
+/// holds text and names at most a language.
 fn render_preformatted(node: Node<'_, '_>) -> Option<String> {
-    if contains_confluence_markup(node) {
+    let code =
+        sole_child(node).filter(|child| child.is_element() && !is_confluence_node(*child))?;
+    if code.tag_name().name() != "code" || code.children().any(|child| !child.is_text()) {
         return None;
     }
-    let code_child = node
-        .children()
-        .find(|child| child.is_element() && child.tag_name().name() == "code");
-    let (language, content) = if let Some(code) = code_child {
-        (
-            code.attribute("class")
-                .and_then(language_from_class)
-                .unwrap_or_default(),
-            code.text()
-                .unwrap_or_default()
-                .trim_end_matches('\n')
-                .to_string(),
-        )
-    } else {
-        (
-            String::new(),
-            node.text()
-                .unwrap_or_default()
-                .trim_end_matches('\n')
-                .to_string(),
-        )
+    let language = match code.attributes().collect::<Vec<_>>().as_slice() {
+        [] => "",
+        [class] if class.namespace().is_none() && class.name() == "class" => {
+            fence_language(class.value())?
+        }
+        _ => return None,
     };
-    let fence = backtick_fence(&content);
+    let content: String = code.children().filter_map(|child| child.text()).collect();
+    // The line break that ends the last line belongs to the fence.
+    let content = content.strip_suffix('\n').unwrap_or(&content);
+    let fence = backtick_fence(content);
     Some(format!("{fence}{language}\n{content}\n{fence}"))
 }
 
-fn language_from_class(class_name: &str) -> Option<String> {
-    class_name
-        .split_whitespace()
-        .find_map(|part| part.strip_prefix("language-"))
-        .map(ToOwned::to_owned)
+/// The language a `class` attribute names, when that is all it says and the
+/// name can follow a code fence.
+fn fence_language(class: &str) -> Option<&str> {
+    class.strip_prefix("language-").filter(|language| {
+        !language.is_empty()
+            && !language.contains(|character: char| {
+                character.is_whitespace() || matches!(character, '`' | '\\' | '&')
+            })
+    })
+}
+
+/// The only child of a node, if it has exactly one.
+fn sole_child<'a, 'input>(node: Node<'a, 'input>) -> Option<Node<'a, 'input>> {
+    let mut children = node.children();
+    let first = children.next()?;
+    children.next().is_none().then_some(first)
+}
+
+/// Whether an element carries an attribute other than the ones named and the
+/// identifier Confluence assigns.
+fn has_attributes_besides(node: Node<'_, '_>, carried: &[&str]) -> bool {
+    node.attributes().any(|attribute| {
+        attribute.name() != LOCAL_ID_ATTRIBUTE
+            && !(attribute.namespace().is_none() && carried.contains(&attribute.name()))
+    })
+}
+
+/// The children of an element when all of them are elements of one name
+/// without attributes, leaving out what renders as nothing.
+fn plain_children<'a, 'input>(node: Node<'a, 'input>, name: &str) -> Option<Vec<Node<'a, 'input>>> {
+    node.children()
+        .filter(|child| !renders_nothing(*child))
+        .map(|child| {
+            (child.is_element()
+                && !is_confluence_node(child)
+                && child.tag_name().name() == name
+                && !has_attributes_besides(child, &[]))
+            .then_some(child)
+        })
+        .collect()
 }
 
 fn render_list(node: Node<'_, '_>, source: &str, indent: usize, ordered: bool) -> Option<String> {
-    let items: Vec<_> = node
-        .children()
-        .filter(|child| child.is_element() && child.tag_name().name() == "li")
-        .collect();
+    if has_attributes_besides(node, if ordered { &["start"] } else { &[] }) {
+        return None;
+    }
+    let items = plain_children(node, "li")?;
     if items.is_empty() {
         return None;
     }
@@ -1143,10 +1195,11 @@ fn render_list(node: Node<'_, '_>, source: &str, indent: usize, ordered: bool) -
     // `1.` marker, and one that starts beyond what a marker holds has no
     // Markdown form.
     const LARGEST_MARKER: u64 = 999_999_999;
-    let start = node
-        .attribute("start")
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|start| ordered && *start != 1);
+    let start = match node.attribute("start") {
+        Some(value) => Some(value.trim().parse::<u64>().ok()?),
+        None => None,
+    }
+    .filter(|start| *start != 1);
     if start.is_some_and(|start| start > LARGEST_MARKER) {
         return None;
     }
@@ -1246,6 +1299,9 @@ fn render_list_item(
                     continue;
                 }
                 if child.tag_name().name() == "p" {
+                    if has_attributes_besides(child, &[]) {
+                        return None;
+                    }
                     if !inline.trim().is_empty() {
                         paragraphs.push(inline.trim().to_string());
                     }
@@ -1297,69 +1353,59 @@ fn render_list_item(
     Some(out)
 }
 
+/// Renders a table as a Markdown table when it has the shape a Markdown
+/// table converts back to: one row of header cells in a `<thead>`, then rows
+/// of as many data cells in a `<tbody>`, none of them with attributes.
 fn render_table(node: Node<'_, '_>, source: &str) -> Option<String> {
-    let rows = collect_table_rows(node);
-    if rows.is_empty() {
+    let sections: Vec<_> = node
+        .children()
+        .filter(|child| !renders_nothing(*child))
+        .collect();
+    let [head, body] = sections.as_slice() else {
+        return None;
+    };
+    let is_section = |section: Node<'_, '_>, name: &str| {
+        section.is_element()
+            && !is_confluence_node(section)
+            && section.tag_name().name() == name
+            && !has_attributes_besides(section, &[])
+    };
+    if !is_section(*head, "thead") || !is_section(*body, "tbody") {
         return None;
     }
 
-    let mut markdown_rows = Vec::new();
-    for row in rows {
-        let mut cells = Vec::new();
-        let mut header_row = false;
-        for cell in row
-            .children()
-            .filter(|child| child.is_element() && matches!(child.tag_name().name(), "th" | "td"))
-        {
-            if cell.attribute("rowspan").is_some() || cell.attribute("colspan").is_some() {
-                return None;
-            }
-            if cell.tag_name().name() == "th" {
-                header_row = true;
-            }
-            let value = render_inline_children(cell, source)?;
-            let value = value.trim().replace('\n', " ").replace('|', r"\|");
-            cells.push(value);
-        }
-        if cells.is_empty() {
-            continue;
-        }
-        markdown_rows.push((header_row, cells));
-    }
+    let render_row = |row: Node<'_, '_>, cell_name: &str| -> Option<Vec<String>> {
+        plain_children(row, cell_name)?
+            .into_iter()
+            .map(|cell| {
+                let value = render_inline_children(cell, source)?;
+                let value = value.trim();
+                // A row is a single line.
+                (!value.contains('\n')).then(|| value.replace('|', r"\|"))
+            })
+            .collect()
+    };
 
-    if markdown_rows.is_empty() || !markdown_rows.first()?.0 {
+    let header_rows = plain_children(*head, "tr")?;
+    let [header_row] = header_rows.as_slice() else {
+        return None;
+    };
+    let headers = render_row(*header_row, "th")?;
+    if headers.is_empty() {
         return None;
     }
-
-    let headers = &markdown_rows[0].1;
-    let mut lines = Vec::new();
-    lines.push(format!("| {} |", headers.join(" | ")));
-    lines.push(format!(
-        "| {} |",
-        headers
-            .iter()
-            .map(|_| "---")
-            .collect::<Vec<_>>()
-            .join(" | ")
-    ));
-    for (_, row) in markdown_rows.into_iter().skip(1) {
-        lines.push(format!("| {} |", row.join(" | ")));
+    let mut lines = vec![
+        format!("| {} |", headers.join(" | ")),
+        format!("| {} |", vec!["---"; headers.len()].join(" | ")),
+    ];
+    for row in plain_children(*body, "tr")? {
+        let cells = render_row(row, "td")?;
+        if cells.len() != headers.len() {
+            return None;
+        }
+        lines.push(format!("| {} |", cells.join(" | ")));
     }
     Some(lines.join("\n"))
-}
-
-fn collect_table_rows<'a, 'input>(node: Node<'a, 'input>) -> Vec<Node<'a, 'input>> {
-    node.children()
-        .filter(|child| child.is_element())
-        .flat_map(|child| match child.tag_name().name() {
-            "thead" | "tbody" | "tfoot" => child
-                .children()
-                .filter(|row| row.is_element() && row.tag_name().name() == "tr")
-                .collect::<Vec<_>>(),
-            "tr" => vec![child],
-            _ => Vec::new(),
-        })
-        .collect()
 }
 
 fn render_task_list(node: Node<'_, '_>, source: &str) -> Option<String> {
@@ -2064,12 +2110,9 @@ fn render_inline_node(node: Node<'_, '_>, source: &str) -> Option<String> {
     }
 
     match node.tag_name().name() {
-        "strong" | "b" => wrap_markdown("**", render_inline_children(node, source)?),
-        "em" | "i" => wrap_markdown("*", render_inline_children(node, source)?),
-        "code" => Some(format!(
-            "`{}`",
-            node.text().unwrap_or_default().trim().replace('`', r"\`")
-        )),
+        "strong" | "b" => render_emphasis(node, source, "**", "strong"),
+        "em" | "i" => render_emphasis(node, source, "*", "em"),
+        "code" => render_code_span(node, source),
         "a" => render_link(node, source),
         "img" => {
             let src = node.attribute("src")?;
@@ -2077,22 +2120,236 @@ fn render_inline_node(node: Node<'_, '_>, source: &str) -> Option<String> {
             Some(format!("![{}]({src})", escape_markdown_text(alt)))
         }
         "br" => Some(HARD_BREAK.to_string()),
-        "span" => {
-            if node.attributes().len() > 0 {
-                Some(raw_xml_fragment(node, source).to_string())
+        _ if is_transparent_inline(node) => render_inline_children(node, source),
+        name if INLINE_TAGS.contains(&name) => {
+            inline_tag(node, name, &render_inline_children(node, source)?)
+        }
+        // Markdown has no way to tell where an element it does not know
+        // belongs, so the block that holds one is kept as storage.
+        _ => None,
+    }
+}
+
+/// Whether an element adds nothing to the text it holds, so that only its
+/// content is written.
+fn is_transparent_inline(node: Node<'_, '_>) -> bool {
+    node.is_element()
+        && !is_confluence_node(node)
+        && node.tag_name().name() == "span"
+        && node.attributes().len() == 0
+}
+
+/// Writes an element as an inline tag around its rendered content. Markdown
+/// keeps such a tag as it is and reads the content between its halves as
+/// Markdown.
+fn inline_tag(node: Node<'_, '_>, name: &str, content: &str) -> Option<String> {
+    // A line that holds nothing but a tag starts a block of raw HTML.
+    if content.contains('\n') {
+        return None;
+    }
+    let mut tag = format!("<{name}");
+    for attribute in node.attributes() {
+        // A prefixed attribute needs a namespace declaration that an inline
+        // tag does not carry, and Markdown reads a tag only when its
+        // attribute names are plain.
+        if attribute.namespace().is_some() || !is_markdown_attribute_name(attribute.name()) {
+            return None;
+        }
+        tag.push_str(&format!(
+            r#" {}="{}""#,
+            attribute.name(),
+            escape_inline_tag_attribute(attribute.value())
+        ));
+    }
+    Some(format!("{tag}>{content}</{name}>"))
+}
+
+/// Renders emphasis with Markdown delimiters where Markdown reads them as
+/// emphasis, and as an inline tag everywhere else.
+fn render_emphasis(node: Node<'_, '_>, source: &str, delimiter: &str, tag: &str) -> Option<String> {
+    let content = render_inline_children(node, source)?;
+    if node.attributes().len() == 0 && delimiters_read_as_emphasis(node) {
+        Some(format!("{delimiter}{content}{delimiter}"))
+    } else {
+        inline_tag(node, tag, &content)
+    }
+}
+
+/// What borders an emphasis delimiter on one side.
+#[derive(Clone, Copy, PartialEq)]
+enum Edge {
+    /// White space, or the start or end of the enclosing block or element.
+    Space,
+    /// A letter or digit.
+    Word,
+    /// Punctuation, which includes the syntax another element is written
+    /// with.
+    Punctuation,
+    /// A character that Markdown implementations classify differently.
+    Unclear,
+    /// Another emphasis element, whose delimiters would run into this one's.
+    Emphasis,
+}
+
+/// Whether Markdown pairs the delimiters written around an emphasis element.
+///
+/// A delimiter opens emphasis only when text follows it directly, and when
+/// that text starts with punctuation only after white space or punctuation.
+/// Closing mirrors that. Delimiters that touch those of a neighbour, or that
+/// sit inside emphasis of the same kind, pair up differently from how the
+/// elements nest.
+fn delimiters_read_as_emphasis(node: Node<'_, '_>) -> bool {
+    let kind = emphasis_kind(node);
+    if node
+        .ancestors()
+        .skip(1)
+        .any(|ancestor| emphasis_kind(ancestor) == kind)
+    {
+        return false;
+    }
+    let first = node
+        .children()
+        .find_map(|child| Some((child, edge_of(child, true)?)));
+    let last = node
+        .children()
+        .rev()
+        .find_map(|child| Some((child, edge_of(child, false)?)));
+    let (Some((first_child, first)), Some((last_child, last))) = (first, last) else {
+        return false;
+    };
+    // Delimiters that meet at both ends form a single run, which Markdown
+    // always reads with the strong emphasis innermost.
+    if kind == Some("strong") && first_child == last_child && first == Edge::Emphasis {
+        return false;
+    }
+    let before = edge_beside(node, false);
+    let after = edge_beside(node, true);
+    let flanks = |inner: Edge, outer: Edge| match inner {
+        Edge::Space => false,
+        Edge::Word => true,
+        _ => matches!(outer, Edge::Space | Edge::Punctuation),
+    };
+    before != Edge::Emphasis
+        && flanks(first, before)
+        && flanks(
+            last,
+            if after == Edge::Emphasis {
+                // That neighbour is written as a tag.
+                Edge::Punctuation
             } else {
-                render_inline_children(node, source)
+                after
+            },
+        )
+}
+
+/// Which kind of emphasis an element is, if any.
+fn emphasis_kind(node: Node<'_, '_>) -> Option<&'static str> {
+    if !node.is_element() || is_confluence_node(node) {
+        return None;
+    }
+    match node.tag_name().name() {
+        "strong" | "b" => Some("strong"),
+        "em" | "i" => Some("em"),
+        _ => None,
+    }
+}
+
+/// The edge that a node's rendering starts with (`start`) or ends with, or
+/// `None` when the node renders as nothing.
+fn edge_of(node: Node<'_, '_>, start: bool) -> Option<Edge> {
+    match node.node_type() {
+        NodeType::Text => {
+            let text = node.text().unwrap_or_default();
+            let character = if start {
+                text.chars().next()
+            } else {
+                text.chars().next_back()
+            }?;
+            Some(if character.is_whitespace() {
+                Edge::Space
+            } else if character.is_alphanumeric() {
+                Edge::Word
+            } else if character.is_ascii_punctuation() {
+                Edge::Punctuation
+            } else {
+                Edge::Unclear
+            })
+        }
+        NodeType::Element if is_transparent_inline(node) => {
+            if start {
+                node.children().find_map(|child| edge_of(child, start))
+            } else {
+                node.children()
+                    .rev()
+                    .find_map(|child| edge_of(child, start))
             }
         }
-        "small" | "big" | "u" | "sub" | "sup" => Some(raw_xml_fragment(node, source).to_string()),
-        _ => {
-            if node.attributes().len() > 0 || has_block_children(node) {
-                Some(raw_xml_fragment(node, source).to_string())
-            } else {
-                render_inline_children(node, source)
-            }
+        NodeType::Element if emphasis_kind(node).is_some() => Some(Edge::Emphasis),
+        NodeType::Element if node.tag_name().name() == "br" && !is_confluence_node(node) => {
+            Some(Edge::Space)
+        }
+        NodeType::Element => Some(Edge::Punctuation),
+        _ => None,
+    }
+}
+
+/// The edge next to an element, after it (`after`) or before it.
+fn edge_beside(node: Node<'_, '_>, after: bool) -> Edge {
+    fn step<'a, 'input>(node: Node<'a, 'input>, after: bool) -> Option<Node<'a, 'input>> {
+        if after {
+            node.next_sibling()
+        } else {
+            node.prev_sibling()
         }
     }
+    let mut current = node;
+    loop {
+        // A neighbour shows the end that faces this element.
+        if let Some(edge) =
+            std::iter::successors(step(current, after), |sibling| step(*sibling, after))
+                .find_map(|sibling| edge_of(sibling, after))
+        {
+            return edge;
+        }
+        match current.parent() {
+            Some(parent) if is_transparent_inline(parent) => current = parent,
+            // Whatever else encloses the element is written with syntax or
+            // starts a block.
+            _ => return Edge::Space,
+        }
+    }
+}
+
+/// Renders inline code as a code span. Code that holds more than text is
+/// written as an inline tag.
+fn render_code_span(node: Node<'_, '_>, source: &str) -> Option<String> {
+    let text: String = node
+        .children()
+        .filter_map(|child| child.text())
+        .collect::<String>()
+        .replace(['\n', '\r'], " ");
+    if node.attributes().len() > 0
+        || node.children().any(|child| child.is_element())
+        || text.is_empty()
+    {
+        return inline_tag(node, "code", &render_inline_children(node, source)?);
+    }
+    let longest_run = text
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let delimiter = "`".repeat(longest_run + 1);
+    // Markdown takes one space off both ends of a code span when both are
+    // there, which is also what keeps a backtick at an end apart from the
+    // delimiter.
+    let spaced = text.starts_with(' ') && text.ends_with(' ') && text.trim() != "";
+    let padding = if spaced || text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    Some(format!("{delimiter}{padding}{text}{padding}{delimiter}"))
 }
 
 fn render_confluence_inline(node: Node<'_, '_>, source: &str) -> Option<String> {
@@ -2259,9 +2516,9 @@ pub(crate) fn encode_target_segment(segment: &str) -> String {
     encoded
 }
 
-/// Attribute of a link that Confluence assigns itself and that says nothing
-/// about how the link looks.
-const LINK_LOCAL_ID_ATTRIBUTE: &str = "local-id";
+/// Attribute that Confluence assigns to an element to identify it. It says
+/// nothing about the content.
+const LOCAL_ID_ATTRIBUTE: &str = "local-id";
 
 /// Renders a link as a Markdown link. A link that carries more than its
 /// address, such as how Confluence displays it, is written as an inline tag
@@ -2272,7 +2529,7 @@ fn render_link(node: Node<'_, '_>, source: &str) -> Option<String> {
     let attributes: Vec<_> = node
         .attributes()
         .filter(|attribute| {
-            attribute.namespace().is_some() || attribute.name() != LINK_LOCAL_ID_ATTRIBUTE
+            attribute.namespace().is_some() || attribute.name() != LOCAL_ID_ATTRIBUTE
         })
         .collect();
     if attributes.len() == 1 {
@@ -2545,47 +2802,20 @@ fn contains_confluence_markup(node: Node<'_, '_>) -> bool {
         .any(|child| child.is_element() && is_confluence_node(child))
 }
 
+/// Elements that sit inside a line of text.
+const INLINE_TAGS: [&str; 28] = [
+    "span", "strong", "b", "em", "i", "code", "a", "img", "br", "small", "big", "u", "sub", "sup",
+    "del", "s", "strike", "ins", "kbd", "mark", "cite", "q", "abbr", "var", "samp", "time", "tt",
+    "dfn",
+];
+
 fn is_inlineish_tag(node: Node<'_, '_>) -> bool {
-    matches!(
-        node.tag_name().name(),
-        "span"
-            | "strong"
-            | "b"
-            | "em"
-            | "i"
-            | "code"
-            | "a"
-            | "img"
-            | "br"
-            | "small"
-            | "big"
-            | "u"
-            | "sub"
-            | "sup"
-    )
+    INLINE_TAGS.contains(&node.tag_name().name())
 }
 
 fn has_block_children(node: Node<'_, '_>) -> bool {
-    node.children().any(|child| {
-        child.is_element()
-            && !matches!(
-                child.tag_name().name(),
-                "span"
-                    | "strong"
-                    | "b"
-                    | "em"
-                    | "i"
-                    | "code"
-                    | "a"
-                    | "img"
-                    | "br"
-                    | "small"
-                    | "big"
-                    | "u"
-                    | "sub"
-                    | "sup"
-            )
-    })
+    node.children()
+        .any(|child| child.is_element() && !is_inlineish_tag(child))
 }
 
 fn normalize_text_node(text: &str) -> String {
@@ -2721,14 +2951,6 @@ fn escape_block_start(line: &str) -> String {
     match escape_at {
         Some(position) => format!("{indent}{}\\{}", &content[..position], &content[position..]),
         None => line.to_string(),
-    }
-}
-
-fn wrap_markdown(wrapper: &str, content: String) -> Option<String> {
-    if content.trim().is_empty() {
-        None
-    } else {
-        Some(format!("{wrapper}{}{wrapper}", content.trim()))
     }
 }
 
@@ -4691,8 +4913,8 @@ mod tests {
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains(":::confluence-content-properties"));
         assert!(markdown.contains("id: decision"));
-        assert!(markdown.contains("| Owner | Ada |"));
-        assert!(markdown.contains("| Status | Approved |"));
+        assert!(markdown.contains("<tr><th>Owner</th><td>Ada</td></tr>"));
+        assert!(markdown.contains("<tr><th>Status</th><td>Approved</td></tr>"));
     }
 
     #[test]
@@ -6550,7 +6772,7 @@ SELECT ']]>' AS sentinel;
 
     #[test]
     fn simple_tables_export_to_markdown_tables() {
-        let storage = r#"<table><tbody><tr><th>Name</th><th>Status</th></tr><tr><td>CLI</td><td>Ready</td></tr></tbody></table>"#;
+        let storage = r#"<table><thead><tr><th>Name</th><th>Status</th></tr></thead><tbody><tr><td>CLI</td><td>Ready</td></tr></tbody></table>"#;
         let markdown = storage_to_markdown(storage);
         assert!(markdown.contains("| Name | Status |"));
         assert!(markdown.contains("| --- | --- |"));

@@ -3756,6 +3756,201 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn emphasis_keeps_white_space_at_its_edges() {
+        assert_round_trips("<p>a <em>lead </em>b</p>");
+        assert_round_trips("<p>a<strong> trail</strong> b</p>");
+        assert_round_trips("<p>a<strong> </strong>b</p>");
+        assert_round_trips(r#"<p><em> <span style="color: red;">b</span></em> c</p>"#);
+        assert_round_trips(concat!(
+            r#"<p><strong><span style="color: red;">b</span> </strong>"#,
+            r#"<span style="color: red;">c</span></p>"#,
+        ));
+        assert_round_trips("<h2><em>a </em>b</h2>");
+        assert_round_trips("<ul><li><em>a </em>b</li></ul>");
+        assert_round_trips(concat!(
+            "<table><thead><tr><th>H</th></tr></thead>",
+            "<tbody><tr><td><em> x</em>a|b</td></tr></tbody></table>",
+        ));
+        assert_round_trips(r#"<p><a href="https://x.example"><em> a</em></a></p>"#);
+    }
+
+    #[test]
+    fn emphasis_next_to_punctuation_stays_emphasis() {
+        assert_round_trips(r#"<p>a<em>"x"</em> b</p>"#);
+        assert_round_trips(r#"<p>a<em> "x"</em> b</p>"#);
+        assert_round_trips(r#"<p>a <em>"x"</em>b</p>"#);
+        assert_round_trips("<p><strong>Title:</strong>x</p>");
+        assert_round_trips("<p>snake<em>_case_</em>x</p>");
+        assert_round_trips(
+            "<p>caf\u{e9}<em>\u{e9}t\u{e9}</em>s \u{2014}<em>\u{201c}q\u{201d}</em>\u{2014}</p>",
+        );
+        assert_round_trips(
+            "<p>(<em>a</em>)<em>b</em>! 1<strong>2</strong>3 <em>*a*</em> <em>a</em>*</p>",
+        );
+    }
+
+    #[test]
+    fn emphasis_that_markdown_reads_is_written_with_delimiters() {
+        let storage = "<p><em>a</em>, <strong>b:</strong> c (<em>d</em>) x<em>e</em>y.</p>";
+        assert_eq!(storage_to_markdown(storage), "*a*, **b:** c (*d*) x*e*y.");
+        assert_round_trips(storage);
+    }
+
+    #[test]
+    fn emphasis_that_touches_other_emphasis_keeps_its_extent() {
+        assert_round_trips("<p><em>a</em><em>b</em></p>");
+        assert_round_trips("<p><em>a</em><strong>b</strong><em>c</em></p>");
+        assert_eq!(
+            apply_storage(&storage_to_markdown(
+                "<p><em>a</em><span><em>b</em></span></p>"
+            ))
+            .unwrap(),
+            "<p><em>a</em><em>b</em></p>"
+        );
+        assert_round_trips("<p><em>a<em>b</em>c</em> <strong>a<strong>b</strong></strong></p>");
+        assert_round_trips(
+            "<p><strong><em>c</em></strong><em>d</em> <em><strong>e</strong></em></p>",
+        );
+        assert_round_trips(
+            "<p><em><strong>a</strong> b</em> <strong>a<em>b</em></strong> <em>a<strong>b</strong>c</em></p>",
+        );
+        assert_round_trips("<p>x<strong><em>a</em>b</strong></p>");
+    }
+
+    #[test]
+    fn emphasis_keeps_its_attributes_and_stays_when_empty() {
+        assert_round_trips(r#"<p><em class="x">a</em> <strong style="color: red;">b</strong></p>"#);
+        assert_round_trips("<p>a<em></em>b</p>");
+    }
+    #[test]
+    fn text_inside_an_inline_element_stays_literal() {
+        assert_round_trips(r#"<p><span style="color: red;">a *b* c</span></p>"#);
+        assert_round_trips("<p><u>a *b* c</u> <sub>x_y_z</sub> <sup>[1]</sup></p>");
+        assert_round_trips(
+            r#"<p><span style="color: red;"><em>a</em> [x] &amp;amp; &lt;b&gt;</span></p>"#,
+        );
+        assert_round_trips(concat!(
+            "<table><thead><tr><th>H</th></tr></thead>",
+            r#"<tbody><tr><td><span title="p|q">s|t</span></td></tr></tbody></table>"#,
+        ));
+    }
+
+    #[test]
+    fn inline_elements_without_markdown_syntax_survive() {
+        assert_round_trips(
+            "<p>a <del>x</del> <s>y</s> <kbd>k</kbd> <mark>m</mark> <ins>i</ins> <cite>c</cite></p>",
+        );
+        assert_round_trips("<ul><li>a<del>b</del></li></ul>");
+        assert_round_trips("<p><custom>x</custom></p>");
+        assert_round_trips(r#"<p><time datetime="2024-01-01" /></p>"#);
+        assert_round_trips(r#"<p><span style="color: red;">a<br />b</span></p>"#);
+    }
+
+    #[test]
+    fn inline_code_keeps_its_spaces_backticks_attributes_and_markup() {
+        assert_round_trips("<p>a<code> b </code>c <code> </code></p>");
+        assert_round_trips("<p><code>a`b</code> <code>`</code> <code>``x`</code></p>");
+        assert_round_trips("<p><code>a*b_c</code> and <code>x<em>y</em></code></p>");
+        assert_round_trips(r#"<p>a<code class="x">b</code></p>"#);
+        assert_eq!(storage_to_markdown("<p>a <code>b</code></p>"), "a `b`");
+    }
+    #[test]
+    fn block_with_attributes_keeps_them() {
+        assert_round_trips(r#"<p style="text-align: center;">a *b*</p>"#);
+        assert_round_trips(r#"<h2 style="text-align: center;">a</h2>"#);
+        assert_round_trips(r#"<blockquote class="x"><p>a</p></blockquote>"#);
+        assert_round_trips(r#"<div class="x"><p>a</p></div>"#);
+        assert_round_trips(r#"<hr class="x" />"#);
+        assert_round_trips(concat!(
+            r#"<blockquote><p style="x">a</p>"#,
+            r#"<ul><li data-x="1">b</li></ul></blockquote>"#,
+        ));
+    }
+
+    #[test]
+    fn identifier_that_confluence_assigns_does_not_keep_a_block_out_of_markdown() {
+        assert_eq!(storage_to_markdown(r#"<p local-id="abc">a</p>"#), "a");
+        assert_eq!(
+            storage_to_markdown(r#"<ul local-id="a"><li local-id="b">one</li></ul>"#),
+            "- one"
+        );
+    }
+
+    #[test]
+    fn table_that_is_more_than_a_markdown_table_stays_as_it_is() {
+        let markdown_table = "<table><thead><tr><th>H</th><th>I</th></tr></thead><tbody><tr><td>c</td><td>d</td></tr></tbody></table>";
+        assert_eq!(
+            storage_to_markdown(markdown_table),
+            "| H | I |\n| --- | --- |\n| c | d |"
+        );
+        assert_round_trips(markdown_table);
+        assert_round_trips("<table><thead><tr><th>H</th></tr></thead><tbody></tbody></table>");
+
+        for table in [
+            r#"<table class="wrapped" style="width: 50%;"><tbody><tr><th>H</th></tr><tr><td>c</td></tr></tbody></table>"#,
+            "<table><tbody><tr><th>H</th></tr><tr><td>c</td></tr></tbody></table>",
+            r#"<table><thead><tr><th class="x">H</th></tr></thead><tbody><tr><td>c</td></tr></tbody></table>"#,
+            r#"<table><thead><tr><th>H</th></tr></thead><tbody><tr><td style="x">c</td></tr></tbody></table>"#,
+            "<table><thead><tr><th>H</th><th>I</th></tr></thead><tbody><tr><th>r</th><td>c</td></tr></tbody></table>",
+            "<table><thead><tr><th>H</th><th>I</th></tr></thead><tbody><tr><td>c</td></tr></tbody></table>",
+            "<table><thead><tr><th>H</th></tr></thead></table>",
+            "<table><colgroup><col /></colgroup><thead><tr><th>H</th></tr></thead><tbody><tr><td>c</td></tr></tbody></table>",
+            "<table><thead><tr><th>H</th></tr></thead><tbody><tr><td>c</td></tr></tbody><tfoot><tr><td>f</td></tr></tfoot></table>",
+            "<table><thead><tr><th>H</th></tr><tr><th>H2</th></tr></thead><tbody><tr><td>c</td></tr></tbody></table>",
+            "<table><thead><tr><th>H</th></tr></thead><tbody><tr><td>a<br />b</td></tr></tbody></table>",
+        ] {
+            assert!(
+                storage_to_markdown(table).starts_with("<table"),
+                "{table} pulled as {}",
+                storage_to_markdown(table)
+            );
+            assert_round_trips(table);
+        }
+    }
+
+    #[test]
+    fn page_properties_keep_their_row_headers() {
+        assert_round_trips(concat!(
+            r#"<ac:macro ac:name="details"><ac:rich-text-body>"#,
+            "<table><tbody><tr><th>Owner</th><td>Ada</td></tr>",
+            "<tr><th>Status</th><td>Approved</td></tr></tbody></table>",
+            "</ac:rich-text-body></ac:macro>",
+        ));
+    }
+
+    #[test]
+    fn list_with_attributes_or_stray_content_stays_as_it_is() {
+        assert_round_trips(r#"<ul><li data-uuid="abc">one</li></ul>"#);
+        assert_round_trips(r#"<ul class="x"><li>one</li></ul>"#);
+        assert_round_trips(r#"<ul><li>one<ul><li data-uuid="q">two</li></ul></li></ul>"#);
+        assert_round_trips(r#"<ol start="3" class="x"><li>one</li></ol>"#);
+        assert_round_trips(r#"<ol start="x"><li>one</li></ol>"#);
+        assert_round_trips("<ul><li>one</li>text</ul>");
+        assert_round_trips(r#"<ul><li><p style="x">one</p><p>two</p></li></ul>"#);
+    }
+
+    #[test]
+    fn preformatted_text_that_is_not_a_plain_code_block_stays_as_it_is() {
+        assert_round_trips(r#"<pre class="x">code</pre>"#);
+        assert_round_trips("<pre>code</pre>");
+        assert_round_trips("<pre>a<strong>b</strong></pre>");
+        assert_round_trips("<pre>a\n\nb</pre><p>after</p>");
+        assert_round_trips("<pre>a\n```\nb</pre>");
+        assert_round_trips("<pre><code class=\"language-rust extra\">code\n</code></pre>");
+        assert_round_trips("<pre><code>a<em>b</em>\n</code></pre>");
+    }
+
+    #[test]
+    fn code_block_keeps_the_blank_lines_at_its_end() {
+        assert_round_trips("<pre><code>a\n\n\n</code></pre>");
+        assert_round_trips("<pre><code>\n\na\n</code></pre>");
+        assert_eq!(
+            storage_to_markdown("<pre><code class=\"language-rust\">a\n</code></pre>"),
+            "```rust\na\n```"
+        );
+    }
+
+    #[test]
     fn straight_quotes_and_ascii_punctuation_survive() {
         assert_round_trips(r#"<p>NXP's "Caddy" path</p>"#);
         assert_round_trips("<p>a -- b --- c ... d</p>");
@@ -4165,10 +4360,6 @@ mod round_trip_tests {
             r#"<pre><code class="language-md">"#,
             "```rust\nfn x() {}\n```\n</code></pre>",
         ));
-        assert_eq!(
-            apply_storage(&storage_to_markdown("<pre>a\n```\nb</pre>")).unwrap(),
-            "<pre><code>a\n```\nb\n</code></pre>"
-        );
     }
 
     #[test]
