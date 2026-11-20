@@ -2702,13 +2702,14 @@ pub fn resolve_placeholder_links(storage: &str) -> String {
 fn rewrite_placeholder_links_to_storage(storage: &str) -> String {
     static LINK: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r#"(?s)<a(\s(?:[^>]*?\s)?)href="(confluence-(?:page|user|status)://[^"]+)"([^>]*)>(.*?)</a>"#,
+            r#"(?s)<a(\s(?:[^>]*?\s)?)href="(confluence-(?:page|user|status)://[^"]+)"([^>]*)>"#,
         )
         .expect("valid placeholder link regex")
     });
+    const CLOSE: &str = "</a>";
     // A link that opens inside a comment is text of that comment. A comment
-    // inside a link is part of the link's text, so the search goes on from
-    // the end of a comment only when a link would open within it.
+    // inside a link is part of the link's text, and so is a closing tag
+    // that the comment holds.
     let mut comments: Vec<std::ops::Range<usize>> = Vec::new();
     let mut at = 0;
     while let Some(open) = storage[at..].find("<!--").map(|open| at + open) {
@@ -2726,20 +2727,34 @@ fn rewrite_placeholder_links_to_storage(storage: &str) -> String {
     let mut copied = 0;
     let mut search_from = 0;
     while let Some(captures) = LINK.captures_at(storage, search_from) {
-        let link = captures.get(0).expect("the whole match");
-        if let Some(comment_end) = comment_around(link.start()) {
+        let open = captures.get(0).expect("the whole match");
+        if let Some(comment_end) = comment_around(open.start()) {
             search_from = comment_end;
             continue;
         }
+        let mut close_from = open.end();
+        let close = loop {
+            let Some(close) = storage[close_from..].find(CLOSE).map(|at| close_from + at) else {
+                break None;
+            };
+            match comment_around(close) {
+                Some(comment_end) => close_from = comment_end,
+                None => break Some(close),
+            }
+        };
+        let Some(close) = close else {
+            search_from = open.end();
+            continue;
+        };
+        let end = close + CLOSE.len();
         let target = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
-        let body = captures.get(4).map(|m| m.as_str()).unwrap_or_default();
-        rewritten.push_str(&storage[copied..link.start()]);
-        match placeholder_to_storage_macro(target, body) {
+        rewritten.push_str(&storage[copied..open.start()]);
+        match placeholder_to_storage_macro(target, &storage[open.end()..close]) {
             Some(element) => rewritten.push_str(&element),
-            None => rewritten.push_str(link.as_str()),
+            None => rewritten.push_str(&storage[open.start()..end]),
         }
-        copied = link.end();
-        search_from = link.end();
+        copied = end;
+        search_from = end;
     }
     rewritten.push_str(&storage[copied..]);
     rewritten
@@ -4889,6 +4904,17 @@ mod round_trip_tests {
                 rewritten.unwrap_or(markdown),
             );
         }
+    }
+
+    #[test]
+    fn placeholder_link_keeps_a_comment_that_holds_a_closing_tag() {
+        let markdown = "[A<!-- </a> -->B](confluence-user://user?username=jdoe)";
+        let applied = apply_storage(markdown).expect("applies");
+        assert_eq!(applied.matches("<ac:link>").count(), 1, "{applied}");
+        assert!(applied.contains("A<!-- </a> -->B"), "{applied}");
+        assert!(!applied.contains("<a "), "{applied}");
+        let unclosed = r#"<p><a href="confluence-user://user?username=jdoe">A<!-- </a> --></p>"#;
+        assert_eq!(resolve_placeholder_links(unclosed), unclosed);
     }
 
     #[test]
