@@ -685,6 +685,42 @@ fn offline_conversion_saves_valid_xml_and_reports_the_artifact() {
 }
 
 #[test]
+fn offline_conversion_writes_placeholder_links_as_apply_writes_them() {
+    let root = tempfile::tempdir().unwrap();
+    let artifact = root.path().join("generated.xml");
+    let output = confluence(&[
+        "convert",
+        "--body",
+        "[@Ada](confluence-user://user?userkey=user-123) on \
+         [Guide](confluence-page://page?space-key=DOCS&content-title=Guide) is \
+         [Done](confluence-status://status?title=Done&colour=Green)",
+        "--output-file",
+        artifact.to_str().unwrap(),
+        "-o",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let saved = std::fs::read_to_string(&artifact).unwrap();
+    assert!(
+        saved.contains(r#"<ac:link><ri:user ri:userkey="user-123""#),
+        "{saved}"
+    );
+    assert!(
+        saved.contains(r#"<ri:page ri:content-title="Guide" ri:space-key="DOCS""#),
+        "{saved}"
+    );
+    assert!(
+        saved.contains(r#"<ac:structured-macro ac:name="status""#),
+        "{saved}"
+    );
+    assert!(!saved.contains("confluence-"), "{saved}");
+}
+
+#[test]
 fn conversion_retains_invalid_xml_for_inspection_even_inside_nested_macros() {
     for markdown in [
         "```confluence-storage\n<p></wrong>\n```",

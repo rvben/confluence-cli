@@ -1522,7 +1522,7 @@ fn rewrite_local_links_to_remote(
     static SRC: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r#"(\s)src="([^"]+)""#).expect("valid src regex"));
 
-    let storage = rewrite_outside_cdata(storage, rewrite_placeholder_links_to_storage);
+    let storage = resolve_placeholder_links(storage);
     rewrite_outside_literal_sections(&storage, |markup| {
         ELEMENT
             .replace_all(markup, |element: &regex::Captures<'_>| {
@@ -1952,6 +1952,13 @@ fn rewrite_generic_macro_page_placeholder_line(
     let rewritten = resolve_placeholder_to_local_path(target, current_dir, paths, items)
         .unwrap_or_else(|| target.to_string());
     format!("{}: {} {}", name.trim_end(), prefix, rewritten)
+}
+
+/// Writes the placeholder links of rendered storage, which stand for a page,
+/// a user or a status in Markdown, as the Confluence elements they stand for.
+/// CDATA sections hold literal text and pass through untouched.
+pub fn resolve_placeholder_links(storage: &str) -> String {
+    rewrite_outside_cdata(storage, rewrite_placeholder_links_to_storage)
 }
 
 fn rewrite_placeholder_links_to_storage(storage: &str) -> String {

@@ -2565,7 +2565,13 @@ fn read_body_storage(input: &BodyInput) -> Result<String> {
     }
     let raw = read_body_text(input)?;
     match input.format {
-        BodyFormat::Markdown => Ok(markdown_to_storage(&raw, input.allow_lossy)?.storage),
+        BodyFormat::Markdown => {
+            let storage = crate::sync::resolve_placeholder_links(
+                &markdown_to_storage(&raw, input.allow_lossy)?.storage,
+            );
+            crate::storage::validate_generated_storage(&storage)?;
+            Ok(storage)
+        }
         BodyFormat::Storage => {
             crate::storage::validate_storage(&raw)?;
             Ok(raw)
@@ -2602,9 +2608,9 @@ fn handle_convert(args: ConvertArgs, output: OutputFormat) -> Result<()> {
     }
     let raw = read_body_text(&args.body)?;
     let storage = match args.body.format {
-        BodyFormat::Markdown => {
-            crate::markdown::render_markdown_storage(&raw, args.body.allow_lossy)?.storage
-        }
+        BodyFormat::Markdown => crate::sync::resolve_placeholder_links(
+            &crate::markdown::render_markdown_storage(&raw, args.body.allow_lossy)?.storage,
+        ),
         BodyFormat::Storage => raw,
     };
     let parent = args
@@ -3555,6 +3561,30 @@ mod tests {
             panic!("expected page update");
         };
         assert_eq!(read_body_storage(&args.body).unwrap(), storage);
+    }
+
+    #[test]
+    fn markdown_body_writes_placeholder_links_as_confluence_links() {
+        let cli = Cli::parse_from([
+            "confluence",
+            "page",
+            "update",
+            "123",
+            "--body",
+            "[@Ada](confluence-user://user?userkey=user-123)",
+        ]);
+        let Commands::Page {
+            command: PageCommand::Update(args),
+        } = cli.command
+        else {
+            panic!("expected page update");
+        };
+        let storage = read_body_storage(&args.body).unwrap();
+        assert!(
+            storage.contains(r#"<ac:link><ri:user ri:userkey="user-123""#),
+            "{storage}"
+        );
+        assert!(!storage.contains("confluence-user://"), "{storage}");
     }
 
     #[test]
