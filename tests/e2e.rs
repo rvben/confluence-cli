@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 #[path = "support/confluence_simulator.rs"]
 mod confluence_simulator;
 
-use confluence_simulator::ConfluenceSimulator;
+use confluence_simulator::{ConfluenceSimulator, FAILING_USER_ID, KNOWN_USER_ID, KNOWN_USER_NAME};
 
 #[derive(Clone, Debug)]
 struct E2eConfig {
@@ -492,6 +492,85 @@ async fn simulated_cloud_supports_the_live_canary_contract() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_shows_the_name_of_a_mentioned_user_and_plans_no_change() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    let storage = format!(
+        r#"<p>Ask <ac:link><ri:user ri:account-id="{KNOWN_USER_ID}" /></ac:link> or <ac:link><ri:user ri:account-id="gone-user" /></ac:link>.</p>"#
+    );
+    let page_id = simulator.add_page("Mentions", Some("100"), &storage);
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().expect("pull destination");
+        let pull_dir = temp.path().join("pull");
+        let pull_arg = pull_dir.to_string_lossy().into_owned();
+
+        let pulled = cfg.run_json(&["pull", "page", &page_id, &pull_arg]);
+        assert_eq!(
+            list_items(&pulled, "pull")[0]["storage_differs_from_remote"],
+            false
+        );
+        let markdown = fs::read_to_string(find_index_md(&pull_dir)).expect("pulled Markdown");
+        assert!(
+            markdown.contains(&format!("Ask [@{KNOWN_USER_NAME}](confluence-user://user?")),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("or [gone-user](confluence-user://user?"),
+            "{markdown}"
+        );
+
+        let plan = cfg.run_json(&["plan", &pull_arg]);
+        let items = list_items(&plan, "plan");
+        assert!(items.iter().all(|item| item["action"] == "noop"), "{plan}");
+    })
+    .await
+    .expect("mention pull task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_goes_on_when_the_name_of_a_mentioned_user_cannot_be_looked_up() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    let storage =
+        format!(r#"<p>Ask <ac:link><ri:user ri:account-id="{FAILING_USER_ID}" /></ac:link>.</p>"#);
+    let page_id = simulator.add_page("Mentions", Some("100"), &storage);
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().expect("pull destination");
+        let pull_dir = temp.path().join("pull");
+        let pull_arg = pull_dir.to_string_lossy().into_owned();
+
+        let pulled = cfg
+            .command()
+            .args(["pull", "page", &page_id, &pull_arg, "-o", "json"])
+            .output()
+            .expect("pull");
+        assert_eq!(pulled.status.code(), Some(0), "{pulled:?}");
+        let warning = String::from_utf8_lossy(&pulled.stderr);
+        assert!(
+            warning.contains("names of mentioned users could not be looked up"),
+            "{warning}"
+        );
+        let markdown = fs::read_to_string(find_index_md(&pull_dir)).expect("pulled Markdown");
+        assert!(
+            markdown.contains(&format!("Ask [{FAILING_USER_ID}](confluence-user://user?")),
+            "{markdown}"
+        );
+
+        let plan = cfg.run_json(&["plan", &pull_arg]);
+        let items = list_items(&plan, "plan");
+        assert!(items.iter().all(|item| item["action"] == "noop"), "{plan}");
+    })
+    .await
+    .expect("mention pull task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pull_marks_a_page_that_markdown_does_not_carry_until_an_update_rewrites_it() {
     let simulator = ConfluenceSimulator::start().await;
     let config_home = TempDir::new().expect("simulator config home");
@@ -580,7 +659,11 @@ async fn pull_writes_the_rest_of_a_tree_when_a_page_does_not_convert() {
     // A code macro holds plain text, so this body is one the converter
     // refuses to write back.
     let broken_storage = r#"<ac:structured-macro ac:name="code"><ac:rich-text-body><p>x</p></ac:rich-text-body></ac:structured-macro>"#;
-    let root_id = simulator.add_page("Tree root", Some("100"), "<p>Root text</p>");
+    let root_id = simulator.add_page(
+        "Tree root",
+        Some("100"),
+        r#"<p>Root text <ac:link><ri:page ri:content-title="Broken" /><ac:plain-text-link-body><![CDATA[the broken page]]></ac:plain-text-link-body></ac:link> and <ac:link><ri:page ri:content-title="Leaf" /><ac:plain-text-link-body><![CDATA[the leaf]]></ac:plain-text-link-body></ac:link></p>"#,
+    );
     let broken_id = simulator.add_page("Broken", Some(&root_id), broken_storage);
     let leaf_id = simulator.add_page("Leaf", Some(&broken_id), "<p>Leaf text</p>");
 
@@ -641,8 +724,18 @@ async fn pull_writes_the_rest_of_a_tree_when_a_page_does_not_convert() {
 
         // The pages that were written sync as usual: the leaf keeps the parent
         // it has remotely, and a second pull may replace the snapshot.
+        // A link to the page left out has no local file to point at, so it
+        // stays the remote reference; a link to a page that is written is local.
+        let root_markdown = fs::read_to_string(&root_index).expect("root markdown");
+        assert!(
+            root_markdown.contains("[the broken page](confluence-page://"),
+            "{root_markdown}"
+        );
+        assert!(root_markdown.contains("/index.md)"), "{root_markdown}");
         let plan = cfg.run_json(&["plan", &pull_arg]);
-        assert_eq!(&list_items(&plan, "plan")[0]["action"], "noop");
+        for item in list_items(&plan, "plan") {
+            assert_eq!(item["action"], "noop", "{plan}");
+        }
         let edited = fs::read_to_string(&leaf_index)
             .expect("leaf markdown")
             .replace("Leaf text", "Edited leaf");

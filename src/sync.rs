@@ -12,15 +12,17 @@ use tempfile::Builder;
 use walkdir::WalkDir;
 
 use crate::markdown::{
-    Frontmatter, LocalDocument, PageLinkPlaceholder, Sidecar, UserMentionPlaceholder,
-    build_page_placeholder_url, build_storage_link_body, decode_character_references,
-    document_dir_name, encode_target_segment, has_generated_label, is_local_target,
-    link_body_unless_default, link_display_attributes, load_document, parse_page_placeholder_url,
-    parse_status_placeholder_url, parse_user_placeholder_url, rewrite_outside_cdata,
-    rewrite_outside_literal_sections, save_document, scan_local_documents, sha256_hex,
-    split_target_fragment, storage_to_markdown,
+    Frontmatter, LocalDocument, PULL_FAILURES_DIR, PULL_FAILURES_MANIFEST, PageLinkPlaceholder,
+    Sidecar, UserMentionPlaceholder, build_page_placeholder_url, build_storage_link_body,
+    decode_character_references, document_dir_name, encode_target_segment, has_generated_label,
+    is_local_target, link_body_unless_default, link_display_attributes, load_document,
+    parse_page_placeholder_url, parse_status_placeholder_url, parse_user_placeholder_url,
+    rewrite_outside_cdata, rewrite_outside_literal_sections, save_document, scan_local_documents,
+    sha256_hex, split_target_fragment, storage_to_markdown,
 };
-use crate::model::{AttachmentState, ContentItem, ContentKind, PlanActionKind, PlanItem, SyncPlan};
+use crate::model::{
+    AttachmentState, ContentItem, ContentKind, PlanActionKind, PlanItem, SyncPlan, UserReference,
+};
 use crate::provider::ConfluenceProvider;
 
 #[derive(Clone, Debug)]
@@ -44,11 +46,6 @@ struct LinkIndex {
 const REWRITES_REMOTE_MARKUP: &str =
     "also rewrites markup of this page that Markdown does not carry as it is stored";
 
-/// Directory inside a pulled snapshot that holds what was fetched and
-/// generated for the pages whose Markdown does not convert back to valid
-/// storage. Nothing in it is a document, so `plan` and `apply` pass it by.
-const PULL_FAILURES_DIR: &str = ".confluence-pull-failures";
-
 /// A page that a pull wrote as a local document.
 #[derive(Debug, Clone)]
 pub struct PulledPage {
@@ -66,9 +63,12 @@ struct UnconvertiblePage {
     /// Where the generated Markdown, the storage it converts to and the
     /// remote storage are kept for inspection.
     artifacts: PathBuf,
+    /// Whether the Markdown converted far enough to keep its storage.
+    generated_storage: bool,
 }
 
 /// A page as fetched, on its way to becoming a local document.
+#[derive(Clone)]
 struct FetchedPage {
     document: LocalDocument,
     remote_storage: String,
@@ -850,18 +850,21 @@ async fn pull_items(
         .tempdir_in(parent)
         .with_context(|| format!("failed to stage pull beside {}", root.display()))?;
     let staged_root = staging.path().join("snapshot");
-    let (written, unconvertible) = write_items(provider, &staged_root, items).await?;
-    install_pulled_pages(&staged_root, root, written, unconvertible)
+    let (written, unconvertible, warnings) = write_items(provider, &staged_root, items).await?;
+    install_pulled_pages(&staged_root, root, written, unconvertible, warnings)
 }
 
 /// Moves a staged snapshot to its destination and reports its pages there.
 /// The snapshot is installed also when some pages were left out, and the
-/// result is then the error that names them.
+/// result is then the error that names them. That error carries the
+/// warnings of the pull, so that it is all the pull reports; a pull that
+/// leaves nothing out prints them.
 fn install_pulled_pages(
     staged_root: &Path,
     root: &Path,
     mut written: Vec<PulledPage>,
     mut unconvertible: Vec<UnconvertiblePage>,
+    warnings: Vec<String>,
 ) -> Result<Vec<PulledPage>> {
     install_staged_snapshot(staged_root, root)?;
 
@@ -882,9 +885,16 @@ fn install_pulled_pages(
         page.artifacts = installed(&page.artifacts)?;
     }
     if unconvertible.is_empty() {
+        for warning in &warnings {
+            crate::output::print_message(&format!("warning: {warning}"));
+        }
         return Ok(written);
     }
-    Err(unconvertible_pages_error(&written, &unconvertible))
+    Err(unconvertible_pages_error(
+        &written,
+        &unconvertible,
+        &warnings,
+    ))
 }
 
 /// Reports the pages a pull left out. The pages that convert are already
@@ -892,6 +902,7 @@ fn install_pulled_pages(
 fn unconvertible_pages_error(
     written: &[PulledPage],
     unconvertible: &[UnconvertiblePage],
+    warnings: &[String],
 ) -> anyhow::Error {
     let summary = unconvertible
         .iter()
@@ -913,7 +924,7 @@ fn unconvertible_pages_error(
             written.len() + unconvertible.len(),
         ),
         Some(format!(
-            "Pages written: {}. For each page left out, {} holds generated.md, the generated.xml it converts to and the remote.xml it came from; report them as a conversion bug.",
+            "Pages written: {}. For each page left out, {} holds the remote.xml it came from, the generated.md made from it and, when that Markdown converts at all, the generated.xml it converts to; report them as a conversion bug.{}{}",
             written.len(),
             unconvertible
                 .first()
@@ -922,10 +933,32 @@ fn unconvertible_pages_error(
                     || PULL_FAILURES_DIR.to_string(),
                     |dir| dir.display().to_string()
                 ),
+            match written
+                .iter()
+                .filter(|page| page.storage_differs_from_remote)
+                .count()
+            {
+                0 => String::new(),
+                differing => format!(
+                    " {differing} of {} pages written hold markup that Markdown does not carry as it is stored; the first update applied to such a page rewrites that markup. `confluence plan` names them.",
+                    written.len()
+                ),
+            },
+            warnings
+                .iter()
+                .map(|warning| format!(" Also: {warning}."))
+                .collect::<String>(),
         )),
         serde_json::json!({
             "operation": "pull",
-            "written": written.iter().map(|page| &page.path).collect::<Vec<_>>(),
+            "written": written
+                .iter()
+                .map(|page| serde_json::json!({
+                    "path": page.path,
+                    "storage_differs_from_remote": page.storage_differs_from_remote,
+                }))
+                .collect::<Vec<_>>(),
+            "warnings": warnings,
             "pages": unconvertible
                 .iter()
                 .map(|page| serde_json::json!({
@@ -933,6 +966,10 @@ fn unconvertible_pages_error(
                     "title": page.title,
                     "error": page.error,
                     "artifacts": page.artifacts,
+                    "files": PULL_FAILURE_ARTIFACTS
+                        .iter()
+                        .filter(|name| page.generated_storage || **name != "generated.xml")
+                        .collect::<Vec<_>>(),
                 }))
                 .collect::<Vec<_>>(),
         }),
@@ -1012,6 +1049,9 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<()> {
     }
 
     let failures_dir = root.join(PULL_FAILURES_DIR);
+    if !holds_only_pull_failure_artifacts(&failures_dir)? {
+        return Err(dirty_pull_destination_error(root));
+    }
     let docs = load_local_documents(root)?;
     if docs.is_empty() {
         for entry in fs::read_dir(root)? {
@@ -1062,6 +1102,91 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// The files a pull keeps for a page it leaves out.
+const PULL_FAILURE_ARTIFACTS: [&str; 3] = ["generated.md", "generated.xml", "remote.xml"];
+
+/// Records the files kept for the pages a pull left out, which is what lets
+/// a later pull tell them from files of the user.
+fn write_pull_failures_manifest(root: &Path, unconvertible: &[UnconvertiblePage]) -> Result<()> {
+    let failures_dir = root.join(PULL_FAILURES_DIR);
+    let mut manifest = BTreeMap::new();
+    for page in unconvertible {
+        let Some(directory) = page.artifacts.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        for name in PULL_FAILURE_ARTIFACTS {
+            let path = page.artifacts.join(name);
+            if path.is_file() {
+                let contents = fs::read(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                manifest.insert(format!("{directory}/{name}"), sha256_hex(contents));
+            }
+        }
+    }
+    let path = failures_dir.join(PULL_FAILURES_MANIFEST);
+    fs::write(&path, serde_json::to_string_pretty(&manifest)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Whether a pull may replace `failures_dir`: it is absent, or it holds
+/// only files its manifest records, each as the pull wrote it, and no
+/// directory but the ones those files were written in. Anything else is
+/// somebody's own data. A file that was removed leaves nothing to keep.
+fn holds_only_pull_failure_artifacts(failures_dir: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(failures_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    let manifest_path = failures_dir.join(PULL_FAILURES_MANIFEST);
+    let is_file = |path: &Path| fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file());
+    if !is_file(&manifest_path) {
+        return Ok(false);
+    }
+    let Ok(manifest) =
+        serde_json::from_slice::<BTreeMap<String, String>>(&fs::read(&manifest_path)?)
+    else {
+        return Ok(false);
+    };
+    for entry in WalkDir::new(failures_dir).min_depth(1) {
+        let entry = entry?;
+        if entry.path() == manifest_path {
+            continue;
+        }
+        let Some(relative) = entry
+            .path()
+            .strip_prefix(failures_dir)
+            .ok()
+            .and_then(|relative| {
+                relative
+                    .iter()
+                    .map(|part| part.to_str())
+                    .collect::<Option<Vec<_>>>()
+            })
+            .map(|parts| parts.join("/"))
+        else {
+            return Ok(false);
+        };
+        let as_written = if entry.file_type().is_dir() {
+            let below = format!("{relative}/");
+            manifest.keys().any(|path| path.starts_with(&below))
+        } else if entry.file_type().is_file() {
+            manifest.get(&relative).is_some_and(|hash| {
+                fs::read(entry.path()).is_ok_and(|read| sha256_hex(read) == *hash)
+            })
+        } else {
+            false
+        };
+        if !as_written {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn validate_filtered_pull_destination(root: &Path) -> Result<()> {
     if !root.exists() {
         return Ok(());
@@ -1100,7 +1225,7 @@ async fn write_items(
     provider: &dyn ConfluenceProvider,
     root: &Path,
     items: Vec<ContentItem>,
-) -> Result<(Vec<PulledPage>, Vec<UnconvertiblePage>)> {
+) -> Result<(Vec<PulledPage>, Vec<UnconvertiblePage>, Vec<String>)> {
     let mut item_map = BTreeMap::new();
     for item in items {
         item_map.insert(item.id.clone(), item);
@@ -1125,7 +1250,10 @@ async fn write_items(
             ));
         }
     }
-    let mut fetched = Vec::new();
+    let mut pulled = Vec::new();
+    let mut user_names = BTreeMap::new();
+    let mut names_available = true;
+    let mut warnings = Vec::new();
     for item in item_map.values() {
         let Some(dir) = paths.get(&item.id) else {
             continue;
@@ -1156,13 +1284,111 @@ async fn write_items(
             );
         }
 
-        let mut body_markdown =
-            storage_to_markdown(item.body_storage.as_deref().unwrap_or_default());
-        body_markdown = rewrite_page_links(&body_markdown, dir, &paths, &item_map);
-        body_markdown =
-            rewrite_generic_macro_page_placeholders(&body_markdown, dir, &paths, &item_map);
-        body_markdown = rewrite_attachment_links(&body_markdown, &attachments);
+        let mut item = PulledItem {
+            item,
+            directory: dir,
+            attachments,
+            attachment_map,
+            markdown_linking_all: String::new(),
+        };
+        item.markdown_linking_all = item.markdown(&paths, &item_map);
+        for user in unnamed_mentions(&item.markdown_linking_all) {
+            if let std::collections::btree_map::Entry::Vacant(entry) = user_names.entry(user) {
+                // A name is a convenience for the reader, so a lookup that
+                // fails leaves the identifier in place and ends the lookups,
+                // and the pull goes on.
+                let name = if names_available {
+                    provider
+                        .user_display_name(entry.key())
+                        .await
+                        .unwrap_or_else(|error| {
+                            names_available = false;
+                            warnings.push(format!(
+                                "the names of mentioned users could not be looked up, so their mentions show identifiers: {error:#}"
+                            ));
+                            None
+                        })
+                } else {
+                    None
+                };
+                entry.insert(name);
+            }
+        }
+        pulled.push(item);
+    }
 
+    let provider_kind = provider.kind();
+    let web_path_prefix = provider.web_path_prefix();
+    let (documents, left_out) = convertible_pages(|left_out| {
+        // A page that is left out has no local file, so a link to it stays
+        // the remote address it was pulled as.
+        let link_paths: BTreeMap<String, PathBuf> = paths
+            .iter()
+            .filter(|(_, directory)| !left_out.contains(*directory))
+            .map(|(content_id, directory)| (content_id.clone(), directory.clone()))
+            .collect();
+        pulled
+            .iter()
+            .filter(|item| !left_out.contains(item.directory))
+            .map(|item| {
+                let markdown = if left_out.is_empty() {
+                    std::borrow::Cow::Borrowed(item.markdown_linking_all.as_str())
+                } else {
+                    std::borrow::Cow::Owned(item.markdown(&link_paths, &item_map))
+                };
+                let body_markdown = name_user_mentions(&markdown, &user_names);
+                item.fetched_page(
+                    body_markdown,
+                    &item_map,
+                    provider_kind,
+                    web_path_prefix.clone(),
+                )
+            })
+            .collect()
+    });
+    let (written, unconvertible) = store_fetched_pages(root, documents, left_out)?;
+    Ok((written, unconvertible, warnings))
+}
+
+/// An item of a pull with its attachments downloaded.
+struct PulledItem<'a> {
+    item: &'a ContentItem,
+    directory: &'a Path,
+    attachments: Vec<crate::model::AttachmentInfo>,
+    attachment_map: BTreeMap<String, AttachmentState>,
+    /// The item's Markdown with links to every page of the pull, which is
+    /// what is written unless a page is left out.
+    markdown_linking_all: String,
+}
+
+impl PulledItem<'_> {
+    /// The item's body as Markdown, with links to the pages in `link_paths`
+    /// and to its attachments pointing at their local files.
+    fn markdown(
+        &self,
+        link_paths: &BTreeMap<String, PathBuf>,
+        item_map: &BTreeMap<String, ContentItem>,
+    ) -> String {
+        let mut markdown =
+            storage_to_markdown(self.item.body_storage.as_deref().unwrap_or_default());
+        markdown = rewrite_page_links(&markdown, self.directory, link_paths, item_map);
+        markdown = rewrite_generic_macro_page_placeholders(
+            &markdown,
+            self.directory,
+            link_paths,
+            item_map,
+        );
+        rewrite_attachment_links(&markdown, &self.attachments)
+    }
+
+    fn fetched_page(
+        &self,
+        body_markdown: String,
+        item_map: &BTreeMap<String, ContentItem>,
+        provider_kind: crate::model::ProviderKind,
+        web_path_prefix: String,
+    ) -> FetchedPage {
+        let item = self.item;
         let frontmatter = Frontmatter {
             title: item.title.clone(),
             kind: item.kind.file_type().to_string(),
@@ -1180,8 +1406,8 @@ async fn write_items(
         let sidecar = Sidecar {
             content_id: Some(item.id.clone()),
             space_key: item.space_key.clone(),
-            provider: Some(provider.kind()),
-            web_path_prefix: Some(provider.web_path_prefix()),
+            provider: Some(provider_kind),
+            web_path_prefix: Some(web_path_prefix),
             remote_version: item.version,
             remote_parent_id: item.parent_id.clone(),
             last_pulled_hash: Some(markdown_body_hash(&body_markdown)),
@@ -1189,7 +1415,7 @@ async fn write_items(
             remote_storage_hash: Some(sha256_hex(
                 item.body_storage.as_deref().unwrap_or_default().as_bytes(),
             )),
-            attachment_map,
+            attachment_map: self.attachment_map.clone(),
             last_sync_at: Some(Utc::now()),
             last_pulled_title: Some(item.title.clone()),
             last_pulled_labels: item.labels.clone(),
@@ -1199,29 +1425,52 @@ async fn write_items(
             last_pulled_body_markdown: Some(body_markdown.clone()),
             storage_differs_from_remote: false,
         };
-        fetched.push(FetchedPage {
+        FetchedPage {
             document: LocalDocument {
-                directory: dir.clone(),
-                markdown_path: dir.join("index.md"),
-                sidecar_path: dir.join(".confluence.json"),
+                directory: self.directory.to_path_buf(),
+                markdown_path: self.directory.join("index.md"),
+                sidecar_path: self.directory.join(".confluence.json"),
                 frontmatter,
                 body_markdown,
                 sidecar,
             },
             remote_storage: item.body_storage.clone().unwrap_or_default(),
-        });
+        }
     }
-
-    store_fetched_pages(root, fetched)
 }
 
-/// Writes the fetched pages that convert back to storage as local documents,
-/// and keeps the rest for inspection outside the document tree.
+/// Converts the fetched pages back to storage and sorts them into the ones
+/// to write and the ones to leave out. `render` gives the fetched pages
+/// without those in the directories it is passed, linking to none of them.
+/// It is asked again whenever more pages are left out, so that a page that is
+/// written links to a local file only when that file is written too, and its
+/// storage hash is the one a later plan computes.
+fn convertible_pages(
+    render: impl Fn(&BTreeSet<PathBuf>) -> Vec<FetchedPage>,
+) -> (Vec<LocalDocument>, Vec<LeftOutPage>) {
+    let mut directories = BTreeSet::new();
+    let mut left_out = Vec::new();
+    loop {
+        let (documents, failures) = stamp_storage_hashes(render(&directories));
+        if failures.is_empty() {
+            return (documents, left_out);
+        }
+        directories.extend(
+            failures
+                .iter()
+                .map(|failure| failure.page.document.directory.clone()),
+        );
+        left_out.extend(failures);
+    }
+}
+
+/// Writes the pages that convert back to storage as local documents, and
+/// keeps the rest for inspection outside the document tree.
 fn store_fetched_pages(
     root: &Path,
-    fetched: Vec<FetchedPage>,
+    documents: Vec<LocalDocument>,
+    left_out: Vec<LeftOutPage>,
 ) -> Result<(Vec<PulledPage>, Vec<UnconvertiblePage>)> {
-    let (documents, failures) = stamp_storage_hashes(fetched);
     let mut written = Vec::with_capacity(documents.len());
     for doc in documents {
         save_document(&doc)?;
@@ -1230,25 +1479,35 @@ fn store_fetched_pages(
             storage_differs_from_remote: doc.sidecar.storage_differs_from_remote,
         });
     }
-    let unconvertible = failures
+    let unconvertible = left_out
         .iter()
-        .map(|(page, error)| keep_unconvertible_page(root, page, error))
+        .map(|page| keep_unconvertible_page(root, page))
         .collect::<Result<Vec<_>>>()?;
+    if !unconvertible.is_empty() {
+        write_pull_failures_manifest(root, &unconvertible)?;
+    }
     // A page that is left out has no document, so its directory holds at
     // most the pages beneath it. The deepest goes first, so a directory whose
-    // pages were all left out goes too.
-    let mut left_out: Vec<&Path> = failures
+    // pages were all left out goes too, and so does a directory that only
+    // groups pages, such as the one of the blog posts, once it is empty.
+    let mut directories: Vec<&Path> = left_out
         .iter()
-        .map(|(page, _)| page.document.directory.as_path())
+        .map(|left_out| left_out.page.document.directory.as_path())
         .collect();
-    left_out.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
-    for directory in left_out {
+    directories.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
+    for directory in directories {
         let attachments = directory.join("attachments");
         if attachments.exists() {
             fs::remove_dir_all(&attachments)
                 .with_context(|| format!("failed to remove {}", attachments.display()))?;
         }
-        if directory.exists() && fs::read_dir(directory)?.next().is_none() {
+        let below_root = directory
+            .ancestors()
+            .take_while(|ancestor| *ancestor != root && ancestor.starts_with(root));
+        for directory in below_root {
+            if !directory.exists() || fs::read_dir(directory)?.next().is_some() {
+                break;
+            }
             fs::remove_dir(directory)
                 .with_context(|| format!("failed to remove {}", directory.display()))?;
         }
@@ -1257,13 +1516,19 @@ fn store_fetched_pages(
     Ok((written, unconvertible))
 }
 
+/// A fetched page whose Markdown does not convert back to valid storage.
+struct LeftOutPage {
+    page: FetchedPage,
+    error: String,
+    /// The storage the Markdown converts to, when conversion gets that far.
+    generated_storage: Option<String>,
+}
+
 /// Converts the Markdown of each fetched page back to storage. A page that
 /// converts gets the hash of that storage and whether it still says what the
 /// remote storage says. A page that does not convert is returned with the
 /// reason, so one such page does not keep the others from being written.
-fn stamp_storage_hashes(
-    fetched: Vec<FetchedPage>,
-) -> (Vec<LocalDocument>, Vec<(FetchedPage, String)>) {
+fn stamp_storage_hashes(fetched: Vec<FetchedPage>) -> (Vec<LocalDocument>, Vec<LeftOutPage>) {
     let link_index = build_link_index(fetched.iter().map(|page| &page.document));
     let mut stamped = Vec::with_capacity(fetched.len());
     let mut failures = Vec::new();
@@ -1276,11 +1541,12 @@ fn stamp_storage_hashes(
         let lines_before = generated
             .as_deref()
             .and_then(|file| lines_before_body(file, &page.document.body_markdown));
+        let web_path_prefix = effective_web_path_prefix(&page.document.sidecar, None);
         match render_storage_of_body(
             &page.document,
             &link_index,
             false,
-            effective_web_path_prefix(&page.document.sidecar, None),
+            &web_path_prefix,
             lines_before,
         ) {
             Ok(storage) => {
@@ -1290,7 +1556,15 @@ fn stamp_storage_hashes(
                     !crate::storage::same_document(&storage, &page.remote_storage);
                 stamped.push(page.document);
             }
-            Err(error) => failures.push((page, format!("{error:#}"))),
+            Err(error) => {
+                let generated_storage =
+                    unvalidated_storage_of_body(&page.document, &link_index, &web_path_prefix).ok();
+                failures.push(LeftOutPage {
+                    page,
+                    error: format!("{error:#}"),
+                    generated_storage,
+                });
+            }
         }
     }
     (stamped, failures)
@@ -1299,12 +1573,8 @@ fn stamp_storage_hashes(
 /// Keeps what a pull has of a page it leaves out: the Markdown generated for
 /// it, the storage that Markdown converts to when conversion gets that far,
 /// and the remote storage.
-fn keep_unconvertible_page(
-    root: &Path,
-    page: &FetchedPage,
-    error: &str,
-) -> Result<UnconvertiblePage> {
-    let document = &page.document;
+fn keep_unconvertible_page(root: &Path, left_out: &LeftOutPage) -> Result<UnconvertiblePage> {
+    let document = &left_out.page.document;
     let artifacts = root.join(PULL_FAILURES_DIR).join(document_dir_name(
         &document.frontmatter.title,
         document.sidecar.content_id.as_deref(),
@@ -1319,19 +1589,16 @@ fn keep_unconvertible_page(
         "generated.md",
         &crate::markdown::render_document(&document.frontmatter, &document.body_markdown)?,
     )?;
-    if let Ok(converted) = crate::markdown::render_markdown_storage(&document.body_markdown, false)
-    {
-        write(
-            "generated.xml",
-            &resolve_placeholder_links(&converted.storage),
-        )?;
+    if let Some(storage) = &left_out.generated_storage {
+        write("generated.xml", storage)?;
     }
-    write("remote.xml", &page.remote_storage)?;
+    write("remote.xml", &left_out.page.remote_storage)?;
     Ok(UnconvertiblePage {
         content_id: document.sidecar.content_id.clone(),
         title: document.frontmatter.title.clone(),
-        error: error.to_string(),
+        error: left_out.error.clone(),
         artifacts,
+        generated_storage: left_out.generated_storage.is_some(),
     })
 }
 
@@ -1499,6 +1766,24 @@ fn render_storage_of_body(
     );
     crate::storage::validate_generated_storage(&storage)?;
     Ok(storage)
+}
+
+/// The storage a document's body converts to, valid or not: what
+/// `render_storage_of_body` validates.
+fn unvalidated_storage_of_body(
+    doc: &LocalDocument,
+    link_index: &LinkIndex,
+    web_path_prefix: &str,
+) -> Result<String> {
+    let rewritten_markdown =
+        rewrite_macro_page_references(&doc.body_markdown, &doc.directory, link_index);
+    let converted = crate::markdown::render_markdown_storage(&rewritten_markdown, false)?;
+    Ok(rewrite_local_links_to_remote(
+        &converted.storage,
+        &doc.directory,
+        link_index,
+        web_path_prefix,
+    ))
 }
 
 /// The number of lines of `file` that precede the first line of `body`, when
@@ -2013,30 +2298,205 @@ fn rewrite_page_links(
     })
 }
 
+/// A mention pulled without a link body, as Markdown writes it: the generated
+/// label and the placeholder target.
+static USER_MENTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\[((?:\\.|[^\]\\\n])*)\]\((confluence-user://user\?[^\s\)"]+)\)$"#)
+        .expect("valid user mention regex")
+});
+
+/// The user a mention target stands for, when the mention carries a generated
+/// label that does not name the user yet.
+fn unnamed_mention_user(target: &str) -> Option<UserReference> {
+    let user = crate::markdown::parse_user_placeholder_url(target)?;
+    (has_generated_label(target)
+        && crate::markdown::generated_user_label(target, &user) == user.default_label())
+    .then(|| user.reference())
+    .flatten()
+}
+
+/// Where pulled Markdown links to a user placeholder, with the placeholder
+/// target as written, in the order of the text. Only what Markdown reads as
+/// a link counts: the same characters in code or in a raw block are text of
+/// the page. The cells of a layout section hold Markdown of their own.
+fn user_mention_links(markdown: &str) -> Vec<(std::ops::Range<usize>, &str)> {
+    let mut raw = raw_markup_ranges(markdown);
+    raw.extend(macro_parameter_ranges(markdown));
+    let mut links = Vec::new();
+    for (event, range) in
+        pulldown_cmark::Parser::new_ext(markdown, crate::markdown::markdown_options())
+            .into_offset_iter()
+    {
+        match event {
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link { dest_url, .. })
+                if dest_url.starts_with("confluence-user://")
+                    && !raw
+                        .iter()
+                        .any(|raw| raw.start < range.end && range.start < raw.end) =>
+            {
+                let Some(target) = USER_MENTION
+                    .captures(&markdown[range.clone()])
+                    .and_then(|captures| captures.get(2))
+                else {
+                    continue;
+                };
+                links.push((
+                    range.clone(),
+                    &markdown[range.start + target.start()..range.start + target.end()],
+                ));
+            }
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(
+                pulldown_cmark::CodeBlockKind::Fenced(info),
+            )) if info.starts_with("confluence-layout-section") => {
+                for cell in layout_cell_ranges(markdown, range) {
+                    links.extend(user_mention_links(&markdown[cell.clone()]).into_iter().map(
+                        |(link, target)| (cell.start + link.start..cell.start + link.end, target),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    links
+}
+
+/// The ranges of the parameter lines of the macro blocks in pulled Markdown:
+/// from the line that opens a block to the line that starts its body or
+/// closes it. A parameter value is text of the macro, whatever it reads as.
+fn macro_parameter_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
+    const OPENER: &str = ":::confluence-macro ";
+    if !markdown.contains(OPENER) {
+        return Vec::new();
+    }
+    // A line of a code block is code, whatever it reads as.
+    let code_blocks: Vec<_> =
+        pulldown_cmark::Parser::new_ext(markdown, crate::markdown::markdown_options())
+            .into_offset_iter()
+            .filter(|(event, _)| {
+                matches!(
+                    event,
+                    pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))
+                )
+            })
+            .map(|(_, range)| range)
+            .collect();
+    let mut ranges = Vec::new();
+    let mut parameters_start = None;
+    let mut offset = 0;
+    for line in markdown.split_inclusive('\n') {
+        match parameters_start {
+            Some(start) if matches!(line.trim(), "---" | ":::") => {
+                ranges.push(start..offset);
+                parameters_start = None;
+            }
+            None if line.trim_start().starts_with(OPENER)
+                && !code_blocks.iter().any(|block| block.contains(&offset)) =>
+            {
+                parameters_start = Some(offset + line.len());
+            }
+            _ => {}
+        }
+        offset += line.len();
+    }
+    ranges.extend(parameters_start.map(|start| start..markdown.len()));
+    ranges
+}
+
+/// The ranges of the cell bodies of the layout section written at `section`.
+fn layout_cell_ranges(
+    markdown: &str,
+    section: std::ops::Range<usize>,
+) -> Vec<std::ops::Range<usize>> {
+    let mut cells = Vec::new();
+    let mut cell_start = None;
+    let mut offset = section.start;
+    for line in markdown[section].split_inclusive('\n') {
+        let ends_cell = matches!(line.trim_end(), "--- cell ---" | "~~~~");
+        if ends_cell && let Some(start) = cell_start.take() {
+            cells.push(start..offset);
+        }
+        offset += line.len();
+        if line.trim_end() == "--- cell ---" {
+            cell_start = Some(offset);
+        }
+    }
+    cells
+}
+
+/// The users mentioned in pulled Markdown whose mention shows an identifier.
+fn unnamed_mentions(markdown: &str) -> BTreeSet<UserReference> {
+    user_mention_links(markdown)
+        .into_iter()
+        .filter_map(|(_, target)| unnamed_mention_user(target))
+        .collect()
+}
+
+/// Shows the name of each mentioned user whose name is known. The target
+/// records the name, which is how apply recognises the label as generated
+/// and writes the mention back without a link body.
+fn name_user_mentions(markdown: &str, names: &BTreeMap<UserReference, Option<String>>) -> String {
+    let mut named = String::with_capacity(markdown.len());
+    let mut rest = 0;
+    for (link, target) in user_mention_links(markdown) {
+        // A name is shown on one line with single spaces, as Markdown reads
+        // the label back, so that apply still recognises it as generated.
+        let Some(name) = unnamed_mention_user(target)
+            .and_then(|user| names.get(&user).cloned().flatten())
+            .map(|name| name.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        // A cell separator in the name would end the table cell that holds
+        // the mention. Escaped, it is the same character everywhere.
+        let label = crate::markdown::escape_markdown_text(&format!("@{name}")).replace('|', r"\|");
+        named.push_str(&markdown[rest..link.start]);
+        named.push_str(&format!(
+            "[{label}]({})",
+            crate::markdown::with_user_display_name(target, &name)
+        ));
+        rest = link.end;
+    }
+    named.push_str(&markdown[rest..]);
+    named
+}
+
 /// Applies a rewrite to the Markdown around raw storage blocks and links
 /// written as inline tags. Both hold markup that apply writes back as it
 /// stands, so an address inside them stays as pulled.
 fn rewrite_outside_raw_markup(markdown: &str, rewrite: impl Fn(&str) -> String) -> String {
+    let mut rewritten = String::with_capacity(markdown.len());
+    let mut rest = 0;
+    for raw in raw_markup_ranges(markdown) {
+        rewritten.push_str(&rewrite(&markdown[rest..raw.start]));
+        rewritten.push_str(&markdown[raw.clone()]);
+        rest = raw.end;
+    }
+    rewritten
+}
+
+/// Ranges of the raw storage blocks and the links written as inline tags in
+/// pulled Markdown, in order, followed by the empty range at the end of the
+/// text.
+fn raw_markup_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
     static LINK_TAG: LazyLock<Regex> = LazyLock::new(|| {
         // A blank line ends the Markdown block that holds the tag, so a
         // link does not reach past one.
         Regex::new(r"<a\s(?:[^>\n]|\n[^>\n])*\n?>(?:[^\n]|\n[^\n])*?</a>")
             .expect("valid inline link tag regex")
     });
-    let mut rewritten = String::with_capacity(markdown.len());
+    let mut ranges = Vec::new();
     let mut rest = 0;
     for block in raw_storage_block_ranges(markdown) {
-        let mut text = rest;
-        for link in LINK_TAG.find_iter(&markdown[rest..block.start]) {
-            rewritten.push_str(&rewrite(&markdown[text..rest + link.start()]));
-            rewritten.push_str(link.as_str());
-            text = rest + link.end();
-        }
-        rewritten.push_str(&rewrite(&markdown[text..block.start]));
-        rewritten.push_str(&markdown[block.clone()]);
+        ranges.extend(
+            LINK_TAG
+                .find_iter(&markdown[rest..block.start])
+                .map(|link| rest + link.start()..rest + link.end()),
+        );
         rest = block.end;
+        ranges.push(block);
     }
-    rewritten
+    ranges
 }
 
 /// Ranges of the raw storage blocks in pulled Markdown, each from its opening
@@ -2250,7 +2710,11 @@ fn placeholder_to_storage_macro(target: &str, body_html: &str) -> Option<String>
 
     if let Some(placeholder) = parse_user_placeholder_url(target) {
         let resource = user_placeholder_to_storage_resource(&placeholder)?;
-        let body = placeholder_link_body(target, body_html, &placeholder.default_label());
+        let body = placeholder_link_body(
+            target,
+            body_html,
+            &crate::markdown::generated_user_label(target, &placeholder),
+        );
         return Some(format!(
             r#"<ac:link{display_attrs}>{resource}{body}</ac:link>"#
         ));
@@ -4119,6 +4583,192 @@ mod round_trip_tests {
         );
     }
 
+    fn named(user: UserReference, name: &str) -> BTreeMap<UserReference, Option<String>> {
+        BTreeMap::from([(user, Some(name.to_string()))])
+    }
+
+    #[test]
+    fn mention_shows_the_name_of_the_user_and_is_written_back_without_a_body() {
+        for (storage, user) in [
+            (
+                r#"<p>ask <ac:link><ri:user ri:account-id="557058:abc-1" /></ac:link> now</p>"#,
+                UserReference::AccountId("557058:abc-1".to_string()),
+            ),
+            (
+                r#"<p>ask <ac:link><ri:user ri:userkey="8a8a8a8a" /></ac:link> now</p>"#,
+                UserReference::UserKey("8a8a8a8a".to_string()),
+            ),
+            (
+                r#"<p>ask <ac:link><ri:user ri:username="jdoe" /></ac:link> now</p>"#,
+                UserReference::Username("jdoe".to_string()),
+            ),
+        ] {
+            let pulled = storage_to_markdown(storage);
+            assert_eq!(unnamed_mentions(&pulled), BTreeSet::from([user.clone()]));
+            for name in ["Jane Doe", "Jane O'Neil [ops]", "A_b *c* (d)", "Zoë & Co"] {
+                let markdown = name_user_mentions(&pulled, &named(user.clone(), name));
+                let label = crate::markdown::escape_markdown_text(&format!("@{name}"));
+                assert!(
+                    markdown.contains(&format!("ask [{label}](confluence-user://user?")),
+                    "{markdown}"
+                );
+                assert!(unnamed_mentions(&markdown).is_empty(), "{markdown}");
+                let applied = apply_storage(&markdown).expect("apply");
+                assert_eq!(canonical(&applied), canonical(storage), "{markdown}");
+            }
+        }
+    }
+
+    #[test]
+    fn mention_whose_shown_name_is_edited_gets_that_text_as_its_body() {
+        let storage = r#"<p>ask <ac:link><ri:user ri:account-id="abc" /></ac:link> now</p>"#;
+        let user = UserReference::AccountId("abc".to_string());
+        let markdown = name_user_mentions(&storage_to_markdown(storage), &named(user, "Jane Doe"));
+        let edited = markdown.replace("[@Jane Doe]", "[Jane]");
+        assert_ne!(edited, markdown);
+        let applied = apply_storage(&edited).expect("apply");
+        assert_eq!(
+            canonical(&applied),
+            canonical(
+                r#"<p>ask <ac:link><ri:user ri:account-id="abc" /><ac:plain-text-link-body><![CDATA[Jane]]></ac:plain-text-link-body></ac:link> now</p>"#
+            ),
+            "{edited}"
+        );
+    }
+
+    #[test]
+    fn mention_of_a_user_without_a_known_name_keeps_its_identifier() {
+        let storage = r#"<p>ask <ac:link><ri:user ri:account-id="abc" /></ac:link> now</p>"#;
+        let pulled = storage_to_markdown(storage);
+        let user = UserReference::AccountId("abc".to_string());
+        assert_eq!(
+            name_user_mentions(&pulled, &BTreeMap::from([(user, None)])),
+            pulled
+        );
+        assert_eq!(name_user_mentions(&pulled, &BTreeMap::new()), pulled);
+    }
+
+    #[test]
+    fn only_a_mention_without_a_body_is_given_a_name() {
+        let user = UserReference::AccountId("abc".to_string());
+        for storage in [
+            r#"<p>ask <ac:link><ri:user ri:account-id="abc" /><ac:plain-text-link-body><![CDATA[the owner]]></ac:plain-text-link-body></ac:link> now</p>"#,
+            r#"<table class="wide"><tbody><tr><td><ac:link><ri:user ri:account-id="abc" /></ac:link></td></tr></tbody></table>"#,
+            r#"<ac:structured-macro ac:name="profile"><ac:parameter ac:name="user"><ri:user ri:account-id="abc" /></ac:parameter></ac:structured-macro>"#,
+        ] {
+            let pulled = storage_to_markdown(storage);
+            assert!(unnamed_mentions(&pulled).is_empty(), "{pulled}");
+            assert_eq!(
+                name_user_mentions(&pulled, &named(user.clone(), "Jane Doe")),
+                pulled
+            );
+        }
+    }
+
+    #[test]
+    fn mention_in_a_table_keeps_its_cell_when_the_name_holds_a_cell_separator() {
+        let storage = concat!(
+            "<table><thead><tr><th>Owner</th><th>Note</th></tr></thead><tbody>",
+            r#"<tr><td><ac:link><ri:user ri:account-id="abc" /></ac:link></td><td>x</td></tr>"#,
+            "</tbody></table>",
+        );
+        let pulled = storage_to_markdown(storage);
+        assert!(pulled.contains("| Owner | Note |"), "{pulled}");
+        let user = UserReference::AccountId("abc".to_string());
+        for name in ["Ops | Jane", "Jane|", r"Jane \| Ops"] {
+            let markdown = name_user_mentions(&pulled, &named(user.clone(), name));
+            assert_ne!(markdown, pulled);
+            assert!(unnamed_mentions(&markdown).is_empty(), "{markdown}");
+            let applied = apply_storage(&markdown).expect("apply");
+            assert_eq!(canonical(&applied), canonical(storage), "{markdown}");
+        }
+    }
+
+    #[test]
+    fn mention_shows_a_name_on_one_line_with_single_spaces() {
+        let user = UserReference::AccountId("abc".to_string());
+        for storage in [
+            r#"<p>ask <ac:link><ri:user ri:account-id="abc" /></ac:link> now</p>"#,
+            r#"<h2>Owner <ac:link><ri:user ri:account-id="abc" /></ac:link></h2>"#,
+            r#"<ul><li><ac:link><ri:user ri:account-id="abc" /></ac:link></li></ul>"#,
+        ] {
+            let pulled = storage_to_markdown(storage);
+            for name in ["  Jane  ", "Jane\r\nDoe", "Jane\nDoe", "Jane \t Doe"] {
+                let markdown = name_user_mentions(&pulled, &named(user.clone(), name));
+                assert!(
+                    markdown.contains("[@Jane](") || markdown.contains("[@Jane Doe]("),
+                    "{markdown}"
+                );
+                let applied = apply_storage(&markdown).expect("apply");
+                assert_eq!(canonical(&applied), canonical(storage), "{markdown}");
+            }
+            assert_eq!(
+                name_user_mentions(&pulled, &named(user.clone(), " \n ")),
+                pulled
+            );
+        }
+    }
+
+    #[test]
+    fn mention_written_as_a_macro_parameter_is_not_given_a_name() {
+        let user = UserReference::AccountId("abc".to_string());
+        let mention = "[abc](confluence-user://user?account-id=abc&label=generated)";
+        let markdown = format!(
+            ":::confluence-macro custom\ntitle: {mention}\n---\nask {mention}\n:::\n\n:::confluence-macro other\nnote: {mention}\n:::\n\nand {mention}\n"
+        );
+        let named = name_user_mentions(&markdown, &named(user, "Jane Doe"));
+        assert!(named.contains(&format!("title: {mention}\n")), "{named}");
+        assert!(named.contains(&format!("note: {mention}\n")), "{named}");
+        assert_eq!(named.matches("[@Jane Doe](").count(), 2, "{named}");
+    }
+
+    #[test]
+    fn mention_after_a_code_block_that_shows_a_macro_block_is_given_a_name() {
+        let user = UserReference::AccountId("abc".to_string());
+        let mention = "[abc](confluence-user://user?account-id=abc&label=generated)";
+        let markdown = format!("```\n:::confluence-macro custom\ntitle: x\n```\n\nask {mention}\n");
+        let named = name_user_mentions(&markdown, &named(user, "Jane Doe"));
+        assert_eq!(named.matches("[@Jane Doe](").count(), 1, "{named}");
+    }
+
+    #[test]
+    fn mention_in_a_layout_cell_is_found_and_given_a_name() {
+        let user = UserReference::AccountId("abc".to_string());
+        let storage = r#"<ac:layout><ac:layout-section ac:type="two_equal"><ac:layout-cell><p>left <ac:link><ri:user ri:account-id="abc" /></ac:link></p></ac:layout-cell><ac:layout-cell><p><code>[abc](confluence-user://user?account-id=abc&amp;label=generated)</code></p><p>right <ac:link><ri:user ri:account-id="abc" /></ac:link></p></ac:layout-cell></ac:layout-section></ac:layout>"#;
+        let pulled = storage_to_markdown(storage);
+        assert_eq!(unnamed_mentions(&pulled), BTreeSet::from([user.clone()]));
+        let markdown = name_user_mentions(&pulled, &named(user, "Jane Doe"));
+        assert_eq!(markdown.matches("[@Jane Doe](").count(), 2, "{markdown}");
+        assert!(markdown.contains("`[abc](confluence-user://"), "{markdown}");
+        let applied = apply_storage(&markdown).expect("apply");
+        assert_eq!(canonical(&applied), canonical(storage), "{markdown}");
+    }
+
+    #[test]
+    fn mention_written_as_code_or_plain_text_is_not_given_a_name() {
+        let user = UserReference::AccountId("abc".to_string());
+        let mention = "[abc](confluence-user://user?account-id=abc&label=generated)";
+        let escaped = mention.replace('&', "&amp;");
+        for storage in [
+            format!("<p>write <code>{escaped}</code> for a mention</p>"),
+            format!("<pre>{escaped}</pre>"),
+            format!(
+                r#"<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[{mention}]]></ac:plain-text-body></ac:structured-macro>"#
+            ),
+        ] {
+            let pulled = storage_to_markdown(&storage);
+            assert!(
+                pulled.contains(mention) || pulled.contains(&escaped),
+                "{pulled}"
+            );
+            assert!(unnamed_mentions(&pulled).is_empty(), "{pulled}");
+            assert_eq!(
+                name_user_mentions(&pulled, &named(user.clone(), "Jane Doe")),
+                pulled
+            );
+        }
+    }
+
     #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
@@ -4987,6 +5637,20 @@ mod round_trip_tests {
         }
     }
 
+    /// Stores the pages a pull fetched, as `write_items` does.
+    fn store_pages(
+        root: &Path,
+        fetched: impl Fn() -> Vec<FetchedPage>,
+    ) -> (Vec<PulledPage>, Vec<UnconvertiblePage>) {
+        let (documents, left_out) = convertible_pages(|left_out| {
+            fetched()
+                .into_iter()
+                .filter(|page| !left_out.contains(&page.document.directory))
+                .collect()
+        });
+        store_fetched_pages(root, documents, left_out).expect("store")
+    }
+
     #[test]
     fn pull_writes_the_pages_that_convert_and_keeps_the_rest_for_inspection() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -4997,19 +5661,21 @@ mod round_trip_tests {
         child.document.markdown_path = child.document.directory.join("index.md");
         child.document.sidecar_path = child.document.directory.join(".confluence.json");
         child.document.sidecar.remote_parent_id = Some("202".to_string());
-        let fetched = vec![
-            fetched_page(&staged, "101", "Fine", "plain text"),
-            fetched_page(&staged, "202", "Broken one", "an <unclosed> tag"),
-            fetched_page(&staged, "303", "Broken two", "another <open attr> tag"),
-            child,
-        ];
-        for page in &fetched {
+        let fetched = || {
+            vec![
+                fetched_page(&staged, "101", "Fine", "plain text"),
+                fetched_page(&staged, "202", "Broken one", "an <unclosed> tag"),
+                fetched_page(&staged, "303", "Broken two", "another <open attr> tag"),
+                child.clone(),
+            ]
+        };
+        for page in fetched() {
             fs::create_dir_all(page.document.directory.join("attachments")).expect("page dir");
         }
         fs::write(staged.join("broken-two--303/attachments/a.txt"), "a").expect("attachment");
 
-        let (written, unconvertible) = store_fetched_pages(&staged, fetched).expect("store");
-        let error = install_pulled_pages(&staged, &root, written, unconvertible)
+        let (written, unconvertible) = store_pages(&staged, fetched);
+        let error = install_pulled_pages(&staged, &root, written, unconvertible, Vec::new())
             .expect_err("pages that do not convert fail the pull");
         let error = error
             .downcast::<crate::output::CliError>()
@@ -5032,8 +5698,11 @@ mod round_trip_tests {
         assert_eq!(
             details["written"],
             serde_json::json!([
-                root.join("fine--101"),
-                root.join("broken-one--202/child--404")
+                {"path": root.join("fine--101"), "storage_differs_from_remote": false},
+                {
+                    "path": root.join("broken-one--202/child--404"),
+                    "storage_differs_from_remote": false,
+                },
             ])
         );
         let pages = &details["pages"];
@@ -5076,17 +5745,315 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn page_left_out_keeps_the_storage_that_did_not_validate_when_there_is_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staged = temp.path().join("staged");
+        let root = temp.path().join("pulled");
+        let fetched = || {
+            let mut fine = fetched_page(&staged, "101", "Fine", "plain text");
+            fine.document.sidecar.space_key = Some("DOCS".to_string());
+            vec![
+                fine,
+                fetched_page(
+                    &staged,
+                    "202",
+                    "Links",
+                    "see [Fine](../fine--101/index.md) and an <unclosed> tag",
+                ),
+                fetched_page(
+                    &staged,
+                    "303",
+                    "Open block",
+                    ":::confluence-macro name=\"info\"\nnever closed",
+                ),
+            ]
+        };
+        let (written, unconvertible) = store_pages(&staged, fetched);
+        let error = install_pulled_pages(&staged, &root, written, unconvertible, Vec::new())
+            .expect_err("left out")
+            .downcast::<crate::output::CliError>()
+            .expect("typed error");
+        let details = error.details.expect("details");
+        let failures = root.join(PULL_FAILURES_DIR);
+
+        // The storage kept is the one apply would have sent, links included.
+        let generated =
+            fs::read_to_string(failures.join("links--202/generated.xml")).expect("storage kept");
+        assert!(generated.contains("<unclosed>"), "{generated}");
+        assert!(generated.contains("pageId=101"), "{generated}");
+        assert!(!generated.contains("index.md"), "{generated}");
+        assert_eq!(
+            details["pages"][0]["files"],
+            serde_json::json!(["generated.md", "generated.xml", "remote.xml"])
+        );
+
+        // Markdown that does not convert at all leaves no storage to keep,
+        // and the report does not name a file that is not there.
+        assert_eq!(details["pages"][1]["content_id"], "303", "{details}");
+        assert!(!failures.join("open-block--303/generated.xml").exists());
+        assert!(failures.join("open-block--303/generated.md").is_file());
+        assert_eq!(
+            details["pages"][1]["files"],
+            serde_json::json!(["generated.md", "remote.xml"])
+        );
+        let hint = error.hint.expect("hint");
+        assert!(
+            hint.contains("when that Markdown converts at all"),
+            "{hint}"
+        );
+    }
+
+    #[test]
     fn pull_destination_that_holds_only_pages_left_out_can_be_pulled_again() {
         let temp = tempfile::tempdir().expect("tempdir");
         let staged = temp.path().join("staged");
         let root = temp.path().join("pulled");
-        let fetched = vec![fetched_page(&staged, "202", "Broken", "an <unclosed> tag")];
-        let (written, unconvertible) = store_fetched_pages(&staged, fetched).expect("store");
-        install_pulled_pages(&staged, &root, written, unconvertible).expect_err("left out");
+        let fetched = || vec![fetched_page(&staged, "202", "Broken", "an <unclosed> tag")];
+        let (written, unconvertible) = store_pages(&staged, fetched);
+        install_pulled_pages(&staged, &root, written, unconvertible, Vec::new())
+            .expect_err("left out");
 
         validate_pull_destination(&root, false).expect("nothing of the user's is in the way");
         fs::write(root.join("notes.txt"), "mine").expect("unmanaged file");
         validate_pull_destination(&root, false).expect_err("an unmanaged file is in the way");
+    }
+
+    #[test]
+    fn pull_that_leaves_a_page_out_still_names_the_pages_whose_markup_differs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staged = temp.path().join("staged");
+        let root = temp.path().join("pulled");
+        let fetched = || {
+            let mut differing = fetched_page(&staged, "101", "Differs", "plain text");
+            differing.remote_storage = "<p>other text</p>".to_string();
+            vec![
+                differing,
+                fetched_page(&staged, "202", "Broken", "an <unclosed> tag"),
+                fetched_page(&staged, "303", "Same", "plain text"),
+            ]
+        };
+        let (written, unconvertible) = store_pages(&staged, fetched);
+        let error = install_pulled_pages(&staged, &root, written, unconvertible, Vec::new())
+            .expect_err("left out")
+            .downcast::<crate::output::CliError>()
+            .expect("typed error");
+        assert_eq!(
+            error.details.expect("details")["written"],
+            serde_json::json!([
+                {"path": root.join("differs--101"), "storage_differs_from_remote": true},
+                {"path": root.join("same--303"), "storage_differs_from_remote": false},
+            ])
+        );
+        let hint = error.hint.expect("hint");
+        assert!(
+            hint.contains("1 of 2 pages written hold markup that Markdown does not carry"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn pull_that_leaves_out_every_blog_post_leaves_nothing_in_the_way_of_the_next() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staged = temp.path().join("staged");
+        let root = temp.path().join("pulled");
+        let fetched = || {
+            let mut post = fetched_page(&staged, "202", "Broken", "an <unclosed> tag");
+            post.document.directory = staged.join("blog-posts").join("broken--202");
+            post.document.markdown_path = post.document.directory.join("index.md");
+            post.document.sidecar_path = post.document.directory.join(".confluence.json");
+            vec![fetched_page(&staged, "101", "Fine", "plain text"), post]
+        };
+        for page in fetched() {
+            fs::create_dir_all(&page.document.directory).expect("page dir");
+        }
+        let (written, unconvertible) = store_pages(&staged, fetched);
+        install_pulled_pages(&staged, &root, written, unconvertible, Vec::new())
+            .expect_err("left out");
+
+        assert!(!root.join("blog-posts").exists());
+        validate_pull_destination(&root, false).expect("nothing of the user's is in the way");
+    }
+
+    #[test]
+    fn page_copied_into_the_failures_directory_is_not_a_document() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let mut page = fetched_page(root, "101", "Fine", "plain text").document;
+        save_document(&page).expect("page");
+        page.directory = root.join(PULL_FAILURES_DIR).join("copy--101");
+        page.markdown_path = page.directory.join("index.md");
+        page.sidecar_path = page.directory.join(".confluence.json");
+        save_document(&page).expect("copy");
+        fs::write(
+            root.join(PULL_FAILURES_DIR).join(PULL_FAILURES_MANIFEST),
+            "{}",
+        )
+        .expect("manifest");
+        // A directory of that name that no pull wrote holds documents.
+        page.directory = root.join("team").join(PULL_FAILURES_DIR).join("draft--101");
+        page.markdown_path = page.directory.join("index.md");
+        page.sidecar_path = page.directory.join(".confluence.json");
+        save_document(&page).expect("draft");
+
+        let documents = load_local_documents(root).expect("documents");
+        assert_eq!(
+            documents
+                .iter()
+                .map(|document| document.directory.as_path())
+                .collect::<Vec<_>>(),
+            [
+                root.join("fine--101"),
+                root.join("team").join(PULL_FAILURES_DIR).join("draft--101"),
+            ]
+        );
+    }
+
+    #[test]
+    fn pull_does_not_replace_a_failures_directory_that_gained_a_directory() {
+        type Change = fn(&Path);
+        let changes: [(Change, bool); 4] = [
+            (
+                |failures| fs::create_dir(failures.join("mine")).expect("directory of the user"),
+                false,
+            ),
+            (
+                |failures| fs::create_dir(failures.join("broken--202/mine")).expect("directory"),
+                false,
+            ),
+            // What was removed leaves nothing of the user's to keep.
+            (
+                |failures| fs::remove_file(failures.join("broken--202/remote.xml")).expect("file"),
+                true,
+            ),
+            (
+                |failures| fs::remove_dir_all(failures.join("broken--202")).expect("directory"),
+                true,
+            ),
+        ];
+        for (change, replaceable) in changes {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let staged = temp.path().join("staged");
+            let root = temp.path().join("pulled");
+            let fetched = || vec![fetched_page(&staged, "202", "Broken", "an <unclosed> tag")];
+            let (written, unconvertible) = store_pages(&staged, fetched);
+            install_pulled_pages(&staged, &root, written, unconvertible, Vec::new())
+                .expect_err("left out");
+            validate_pull_destination(&root, false).expect("only what the pull wrote");
+
+            change(&root.join(PULL_FAILURES_DIR));
+            assert_eq!(validate_pull_destination(&root, false).is_ok(), replaceable);
+        }
+    }
+
+    #[test]
+    fn pull_replaces_in_the_failures_directory_only_what_a_pull_wrote_there() {
+        let failures = Path::new(PULL_FAILURES_DIR);
+        for (kept, in_the_way) in [
+            (None, failures.join("notes.txt")),
+            (None, failures.join("broken--202/notes.txt")),
+            (None, failures.join("broken--202/extra/remote.xml")),
+            (None, failures.join("mine/deeper/remote.xml")),
+            // A file named as one a pull writes, where no pull wrote it, and
+            // one a pull wrote that was edited since.
+            (None, failures.join("notes/generated.md")),
+            (None, failures.join("broken--202/generated.md")),
+            (None, failures.join("manifest.json")),
+            (Some("202"), failures.join("notes.txt")),
+            (Some("202"), failures.join("broken--202/notes.txt")),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let staged = temp.path().join("staged");
+            let root = temp.path().join("pulled");
+            let fetched = || {
+                vec![
+                    fetched_page(&staged, "101", "Fine", "plain text"),
+                    fetched_page(&staged, "202", "Broken", "an <unclosed> tag"),
+                ]
+                .into_iter()
+                .filter(|page| {
+                    kept.is_none_or(|kept| {
+                        page.document.sidecar.content_id.as_deref() == Some(kept)
+                    })
+                })
+                .collect::<Vec<_>>()
+            };
+            let (written, unconvertible) = store_pages(&staged, fetched);
+            install_pulled_pages(&staged, &root, written, unconvertible, Vec::new())
+                .expect_err("left out");
+            validate_pull_destination(&root, false).expect("only what the pull wrote");
+
+            let in_the_way = root.join(in_the_way);
+            fs::create_dir_all(in_the_way.parent().expect("parent")).expect("directories");
+            fs::write(&in_the_way, "mine").expect("file of the user");
+            validate_pull_destination(&root, false)
+                .expect_err(&format!("{} is in the way", in_the_way.display()));
+        }
+    }
+
+    #[test]
+    fn pull_that_leaves_a_page_out_reports_its_warnings_in_the_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staged = temp.path().join("staged");
+        let root = temp.path().join("pulled");
+        let fetched = || vec![fetched_page(&staged, "202", "Broken", "an <unclosed> tag")];
+        let (written, unconvertible) = store_pages(&staged, fetched);
+        let warnings = vec!["names could not be looked up".to_string()];
+        let error = install_pulled_pages(&staged, &root, written, unconvertible, warnings)
+            .expect_err("left out")
+            .downcast::<crate::output::CliError>()
+            .expect("typed error");
+        assert_eq!(
+            error.details.expect("details")["warnings"],
+            serde_json::json!(["names could not be looked up"])
+        );
+        let hint = error.hint.expect("hint");
+        assert!(
+            hint.ends_with("Also: names could not be looked up."),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn pull_does_not_replace_a_file_named_as_the_failures_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join(PULL_FAILURES_DIR), "mine").expect("file of the user");
+        validate_pull_destination(temp.path(), false).expect_err("the file is in the way");
+    }
+
+    #[test]
+    fn page_that_is_written_links_to_a_page_left_out_by_its_remote_address() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staged = temp.path().join("staged");
+        let root = temp.path().join("pulled");
+        let broken = staged.join(document_dir_name("Broken", Some("202")));
+        let (written, unconvertible) = {
+            let (documents, left_out) = convertible_pages(|left_out| {
+                let link = if left_out.contains(&broken) {
+                    "https://example.atlassian.net/wiki/spaces/DOCS/pages/202/Broken"
+                } else {
+                    "../broken--202/index.md"
+                };
+                vec![
+                    fetched_page(&staged, "101", "Fine", &format!("see [Broken]({link})")),
+                    fetched_page(&staged, "202", "Broken", "an <unclosed> tag"),
+                ]
+                .into_iter()
+                .filter(|page| !left_out.contains(&page.document.directory))
+                .collect()
+            });
+            store_fetched_pages(&staged, documents, left_out).expect("store")
+        };
+        install_pulled_pages(&staged, &root, written, unconvertible, Vec::new())
+            .expect_err("left out");
+
+        let fine = fs::read_to_string(root.join("fine--101/index.md")).expect("page written");
+        assert!(
+            fine.contains("(https://example.atlassian.net/wiki/spaces/DOCS/pages/202/Broken)"),
+            "{fine}"
+        );
+        let plan = plan_path(&root, false, true, false).expect("plan");
+        assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
+        assert_eq!(plan.items[0].action, PlanActionKind::Noop);
     }
 
     #[test]

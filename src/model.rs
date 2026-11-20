@@ -67,6 +67,14 @@ pub struct SpaceSummary {
     pub web_url: Option<String>,
 }
 
+/// The identifier by which storage refers to a user.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UserReference {
+    AccountId(String),
+    UserKey(String),
+    Username(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentUser {
     #[serde(default, alias = "accountId")]

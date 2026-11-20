@@ -15,7 +15,7 @@ use url::Url;
 use crate::config::{AuthConfig, ResolvedProfile};
 use crate::model::{
     AttachmentInfo, CommentInfo, ContentItem, ContentKind, ContentProperty, CreateContentRequest,
-    CurrentUser, ProviderKind, SearchResult, SpaceSummary, UpdateContentRequest,
+    CurrentUser, ProviderKind, SearchResult, SpaceSummary, UpdateContentRequest, UserReference,
 };
 
 pub mod cloud;
@@ -48,6 +48,9 @@ pub trait ConfluenceProvider: Send + Sync {
 
     async fn ping(&self) -> Result<()>;
     async fn current_user(&self) -> Result<CurrentUser>;
+    /// The name Confluence displays for a user, or none when the deployment
+    /// does not disclose that user to the caller.
+    async fn user_display_name(&self, user: &UserReference) -> Result<Option<String>>;
     async fn resolve_page_ref(&self, reference: &str) -> Result<String>;
     async fn list_spaces(&self, limit: usize) -> Result<Vec<SpaceSummary>>;
     async fn list_spaces_window(&self, limit: usize) -> Result<ListWindow<SpaceSummary>>;
@@ -1070,6 +1073,45 @@ pub fn ensure_writable(profile: &ResolvedProfile) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Looks up the name displayed for a user. A user that does not exist, or
+/// that the caller may not see, has no name here.
+pub(crate) async fn user_display_name(
+    http: &HttpClient,
+    user: &UserReference,
+) -> Result<Option<String>> {
+    let (parameter, value) = match user {
+        UserReference::AccountId(value) => ("accountId", value),
+        UserReference::UserKey(value) => ("key", value),
+        UserReference::Username(value) => ("username", value),
+    };
+    let url = http.v1_url(&format!("/user?{parameter}={}", urlencoding::encode(value)));
+    let response = http
+        .send(&url, http.auth(http.raw_client().get(&url)))
+        .await?;
+    let status = response.status();
+    if matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::NOT_FOUND
+    ) {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let raw = response.text().await.unwrap_or_default();
+        let message = extract_error_message(&raw);
+        return Err(crate::output::http_error(
+            status,
+            format!("request to {url} failed with {status}: {message}"),
+        ));
+    }
+    let found: CurrentUser = response.json().await?;
+    Ok(found
+        .display_name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty()))
 }
 
 #[cfg(test)]

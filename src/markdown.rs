@@ -1029,7 +1029,7 @@ pub(crate) fn split_target_fragment(target: &str) -> (&str, Option<&str>) {
 /// escaped where it would read as that syntax. Extensions that reinterpret
 /// ordinary prose (smart punctuation, subscript, superscript, math,
 /// wikilinks) stay off, because they rewrite text a page already contains.
-fn markdown_options() -> Options {
+pub(crate) fn markdown_options() -> Options {
     Options::ENABLE_TABLES
         | Options::ENABLE_HEADING_ATTRIBUTES
         | Options::ENABLE_DEFINITION_LIST
@@ -2984,7 +2984,7 @@ fn normalize_text_node(text: &str) -> String {
 
 /// Escapes characters that Markdown would read as syntax, so literal page
 /// text converts back to the same text.
-fn escape_markdown_text(text: &str) -> String {
+pub(crate) fn escape_markdown_text(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for (index, ch) in text.char_indices() {
         let rest = &text[index + ch.len_utf8()..];
@@ -3270,6 +3270,44 @@ pub(crate) fn build_user_placeholder_url(link: &UserMentionPlaceholder) -> Strin
         }
     }
     url.to_string()
+}
+
+const USER_DISPLAY_NAME_PARAMETER: &str = "name";
+
+/// A mention target that also records the name displayed for the user. The
+/// label generated for such a mention is that name.
+pub(crate) fn with_user_display_name(target: &str, name: &str) -> String {
+    let Ok(mut url) = Url::parse(target) else {
+        return target.to_string();
+    };
+    url.query_pairs_mut()
+        .append_pair(USER_DISPLAY_NAME_PARAMETER, name);
+    url.to_string()
+}
+
+/// The link text pull generates for a mention without a link body: the name
+/// its target records for the user, or else the user's identifier.
+pub(crate) fn generated_user_label(target: &str, user: &UserMentionPlaceholder) -> String {
+    Url::parse(&target.replace("&amp;", "&"))
+        .ok()
+        .and_then(|url| {
+            url.query_pairs()
+                .find_map(|(key, value)| (key == USER_DISPLAY_NAME_PARAMETER).then_some(value))
+                .map(|name| format!("@{name}"))
+        })
+        .unwrap_or_else(|| user.default_label())
+}
+
+impl UserMentionPlaceholder {
+    /// The identifier a lookup of this user goes by.
+    pub(crate) fn reference(&self) -> Option<crate::model::UserReference> {
+        use crate::model::UserReference;
+        self.account_id
+            .clone()
+            .map(UserReference::AccountId)
+            .or_else(|| self.user_key.clone().map(UserReference::UserKey))
+            .or_else(|| self.username.clone().map(UserReference::Username))
+    }
 }
 
 pub(crate) fn parse_user_placeholder_url(target: &str) -> Option<UserMentionPlaceholder> {
@@ -4888,6 +4926,15 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The directory, below the destination of a pull, of what the pull keeps
+/// of the pages it leaves out. Nothing in it is a local document.
+pub(crate) const PULL_FAILURES_DIR: &str = ".confluence-pull-failures";
+
+/// The record a pull keeps in its failures directory of the files it wrote
+/// there: the path of each below that directory and the SHA-256 of its
+/// contents. A directory of that name without the record is not a pull's.
+pub(crate) const PULL_FAILURES_MANIFEST: &str = "manifest.json";
+
 pub fn scan_local_documents(root: &Path) -> Result<Vec<LocalContentIndex>> {
     if !root.exists() {
         return Err(crate::output::typed_error(
@@ -4902,7 +4949,12 @@ pub fn scan_local_documents(root: &Path) -> Result<Vec<LocalContentIndex>> {
         ));
     }
     let mut docs = Vec::new();
-    for entry in WalkDir::new(root) {
+    let documents = WalkDir::new(root).into_iter().filter_entry(|entry| {
+        entry.depth() == 0
+            || entry.file_name() != PULL_FAILURES_DIR
+            || !entry.path().join(PULL_FAILURES_MANIFEST).is_file()
+    });
+    for entry in documents {
         let entry = entry.with_context(|| format!("failed to scan `{}`", root.display()))?;
         if !entry.file_type().is_file() || entry.file_name() != "index.md" {
             continue;

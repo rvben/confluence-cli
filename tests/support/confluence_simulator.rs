@@ -7,6 +7,11 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const SPACE_ID: &str = "1";
 const SPACE_KEY: &str = "TEST";
+/// The one user the simulator knows by identifier, and the name it displays.
+pub const KNOWN_USER_ID: &str = "known-user";
+pub const KNOWN_USER_NAME: &str = "Jane O'Neil";
+/// A user whose lookup the simulator answers with a server error.
+pub const FAILING_USER_ID: &str = "failing-user";
 const CLOUD_AUTHORIZATION: &str = "Basic c2ltdWxhdG9yQGV4YW1wbGUudGVzdDpzaW11bGF0ZWQtdG9rZW4=";
 const DATA_CENTER_AUTHORIZATION: &str = "Bearer simulated-token";
 
@@ -158,6 +163,29 @@ impl Respond for SimulatorResponder {
                 "username": "simulator",
                 "displayName": "Simulator User"
             })),
+            ("GET", "v1", "/user") => {
+                let known = request.url.query_pairs().any(|(key, value)| {
+                    matches!(key.as_ref(), "accountId" | "key" | "username")
+                        && value == KNOWN_USER_ID
+                });
+                let failing = request
+                    .url
+                    .query_pairs()
+                    .any(|(_, value)| value == FAILING_USER_ID);
+                if known {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "accountId": KNOWN_USER_ID,
+                        "displayName": KNOWN_USER_NAME
+                    }))
+                } else if failing {
+                    ResponseTemplate::new(500).set_body_json(json!({
+                        "statusCode": 500,
+                        "message": "user directory is unavailable"
+                    }))
+                } else {
+                    not_found()
+                }
+            }
             ("GET", "v1", "/space") => results_response(vec![space_json()]),
             ("GET", "v1", resource) if resource.strip_prefix("/space/").is_some() => {
                 if resource == format!("/space/{SPACE_KEY}") {

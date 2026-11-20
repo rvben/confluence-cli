@@ -196,6 +196,13 @@ impl ConfluenceProvider for DataCenterProvider {
             .await
     }
 
+    async fn user_display_name(
+        &self,
+        user: &crate::model::UserReference,
+    ) -> Result<Option<String>> {
+        crate::provider::user_display_name(&self.http, user).await
+    }
+
     async fn resolve_page_ref(&self, reference: &str) -> Result<String> {
         resolve_reference_via_url_or_search(&self.http, reference).await
     }
