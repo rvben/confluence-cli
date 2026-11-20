@@ -161,8 +161,14 @@ pub(crate) struct StatusMacroPlaceholder {
 }
 
 fn storage_to_markdown_xml(storage: &str) -> Option<String> {
-    let wrapped = wrap_storage_fragment(storage);
-    let document = Document::parse(&wrapped).ok()?;
+    // Storage names characters by the entities of HTML, which XML knows
+    // only when they are declared.
+    let wrapped = wrap_storage_fragment(storage)?;
+    let options = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..roxmltree::ParsingOptions::default()
+    };
+    let document = Document::parse_with_options(&wrapped, options).ok()?;
     let mut blocks = Vec::new();
     for child in document.root_element().children() {
         if let Some(block) = render_top_level_block(child, &wrapped)
@@ -1041,8 +1047,13 @@ pub(crate) fn markdown_options() -> Options {
         | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
 }
 
-fn wrap_storage_fragment(storage: &str) -> String {
-    format!(r#"<root xmlns:ac="{AC_NS}" xmlns:ri="{RI_NS}">{storage}</root>"#)
+/// A storage body as one XML document. `None` when the body names an entity
+/// that has no characters to stand for.
+fn wrap_storage_fragment(storage: &str) -> Option<String> {
+    let declarations = crate::storage::named_character_declarations(storage)?;
+    Some(format!(
+        r#"<!DOCTYPE root [{declarations}]><root xmlns:ac="{AC_NS}" xmlns:ri="{RI_NS}">{storage}</root>"#
+    ))
 }
 
 fn render_top_level_block(node: Node<'_, '_>, source: &str) -> Option<String> {
@@ -2956,30 +2967,39 @@ fn has_block_children(node: Node<'_, '_>) -> bool {
         .any(|child| child.is_element() && !is_inlineish_tag(child))
 }
 
+/// The Markdown of a text node. White space that HTML collapses becomes one
+/// space. A space that HTML keeps, such as a no-break space, is written as a
+/// character reference: Markdown would trim the character itself from the
+/// end of a line and drop a paragraph that holds nothing else.
 fn normalize_text_node(text: &str) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapses = |character: char| character.is_ascii_whitespace();
+    let collapsed = text
+        .split(collapses)
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     if collapsed.is_empty() {
-        if text.chars().any(char::is_whitespace) {
-            " ".to_string()
-        } else {
+        return if text.is_empty() {
             String::new()
-        }
-    } else {
-        let leading = if text.chars().next().is_some_and(char::is_whitespace) {
-            " "
         } else {
-            ""
+            " ".to_string()
         };
-        let trailing = if text.chars().last().is_some_and(char::is_whitespace) {
-            " "
-        } else {
-            ""
-        };
-        format!("{leading}{}{trailing}", escape_markdown_text(&collapsed))
     }
+    let leading = if text.starts_with(collapses) { " " } else { "" };
+    let trailing = if text.ends_with(collapses) { " " } else { "" };
+    let mut markdown = String::with_capacity(text.len());
+    markdown.push_str(leading);
+    for character in escape_markdown_text(&collapsed).chars() {
+        match character {
+            '\u{a0}' => markdown.push_str("&nbsp;"),
+            kept if kept.is_whitespace() && !collapses(kept) => {
+                markdown.push_str(&format!("&#x{:X};", u32::from(kept)))
+            }
+            other => markdown.push(other),
+        }
+    }
+    markdown.push_str(trailing);
+    markdown
 }
 
 /// Escapes characters that Markdown would read as syntax, so literal page

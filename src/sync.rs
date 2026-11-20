@@ -4839,6 +4839,71 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn space_that_does_not_break_or_collapse_is_kept() {
+        assert_keeps("<p>a&nbsp;&nbsp;b</p>");
+        assert_keeps("<p>a&nbsp;</p>");
+        assert_keeps("<p>&nbsp;b</p>");
+        assert_keeps("<p>&nbsp;</p>");
+        assert_keeps("<p>a</p><p>&nbsp;</p><p>b</p>");
+        assert_keeps("<p>a &nbsp; b</p>");
+        assert_keeps("<p><em>a</em>&nbsp;<em>b</em></p>");
+        assert_keeps("<p><strong>a&nbsp;</strong>b</p>");
+        assert_keeps("<h2>a&nbsp;</h2>");
+        assert_keeps("<ul><li>&nbsp;</li><li>a&nbsp;&nbsp;b</li></ul>");
+        assert_keeps(
+            "<table><thead><tr><th>h</th></tr></thead><tbody><tr><td>&nbsp;</td></tr></tbody></table>",
+        );
+        assert_keeps("<p>a&#x2003;&#x2003;b&#x2009;</p>");
+        assert_keeps("<p>written as text: &amp;nbsp;</p>");
+    }
+
+    #[test]
+    fn space_that_does_not_break_is_kept_at_the_edge_of_emphasis() {
+        for storage in [
+            "<p>x<em>&nbsp;a</em>y</p>",
+            "<p>x<em>a&nbsp;</em>y</p>",
+            "<p>x<strong>&nbsp;</strong>y</p>",
+            "<p><em>&nbsp;a</em></p>",
+            "<p>x <em>a&nbsp;</em> y</p>",
+            "<p>x<em>&#x2003;a&#x2003;</em>y</p>",
+            "<p>x<s>&nbsp;a&nbsp;</s>y</p>",
+            "<p>x<a href=\"https://example.com\">&nbsp;a&nbsp;</a>y</p>",
+            "<p>x<code>&nbsp;a&nbsp;</code>y</p>",
+        ] {
+            assert_keeps(storage);
+        }
+    }
+
+    #[test]
+    fn page_that_names_characters_by_entity_keeps_what_markdown_cannot_carry() {
+        for storage in [
+            r#"<p class="x">a&nbsp;b</p>"#,
+            r#"<p>it&rsquo;s <span style="color: red;">red</span> &rarr; &eacute;</p>"#,
+            r#"<table><tbody><tr><td colspan="2">a&nbsp;b</td></tr></tbody></table>"#,
+        ] {
+            let markdown = storage_to_markdown(storage);
+            assert!(
+                markdown.contains("class=\"x\"")
+                    || markdown.contains("color: red")
+                    || markdown.contains("colspan"),
+                "{markdown}"
+            );
+            assert_keeps(storage);
+        }
+    }
+
+    /// Pull and apply give back a document that says the same as `storage`.
+    fn assert_keeps(storage: &str) {
+        let markdown = storage_to_markdown(storage);
+        let applied = apply_storage(&markdown)
+            .unwrap_or_else(|error| panic!("apply failed for {markdown:?}: {error:#}"));
+        assert!(
+            crate::storage::same_document(&applied, storage),
+            "{storage} pulled as {markdown:?}, applied as {applied}"
+        );
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");

@@ -100,6 +100,17 @@ pub(crate) fn validate_storage(storage: &str) -> Result<()> {
 /// namespaces and the named entities the body uses, each with the value
 /// `entity_value` gives it.
 fn wrap_fragment(storage: &str, entity_value: impl Fn(&str) -> String) -> String {
+    let declarations = entity_declarations(storage, entity_value);
+    // Bodies are fragments with multiple top-level nodes and implicit ac/ri
+    // namespaces. A newline keeps original columns intact on the first line.
+    format!(
+        "<!DOCTYPE storage-root [{declarations}]><storage-root xmlns:ac=\"{AC_NS}\" xmlns:ri=\"{RI_NS}\">\n{storage}\n</storage-root>"
+    )
+}
+
+/// A declaration for each entity the body names beyond those XML defines,
+/// giving it the value `entity_value` returns.
+fn entity_declarations(storage: &str, entity_value: impl Fn(&str) -> String) -> String {
     static ENTITIES: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"&[A-Za-z][A-Za-z0-9]*;").expect("valid entity regex"));
     let entities: BTreeSet<_> = ENTITIES
@@ -112,11 +123,21 @@ fn wrap_fragment(storage: &str, entity_value: impl Fn(&str) -> String) -> String
         // Names come from the restricted regex, so cannot inject declarations.
         declarations.push_str(&format!("<!ENTITY {name} '{}'>", entity_value(name)));
     }
-    // Bodies are fragments with multiple top-level nodes and implicit ac/ri
-    // namespaces. A newline keeps original columns intact on the first line.
-    format!(
-        "<!DOCTYPE storage-root [{declarations}]><storage-root xmlns:ac=\"{AC_NS}\" xmlns:ri=\"{RI_NS}\">\n{storage}\n</storage-root>"
-    )
+    declarations
+}
+
+/// Declarations that make each named entity of HTML in the body stand for
+/// its characters. `None` when the body names an entity that HTML does not
+/// have or that stands for markup, which no declaration can give a value.
+pub(crate) fn named_character_declarations(storage: &str) -> Option<String> {
+    let unknown = std::cell::Cell::new(false);
+    let declarations = entity_declarations(storage, |name| {
+        named_characters(name).unwrap_or_else(|| {
+            unknown.set(true);
+            String::new()
+        })
+    });
+    (!unknown.get()).then_some(declarations)
 }
 
 /// Whether two storage bodies describe the same document. Spellings that
