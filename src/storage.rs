@@ -200,7 +200,10 @@ fn write_canonical(node: Node<'_, '_>, preformatted: bool, out: &mut String) {
         return;
     }
     if node.is_comment() {
-        out.push_str(&format!("<!--{}-->", node.text().unwrap_or_default()));
+        // A parser reads every line ending as a line feed, also in a comment.
+        let text = node.text().unwrap_or_default();
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        out.push_str(&format!("<!--{text}-->"));
         return;
     }
     if !node.is_element() {
@@ -594,6 +597,12 @@ mod tests {
                 "<p><em>one</em> <em>two</em></p>",
             ),
             ("<p>a</p>\n<!-- note -->", "<p>a</p><!-- note -->"),
+            ("<!-- a\r\nb\rc -->", "<!-- a\nb\nc -->"),
+            ("<pre>a\r\nb\rc</pre>", "<pre>a\nb\nc</pre>"),
+            (
+                "<ac:structured-macro ac:name=\"code\"><ac:plain-text-body><![CDATA[a\r\nb]]></ac:plain-text-body></ac:structured-macro>",
+                "<ac:structured-macro ac:name=\"code\"><ac:plain-text-body><![CDATA[a\nb]]></ac:plain-text-body></ac:structured-macro>",
+            ),
             (
                 "<p>a</p>\n<ac:structured-macro ac:name=\"toc\" />\n<p>b</p>",
                 r#"<p>a</p><ac:structured-macro ac:name="toc" /><p>b</p>"#,
