@@ -6453,6 +6453,16 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn block_after_a_layout_stays_outside_it() {
+        assert_keeps(
+            r#"<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell><p>in</p></ac:layout-cell></ac:layout-section></ac:layout><p>after</p>"#,
+        );
+        assert_keeps(
+            r#"<p>before</p><ac:layout><ac:layout-section ac:type="single"><ac:layout-cell><p>in</p></ac:layout-cell></ac:layout-section></ac:layout><h2>after</h2><p>more</p>"#,
+        );
+    }
+
+    #[test]
     fn link_with_display_attributes_keeps_a_bar_in_its_address_inside_a_table() {
         assert_round_trips(
             r#"<table><thead><tr><th>h</th></tr></thead><tbody><tr><td><a href="https://x.example/a|b" title="a | b">c | d</a></td></tr></tbody></table>"#,

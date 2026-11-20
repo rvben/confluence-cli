@@ -4129,6 +4129,8 @@ fn parse_layout_group(lines: &[&str], start: usize, allow_lossy: bool) -> Result
         while scan < lines.len() && lines[scan].trim().is_empty() {
             scan += 1;
         }
+        // Blank lines after the last section stay, which is what keeps the
+        // layout apart from the block that follows it.
         if scan >= lines.len()
             || !lines[scan]
                 .trim_start()
