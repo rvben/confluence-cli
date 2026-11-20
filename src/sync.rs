@@ -2266,9 +2266,10 @@ fn rewrite_page_links(
         let relative = diff_paths(&target_index, current_dir).unwrap_or(target_index);
         let replacement = relative.to_string_lossy().replace('\\', "/");
         let patterns = [
-            format!(r#"https?://[^\s\)]+/pages/{content_id}(?:/[^\s\)]*)?"#),
-            format!(r#"/pages/{content_id}(?:/[^\s\)]*)?"#),
-            format!(r#"viewpage\.action\?pageId={content_id}"#),
+            // The boundary keeps an id from matching the start of a longer one.
+            format!(r#"https?://[^\s\)]+/pages/{content_id}\b(?:/[^\s\)]*)?"#),
+            format!(r#"/pages/{content_id}\b(?:/[^\s\)]*)?"#),
+            format!(r#"viewpage\.action\?pageId={content_id}\b"#),
         ];
         for pattern in patterns {
             let re = Regex::new(&pattern).expect("valid page link regex");
@@ -4865,6 +4866,27 @@ mod round_trip_tests {
             assert_eq!(
                 rewritten,
                 format!("{opening} then [a](../short--12/index.md) and `-->`\n")
+            );
+        }
+    }
+
+    #[test]
+    fn address_of_a_page_is_rewritten_for_that_page_only() {
+        let paths = BTreeMap::from([("12".to_string(), PathBuf::from("/tmp/root/short--12"))]);
+        let current = PathBuf::from("/tmp/root/current--1");
+        for (markdown, rewritten) in [
+            (
+                "[a](https://example.atlassian.net/wiki/spaces/S/pages/123/Long) [b](/wiki/spaces/S/pages/123) [c](/pages/viewpage.action?pageId=123)",
+                None,
+            ),
+            (
+                "[a](https://example.atlassian.net/wiki/spaces/S/pages/12/Short)",
+                Some("[a](../short--12/index.md)"),
+            ),
+        ] {
+            assert_eq!(
+                rewrite_page_links(markdown, &current, &paths, &BTreeMap::new()),
+                rewritten.unwrap_or(markdown),
             );
         }
     }
