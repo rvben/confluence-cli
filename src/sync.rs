@@ -1799,44 +1799,57 @@ fn rewrite_macro_page_references(
     current_dir: &Path,
     link_index: &LinkIndex,
 ) -> String {
-    let lines: Vec<&str> = markdown.lines().collect();
-    let mut output = String::new();
-    let mut index = 0;
+    rewrite_macro_parameter_lines(markdown, &|line, mode| {
+        rewrite_page_reference_parameter_line(line, current_dir, link_index, mode)
+    })
+}
 
-    while index < lines.len() {
-        output.push_str(lines[index]);
-        output.push('\n');
-
-        let Some(macro_mode) = MacroPageReferenceMode::of_block(lines[index]) else {
-            index += 1;
-            continue;
+/// Rewrites the parameter lines of the macro blocks whose parameters can
+/// name a page. The blocks are the ones apply reads: a line in the Markdown
+/// body of a macro is text of that body, though a block inside the body has
+/// parameters of its own, and a block shown as code is code.
+fn rewrite_macro_parameter_lines(
+    markdown: &str,
+    rewrite: &impl Fn(&str, MacroPageReferenceMode) -> String,
+) -> String {
+    let mut rewritten = String::with_capacity(markdown.len());
+    let mut rest = 0;
+    for block in crate::markdown::block_markdown(markdown) {
+        let opening_end = block.range.start
+            + markdown[block.range.clone()]
+                .find('\n')
+                .map_or(block.range.len(), |newline| newline + 1);
+        rewritten.push_str(&markdown[rest..opening_end]);
+        let mode = MacroPageReferenceMode::of_block(&markdown[block.range.start..opening_end]);
+        let own_lines = |rewritten: &mut String, lines: &str| {
+            let Some(mode) = mode else {
+                rewritten.push_str(lines);
+                return;
+            };
+            for line in lines.split_inclusive('\n') {
+                let text = line.trim_end_matches(['\r', '\n']);
+                if text.trim() == ":::" {
+                    rewritten.push_str(line);
+                } else {
+                    rewritten.push_str(&rewrite(text, mode));
+                    rewritten.push_str(&line[text.len()..]);
+                }
+            }
         };
-
-        index += 1;
-        while index < lines.len() && lines[index].trim() != ":::" {
-            let rewritten = rewrite_page_reference_parameter_line(
-                lines[index],
-                current_dir,
-                link_index,
-                macro_mode,
-            );
-            output.push_str(&rewritten);
-            output.push('\n');
-            index += 1;
+        let mut own = opening_end;
+        for body in &block.bodies {
+            own_lines(&mut rewritten, &markdown[own..body.start]);
+            rewritten.push_str(&rewrite_macro_parameter_lines(
+                &markdown[body.clone()],
+                rewrite,
+            ));
+            own = body.end;
         }
-
-        if index < lines.len() {
-            output.push_str(lines[index]);
-            output.push('\n');
-            index += 1;
-        }
+        own_lines(&mut rewritten, &markdown[own..block.range.end]);
+        rest = block.range.end;
     }
-
-    if !markdown.ends_with('\n') && output.ends_with('\n') {
-        output.pop();
-    }
-
-    output
+    rewritten.push_str(&markdown[rest..]);
+    rewritten
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2834,44 +2847,9 @@ fn rewrite_macro_page_placeholders(
     paths: &BTreeMap<String, PathBuf>,
     items: &BTreeMap<String, ContentItem>,
 ) -> String {
-    let lines: Vec<&str> = markdown.lines().collect();
-    let mut output = String::new();
-    let mut index = 0;
-
-    while index < lines.len() {
-        output.push_str(lines[index]);
-        output.push('\n');
-
-        let Some(mode) = MacroPageReferenceMode::of_block(lines[index]) else {
-            index += 1;
-            continue;
-        };
-
-        index += 1;
-        while index < lines.len() && lines[index].trim() != ":::" {
-            output.push_str(&rewrite_macro_page_placeholder_line(
-                lines[index],
-                mode,
-                current_dir,
-                paths,
-                items,
-            ));
-            output.push('\n');
-            index += 1;
-        }
-
-        if index < lines.len() {
-            output.push_str(lines[index]);
-            output.push('\n');
-            index += 1;
-        }
-    }
-
-    if !markdown.ends_with('\n') && output.ends_with('\n') {
-        output.pop();
-    }
-
-    output
+    rewrite_macro_parameter_lines(markdown, &|line, mode| {
+        rewrite_macro_page_placeholder_line(line, mode, current_dir, paths, items)
+    })
 }
 
 fn rewrite_macro_page_placeholder_line(
@@ -6213,6 +6191,96 @@ mod round_trip_tests {
             rewrite_attachment_links(&format!("[a]({listed})"), "123", &attachments),
             "[a](attachments/plan.pdf)"
         );
+    }
+
+    #[test]
+    fn body_of_a_macro_is_not_read_as_its_parameters() {
+        for body in [
+            "```\nkey:    value\n```",
+            "first: line  \nsecond",
+            "where: !page index.md",
+            "    indented:   code",
+        ] {
+            let inner = apply_storage(body).expect("apply body");
+            for parameters in ["", "title: x\n"] {
+                let applied = apply_storage(&format!(
+                    ":::confluence-macro custom\n{parameters}---\n{body}\n:::\n"
+                ))
+                .expect("apply");
+                assert!(
+                    applied.contains(&format!("<ac:rich-text-body>{inner}</ac:rich-text-body>")),
+                    "{body:?} applied as {applied}, alone as {inner}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn macro_in_the_body_of_a_macro_keeps_its_page_parameter() {
+        let applied = apply_storage(
+            ":::confluence-macro custom\nwhere: !page index.md\n---\n:::confluence-children\npage: index.md\n:::\n:::\n",
+        )
+        .expect("apply");
+        assert_eq!(
+            applied,
+            concat!(
+                r#"<ac:structured-macro ac:name="custom">"#,
+                r#"<ac:parameter ac:name="where"><ri:page ri:content-title="Current" /></ac:parameter>"#,
+                r#"<ac:rich-text-body><ac:structured-macro ac:name="children">"#,
+                r#"<ac:parameter ac:name="page"><ac:link><ri:page ri:content-title="Current" /></ac:link></ac:parameter>"#,
+                "</ac:structured-macro></ac:rich-text-body></ac:structured-macro>"
+            )
+        );
+    }
+
+    #[test]
+    fn macro_block_shown_as_code_stays_as_written() {
+        for block in [
+            ":::confluence-macro custom\nkey:    value\nwhere: !page index.md\n:::\n",
+            ":::confluence-children\npage: index.md\n:::\n",
+        ] {
+            for (opening, closing) in [("```\n", "```\n"), ("~~~confluence-code\n", "~~~\n")] {
+                let applied = apply_storage(&format!("{opening}{block}{closing}")).expect("apply");
+                assert!(applied.contains(block.trim_end()), "{applied}");
+            }
+        }
+    }
+
+    #[test]
+    fn placeholder_is_resolved_only_in_the_parameter_of_a_macro() {
+        let paths = BTreeMap::from([("12".to_string(), PathBuf::from("/tmp/root/short--12"))]);
+        let current = PathBuf::from("/tmp/root/current--1");
+        let placeholder = build_page_placeholder_url(&PageLinkPlaceholder {
+            content_id: Some("12".to_string()),
+            ..PageLinkPlaceholder::default()
+        });
+        let local = "../short--12/index.md";
+        let rewrite = |text: &str| {
+            rewrite_macro_page_placeholders(
+                &text.replace("TARGET", &placeholder),
+                &current,
+                &paths,
+                &BTreeMap::new(),
+            )
+        };
+        for text in [
+            "```\n:::confluence-children\npage: TARGET\n:::\n```\n",
+            "~~~confluence-code\n:::confluence-children\npage: TARGET\n:::\n~~~\n",
+            ":::confluence-macro custom\n---\nwhere: !page TARGET\n:::\n",
+            ":::confluence-macro custom\ntitle: x\n---\npage: TARGET\n:::\n",
+        ] {
+            assert_eq!(rewrite(text), text.replace("TARGET", &placeholder));
+        }
+        for text in [
+            ":::confluence-children\npage: TARGET\n:::\n",
+            ":::confluence-children\npage: TARGET\n:::",
+            "before\n\n:::confluence-macro custom\nwhere: !page TARGET\n---\nbody\n:::\n\nafter\n",
+            ":::confluence-info\n:::confluence-children\npage: TARGET\n:::\n:::\n",
+            ":::confluence-macro custom\n---\n:::confluence-children\npage: TARGET\n:::\n:::\n",
+            "~~~~confluence-layout-section single\n--- cell ---\n:::confluence-children\npage: TARGET\n:::\n~~~~\n",
+        ] {
+            assert_eq!(rewrite(text), text.replace("TARGET", local));
+        }
     }
 
     #[test]
