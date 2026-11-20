@@ -163,7 +163,7 @@ pub(crate) struct StatusMacroPlaceholder {
 fn storage_to_markdown_xml(storage: &str) -> Option<String> {
     // Storage names characters by the entities of HTML, which XML knows
     // only when they are declared.
-    let wrapped = wrap_storage_fragment(storage)?;
+    let wrapped = wrap_storage_fragment(storage);
     let options = roxmltree::ParsingOptions {
         allow_dtd: true,
         ..roxmltree::ParsingOptions::default()
@@ -1047,13 +1047,12 @@ pub(crate) fn markdown_options() -> Options {
         | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
 }
 
-/// A storage body as one XML document. `None` when the body names an entity
-/// that has no characters to stand for.
-fn wrap_storage_fragment(storage: &str) -> Option<String> {
-    let declarations = crate::storage::named_character_declarations(storage)?;
-    Some(format!(
+/// A storage body as one XML document.
+fn wrap_storage_fragment(storage: &str) -> String {
+    let declarations = crate::storage::named_character_declarations(storage);
+    format!(
         r#"<!DOCTYPE root [{declarations}]><root xmlns:ac="{AC_NS}" xmlns:ri="{RI_NS}">{storage}</root>"#
-    ))
+    )
 }
 
 fn render_top_level_block(node: Node<'_, '_>, source: &str) -> Option<String> {
@@ -1109,10 +1108,16 @@ fn render_block_element(node: Node<'_, '_>, source: &str) -> Option<String> {
                 return render_container_blocks(node, source);
             }
             let inline = render_inline_children(node, source)?;
-            if inline.trim().is_empty() {
+            let inline = inline.trim();
+            // Markdown reads a first line that is one tag and nothing else
+            // as the start of an HTML block, which is not a paragraph.
+            let first_line = inline.lines().next().unwrap_or_default().trim_end();
+            let is_one_tag =
+                first_line.starts_with('<') && first_line.find('>') == Some(first_line.len() - 1);
+            if inline.is_empty() || is_one_tag {
                 None
             } else {
-                Some(escape_block_starts(inline.trim()))
+                Some(escape_block_starts(inline))
             }
         }
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
@@ -2257,6 +2262,14 @@ fn render_inline_node(node: Node<'_, '_>, source: &str) -> Option<String> {
     if contains_confluence_markup(node) {
         return None;
     }
+    // Text is written with its white space collapsed, which is not how an
+    // element that sets `white-space` shows it.
+    if node
+        .attribute("style")
+        .is_some_and(|style| style.to_ascii_lowercase().contains("white-space"))
+    {
+        return None;
+    }
 
     match node.tag_name().name() {
         "strong" | "b" => render_emphasis(node, source, "**", "strong"),
@@ -2268,7 +2281,8 @@ fn render_inline_node(node: Node<'_, '_>, source: &str) -> Option<String> {
             let alt = node.attribute("alt").unwrap_or_default();
             Some(format!("![{}]({src})", escape_markdown_text(alt)))
         }
-        "br" => Some(HARD_BREAK.to_string()),
+        "br" if breaks_between_lines_of_text(node) => Some(HARD_BREAK.to_string()),
+        "br" => Some("<br/>".to_string()),
         _ if is_transparent_inline(node) => render_inline_children(node, source),
         name if INLINE_TAGS.contains(&name) => {
             inline_tag(node, name, &render_inline_children(node, source)?)
@@ -2276,6 +2290,68 @@ fn render_inline_node(node: Node<'_, '_>, source: &str) -> Option<String> {
         // Markdown has no way to tell where an element it does not know
         // belongs, so the block that holds one is kept as storage.
         _ => None,
+    }
+}
+
+/// Whether a line break has text of its own block on both sides, which is
+/// where Markdown reads a hard break. A break at the start or end of a
+/// block, beside another break or in a heading is written as a tag.
+fn breaks_between_lines_of_text(node: Node<'_, '_>) -> bool {
+    let in_heading = node.ancestors().any(|ancestor| {
+        !is_confluence_node(ancestor)
+            && matches!(
+                ancestor.tag_name().name(),
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+            )
+    });
+    // White space beside a break shows nothing, with or without elements
+    // around it.
+    let shows = |neighbour: Node<'_, '_>| {
+        neighbour.descendants().any(|part| match part.node_type() {
+            NodeType::Text => !part.text().unwrap_or_default().trim().is_empty(),
+            NodeType::Element => {
+                is_confluence_node(part) || matches!(part.tag_name().name(), "br" | "img")
+            }
+            _ => false,
+        })
+    };
+    let is_text = |after: bool| {
+        inline_neighbour(node, after, shows).is_some_and(|neighbour| {
+            neighbour.is_text() || (is_inlineish_tag(neighbour) && !is_line_break(neighbour))
+        })
+    };
+    !in_heading && is_text(false) && is_text(true)
+}
+
+fn is_line_break(node: Node<'_, '_>) -> bool {
+    node.is_element() && node.tag_name().name() == "br" && !is_confluence_node(node)
+}
+
+/// The nearest node that `counts` next to an inline node within its block,
+/// after it (`after`) or before it. An element that is only there to hold
+/// the node is looked past.
+fn inline_neighbour<'a, 'input>(
+    node: Node<'a, 'input>,
+    after: bool,
+    counts: impl Fn(Node<'a, 'input>) -> bool,
+) -> Option<Node<'a, 'input>> {
+    let step = |node: Node<'a, 'input>| {
+        if after {
+            node.next_sibling()
+        } else {
+            node.prev_sibling()
+        }
+    };
+    let mut current = node;
+    loop {
+        let neighbour = std::iter::successors(step(current), |sibling| step(*sibling))
+            .find(|sibling| (sibling.is_element() || sibling.is_text()) && counts(*sibling));
+        if neighbour.is_some() {
+            return neighbour;
+        }
+        current = current
+            .parent()
+            .filter(|parent| is_transparent_inline(*parent))?;
     }
 }
 
@@ -2434,9 +2510,7 @@ fn edge_of(node: Node<'_, '_>, start: bool) -> Option<Edge> {
             }
         }
         NodeType::Element if emphasis_kind(node).is_some() => Some(Edge::Emphasis),
-        NodeType::Element if node.tag_name().name() == "br" && !is_confluence_node(node) => {
-            Some(Edge::Space)
-        }
+        NodeType::Element if is_line_break(node) => Some(Edge::Space),
         NodeType::Element => Some(Edge::Punctuation),
         _ => None,
     }
@@ -2477,9 +2551,26 @@ fn render_code_span(node: Node<'_, '_>, source: &str) -> Option<String> {
         .filter_map(|child| child.text())
         .collect::<String>()
         .replace(['\n', '\r'], " ");
+    // The delimiters of two code spans that touch read as one longer
+    // delimiter.
+    let written = |neighbour: Node<'_, '_>| edge_of(neighbour, false).is_some();
+    let before = std::iter::successors(inline_neighbour(node, false, written), |neighbour| {
+        neighbour
+            .children()
+            .rev()
+            .find(|child| written(*child))
+            .filter(|_| is_transparent_inline(*neighbour))
+    })
+    .last();
+    let touches_code_span = before.is_some_and(|neighbour| {
+        neighbour.is_element()
+            && neighbour.tag_name().name() == "code"
+            && !is_confluence_node(neighbour)
+    });
     if node.attributes().len() > 0
         || node.children().any(|child| child.is_element())
         || text.is_empty()
+        || touches_code_span
     {
         return inline_tag(node, "code", &render_inline_children(node, source)?);
     }
@@ -4043,7 +4134,6 @@ fn parse_layout_group(lines: &[&str], start: usize, allow_lossy: bool) -> Result
                 .trim_start()
                 .starts_with("~~~~confluence-layout-section")
         {
-            index = scan;
             break;
         }
         index = scan;
@@ -4809,8 +4899,12 @@ fn convert_checkbox_lists_to_task_lists(html: &str) -> String {
         r#"(?s)<ul>\s*((?:<li>\s*<input[^>]*type="checkbox"[^>]*/?>\s*.*?</li>\s*)+)</ul>"#,
     )
     .expect("valid checkbox list regex");
-    let li_re = Regex::new(r#"(?s)<li>\s*<input([^>]*)type="checkbox"([^>]*)/?>\s*(.*?)\s*</li>"#)
-        .expect("valid checkbox item regex");
+    // Only the white space of the layout surrounds the body. A space that
+    // does not break is part of it.
+    let li_re = Regex::new(
+        r#"(?s)<li>\s*<input([^>]*)type="checkbox"([^>]*)/?>[ \t\r\n]*(.*?)[ \t\r\n]*</li>"#,
+    )
+    .expect("valid checkbox item regex");
 
     ul_re
         .replace_all(html, |captures: &regex::Captures<'_>| {
@@ -4823,7 +4917,7 @@ fn convert_checkbox_lists_to_task_lists(html: &str) -> String {
                 } else {
                     "incomplete"
                 };
-                let body = item[3].trim();
+                let body = &item[3];
                 tasks.push(format!(
                     "<ac:task><ac:task-status>{status}</ac:task-status><ac:task-body>{body}</ac:task-body></ac:task>"
                 ));

@@ -100,7 +100,7 @@ pub(crate) fn validate_storage(storage: &str) -> Result<()> {
 /// namespaces and the named entities the body uses, each with the value
 /// `entity_value` gives it.
 fn wrap_fragment(storage: &str, entity_value: impl Fn(&str) -> String) -> String {
-    let declarations = entity_declarations(storage, entity_value);
+    let declarations = entity_declarations(storage, |name| Some(entity_value(name)));
     // Bodies are fragments with multiple top-level nodes and implicit ac/ri
     // namespaces. A newline keeps original columns intact on the first line.
     format!(
@@ -109,8 +109,9 @@ fn wrap_fragment(storage: &str, entity_value: impl Fn(&str) -> String) -> String
 }
 
 /// A declaration for each entity the body names beyond those XML defines,
-/// giving it the value `entity_value` returns.
-fn entity_declarations(storage: &str, entity_value: impl Fn(&str) -> String) -> String {
+/// giving it the value `entity_value` returns. An entity without a value is
+/// left undeclared.
+fn entity_declarations(storage: &str, entity_value: impl Fn(&str) -> Option<String>) -> String {
     static ENTITIES: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"&[A-Za-z][A-Za-z0-9]*;").expect("valid entity regex"));
     let entities: BTreeSet<_> = ENTITIES
@@ -121,23 +122,20 @@ fn entity_declarations(storage: &str, entity_value: impl Fn(&str) -> String) -> 
     let mut declarations = String::new();
     for name in entities {
         // Names come from the restricted regex, so cannot inject declarations.
-        declarations.push_str(&format!("<!ENTITY {name} '{}'>", entity_value(name)));
+        if let Some(value) = entity_value(name) {
+            declarations.push_str(&format!("<!ENTITY {name} '{value}'>"));
+        }
     }
     declarations
 }
 
 /// Declarations that make each named entity of HTML in the body stand for
-/// its characters. `None` when the body names an entity that HTML does not
-/// have or that stands for markup, which no declaration can give a value.
-pub(crate) fn named_character_declarations(storage: &str) -> Option<String> {
-    let unknown = std::cell::Cell::new(false);
-    let declarations = entity_declarations(storage, |name| {
-        named_characters(name).unwrap_or_else(|| {
-            unknown.set(true);
-            String::new()
-        })
-    });
-    (!unknown.get()).then_some(declarations)
+/// its characters. A name that HTML does not have, or that stands for
+/// markup, is left undeclared: it is no reference where it is written as
+/// text, in a comment or in character data, and anywhere else the body is
+/// not well formed.
+pub(crate) fn named_character_declarations(storage: &str) -> String {
+    entity_declarations(storage, named_characters)
 }
 
 /// Whether two storage bodies describe the same document. Spellings that

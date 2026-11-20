@@ -4875,6 +4875,120 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn line_break_is_kept_where_markdown_has_no_hard_break() {
+        for storage in [
+            "<p>x<br/><br/>y</p>",
+            "<p>x<br/><br/><br/>y</p>",
+            "<p>x<br/></p>",
+            "<p><br/>x</p>",
+            "<p>x<br/>y</p>",
+            "<p>x<br/> <br/>y</p>",
+            "<p><em>x<br/></em>y</p>",
+            "<ul><li>x<br/><br/>y</li></ul>",
+            "<ul><li>x<br/></li><li>y</li></ul>",
+            "<h2>x<br/>y</h2>",
+            "<table><tbody><tr><td>x<br/><br/>y</td></tr></tbody></table>",
+            "<blockquote><p>x<br/><br/>y</p></blockquote>",
+            "<p>a<br/><em> </em><br/>b</p>",
+            "<ul><li>x<br/><ul><li>z</li></ul></li></ul>",
+            "<p>x<br/><strong>y</strong></p>",
+        ] {
+            assert_keeps(storage);
+        }
+        assert_eq!(storage_to_markdown("<p>x<br/>y</p>"), "x  \ny");
+    }
+
+    #[test]
+    fn code_spans_that_touch_stay_apart() {
+        for storage in [
+            "<p><code>a</code><code>b</code></p>",
+            "<p><code>a</code><code>b</code><code>c</code></p>",
+            "<p><code>a</code> <code>b</code></p>",
+            "<p><code>a</code>`<code>b</code></p>",
+            "<p><code>a</code><em></em><code>b</code></p>",
+        ] {
+            assert_keeps(storage);
+        }
+        assert_eq!(
+            storage_to_markdown("<p><code>a</code> <code>b</code></p>"),
+            "`a` `b`"
+        );
+        // An element that only holds a code span does not keep it apart.
+        for storage in [
+            "<p><code>a</code><span><code>b</code></span></p>",
+            "<p><span><code>a</code></span><code>b</code></p>",
+            "<p><code>a</code><span></span><code>b</code></p>",
+        ] {
+            let applied = apply_storage(&storage_to_markdown(storage)).expect("applies");
+            assert!(
+                crate::storage::same_document(&applied, "<p><code>a</code><code>b</code></p>"),
+                "{storage} applied as {applied}"
+            );
+        }
+    }
+
+    #[test]
+    fn entity_name_in_code_or_a_comment_is_text_of_the_page() {
+        for storage in [
+            r#"<p class="x">a&nbsp;b</p><ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[x = &custom; + &nbsp;]]></ac:plain-text-body></ac:structured-macro>"#,
+            r#"<p class="x">a</p><!-- &custom; --><p>b</p>"#,
+        ] {
+            let markdown = storage_to_markdown(storage);
+            assert!(markdown.contains(r#"class="x""#), "{markdown}");
+        }
+        // A reference to an entity that has no characters is not well formed.
+        assert!(storage_to_markdown("<p>a&custom;b</p>").contains("custom"));
+    }
+
+    #[test]
+    fn element_that_sets_how_white_space_shows_is_kept_as_storage() {
+        for storage in [
+            r#"<p><span style="white-space: pre">A   B</span></p>"#,
+            r#"<p>x<strong style="white-space: pre">A   B</strong></p>"#,
+            r#"<p>x<em style="white-space: pre-wrap">A   B</em></p>"#,
+            r#"<p>x<a href="https://example.com" style="white-space: pre">A   B</a></p>"#,
+            r#"<p style="white-space: pre">A   B</p>"#,
+            r#"<table><tbody><tr><td style="white-space: pre">A   B</td></tr></tbody></table>"#,
+        ] {
+            let markdown = storage_to_markdown(storage);
+            let applied = apply_storage(&markdown).expect("applies");
+            assert!(
+                applied.contains("A   B"),
+                "{storage}\n{markdown}\n{applied}"
+            );
+        }
+    }
+
+    #[test]
+    fn paragraph_that_starts_with_a_line_break_stays_a_paragraph() {
+        for storage in [
+            "<p><br /></p>",
+            "<p>a</p><p><br /></p><p>b</p>",
+            "<blockquote><p><br /></p></blockquote>",
+            "<p><br /> </p><p>x</p>",
+            "<p><br /><br />b</p>",
+            "<p><u><br />x</u></p>",
+            r#"<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell><p><br /></p></ac:layout-cell></ac:layout-section></ac:layout>"#,
+            r#"<ac:structured-macro ac:name="info"><ac:rich-text-body><p><br /></p></ac:rich-text-body></ac:structured-macro>"#,
+        ] {
+            assert_keeps(storage);
+            let applied = apply_storage(&storage_to_markdown(storage)).expect("applies");
+            assert_eq!(
+                applied.matches("<p>").count(),
+                storage.matches("<p>").count(),
+                "{storage}\n{applied}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_keeps_a_space_that_does_not_break_at_its_edges() {
+        assert_keeps(
+            "<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>&nbsp;a&nbsp;</ac:task-body></ac:task></ac:task-list>",
+        );
+    }
+
+    #[test]
     fn page_that_names_characters_by_entity_keeps_what_markdown_cannot_carry() {
         for storage in [
             r#"<p class="x">a&nbsp;b</p>"#,
@@ -5938,18 +6052,26 @@ mod round_trip_tests {
     }
 
     #[test]
-    fn pull_destination_that_holds_only_pages_left_out_can_be_pulled_again() {
+    fn pull_that_leaves_a_page_out_reports_its_warnings_in_the_error() {
         let temp = tempfile::tempdir().expect("tempdir");
         let staged = temp.path().join("staged");
         let root = temp.path().join("pulled");
         let fetched = || vec![fetched_page(&staged, "202", "Broken", "an <unclosed> tag")];
         let (written, unconvertible) = store_pages(&staged, fetched);
-        install_pulled_pages(&staged, &root, written, unconvertible, Vec::new())
-            .expect_err("left out");
-
-        validate_pull_destination(&root, false).expect("nothing of the user's is in the way");
-        fs::write(root.join("notes.txt"), "mine").expect("unmanaged file");
-        validate_pull_destination(&root, false).expect_err("an unmanaged file is in the way");
+        let warnings = vec!["names could not be looked up".to_string()];
+        let error = install_pulled_pages(&staged, &root, written, unconvertible, warnings)
+            .expect_err("left out")
+            .downcast::<crate::output::CliError>()
+            .expect("typed error");
+        assert_eq!(
+            error.details.expect("details")["warnings"],
+            serde_json::json!(["names could not be looked up"])
+        );
+        let hint = error.hint.expect("hint");
+        assert!(
+            hint.ends_with("Also: names could not be looked up."),
+            "{hint}"
+        );
     }
 
     #[test]
@@ -6080,6 +6202,21 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn pull_destination_that_holds_only_pages_left_out_can_be_pulled_again() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staged = temp.path().join("staged");
+        let root = temp.path().join("pulled");
+        let fetched = || vec![fetched_page(&staged, "202", "Broken", "an <unclosed> tag")];
+        let (written, unconvertible) = store_pages(&staged, fetched);
+        install_pulled_pages(&staged, &root, written, unconvertible, Vec::new())
+            .expect_err("left out");
+
+        validate_pull_destination(&root, false).expect("nothing of the user's is in the way");
+        fs::write(root.join("notes.txt"), "mine").expect("unmanaged file");
+        validate_pull_destination(&root, false).expect_err("an unmanaged file is in the way");
+    }
+
+    #[test]
     fn pull_replaces_in_the_failures_directory_only_what_a_pull_wrote_there() {
         let failures = Path::new(PULL_FAILURES_DIR);
         for (kept, in_the_way) in [
@@ -6122,29 +6259,6 @@ mod round_trip_tests {
             validate_pull_destination(&root, false)
                 .expect_err(&format!("{} is in the way", in_the_way.display()));
         }
-    }
-
-    #[test]
-    fn pull_that_leaves_a_page_out_reports_its_warnings_in_the_error() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let staged = temp.path().join("staged");
-        let root = temp.path().join("pulled");
-        let fetched = || vec![fetched_page(&staged, "202", "Broken", "an <unclosed> tag")];
-        let (written, unconvertible) = store_pages(&staged, fetched);
-        let warnings = vec!["names could not be looked up".to_string()];
-        let error = install_pulled_pages(&staged, &root, written, unconvertible, warnings)
-            .expect_err("left out")
-            .downcast::<crate::output::CliError>()
-            .expect("typed error");
-        assert_eq!(
-            error.details.expect("details")["warnings"],
-            serde_json::json!(["names could not be looked up"])
-        );
-        let hint = error.hint.expect("hint");
-        assert!(
-            hint.ends_with("Also: names could not be looked up."),
-            "{hint}"
-        );
     }
 
     #[test]
