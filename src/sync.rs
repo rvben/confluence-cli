@@ -5245,6 +5245,49 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn block_keeps_a_line_of_tildes_in_its_body() {
+        let plain = |name: &str, text: &str| {
+            format!(
+                r#"<ac:structured-macro ac:name="{name}"><ac:plain-text-body><![CDATA[{text}]]></ac:plain-text-body></ac:structured-macro>"#
+            )
+        };
+        let layout = |cell: &str| {
+            format!(
+                r#"<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell>{cell}</ac:layout-cell></ac:layout-section></ac:layout>"#
+            )
+        };
+        for name in ["code", "noformat"] {
+            for text in ["a\n~~~\nb", "a\n~~~~~\nb", "~~~\n~~~~", "  ~~~  \nb"] {
+                let block = plain(name, text);
+                assert_keeps(&block);
+                assert_keeps(&format!("{block}<p>after</p>"));
+                assert_keeps(&layout(&block));
+                assert_keeps(&format!(
+                    r#"<ac:structured-macro ac:name="info"><ac:rich-text-body>{block}</ac:rich-text-body></ac:structured-macro>"#
+                ));
+            }
+        }
+        assert_eq!(
+            storage_to_markdown(&plain("code", "a\n~~~\nb")),
+            "~~~~confluence-code\na\n~~~\nb\n~~~~"
+        );
+    }
+
+    #[test]
+    fn layout_inside_a_layout_cell_is_kept() {
+        let layout = |cell: &str| {
+            format!(
+                r#"<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell>{cell}</ac:layout-cell></ac:layout-section></ac:layout>"#
+            )
+        };
+        assert_keeps(&layout(&layout("<p>in</p>")));
+        assert_keeps(&layout(&format!(
+            "<p>a</p>{}<p>b</p>",
+            layout(&layout("<p>in</p>"))
+        )));
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");

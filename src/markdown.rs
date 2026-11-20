@@ -1233,7 +1233,7 @@ fn render_layout(node: Node<'_, '_>, source: &str) -> Option<String> {
             return Some(confluence_raw_block(raw_xml_fragment(node, source)));
         }
 
-        let mut block = format!("~~~~confluence-layout-section {section_type}\n");
+        let mut block = String::new();
         if let Some(breakout_mode) = breakout_mode.filter(|value| !value.is_empty()) {
             block.push_str(&format!("breakout-mode: {breakout_mode}\n"));
         }
@@ -1245,8 +1245,10 @@ fn render_layout(node: Node<'_, '_>, source: &str) -> Option<String> {
                 block.push('\n');
             }
         }
-        block.push_str("~~~~");
-        rendered_sections.push(block);
+        let fence = tilde_fence(&block, 4);
+        rendered_sections.push(format!(
+            "{fence}confluence-layout-section {section_type}\n{block}{fence}"
+        ));
     }
 
     Some(rendered_sections.join("\n\n"))
@@ -2238,6 +2240,20 @@ fn render_rich_text_macro_block(
     markdown
 }
 
+/// A tilde fence for a block with this body: at least `least` tildes, and
+/// more than any line of the body that would close it.
+fn tilde_fence(body: &str, least: usize) -> String {
+    let longest = body
+        .lines()
+        .filter_map(|line| match fence_line(line) {
+            Some(('~', length, "")) => Some(length),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    "~".repeat(least.max(longest + 1))
+}
+
 fn render_code_macro_block(node: Node<'_, '_>) -> Option<String> {
     let code_body = namespaced_child(node, AC_NS, "plain-text-body")?;
     let code = code_body.text().unwrap_or_default().trim_end_matches('\n');
@@ -2246,16 +2262,17 @@ fn render_code_macro_block(node: Node<'_, '_>) -> Option<String> {
         .remove("language")
         .filter(|value| !value.is_empty());
 
+    let fence = tilde_fence(code, 3);
     let mut markdown = match language {
-        Some(language) => format!("~~~confluence-code {language}\n"),
-        None => "~~~confluence-code\n".to_string(),
+        Some(language) => format!("{fence}confluence-code {language}\n"),
+        None => format!("{fence}confluence-code\n"),
     };
     markdown.push_str(&macro_header(&parameters, code));
     markdown.push_str(code);
     if !code.is_empty() {
         markdown.push('\n');
     }
-    markdown.push_str("~~~");
+    markdown.push_str(&fence);
     Some(markdown)
 }
 
@@ -2264,13 +2281,14 @@ fn render_noformat_macro_block(node: Node<'_, '_>) -> Option<String> {
     let text = body.text().unwrap_or_default().trim_end_matches('\n');
     let parameters = collect_macro_parameters(node);
 
-    let mut markdown = "~~~confluence-noformat\n".to_string();
+    let fence = tilde_fence(text, 3);
+    let mut markdown = format!("{fence}confluence-noformat\n");
     markdown.push_str(&macro_header(&parameters, text));
     markdown.push_str(text);
     if !text.is_empty() {
         markdown.push('\n');
     }
-    markdown.push_str("~~~");
+    markdown.push_str(&fence);
     Some(markdown)
 }
 
