@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.41](https://github.com/rvben/confluence-cli/compare/v0.1.40...v0.1.41) - 2026-11-20
+
+### Added
+
+- **pull**: show the name of a mentioned user ([a8a247d](https://github.com/rvben/confluence-cli/commit/a8a247d8873e13af55c11c6db84ba4c478329fc0))
+
+### Fixed
+
+- **apply**: keep a closing tag that a comment inside a placeholder link holds ([8651b35](https://github.com/rvben/confluence-cli/commit/8651b3528f6f4406f6f067c233a02ebec28eb48e))
+- **pull**: link to the page an address names, not one whose id it starts with ([a6c470b](https://github.com/rvben/confluence-cli/commit/a6c470b5497315814639b22172e1f2c8d571c003))
+- **apply**: resolve a placeholder link that follows a comment naming CDATA ([3337c2b](https://github.com/rvben/confluence-cli/commit/3337c2b896358f9a72e091dd52d325d2842dd751))
+- **pull**: keep a comment that a page holds ([3bf3db0](https://github.com/rvben/confluence-cli/commit/3bf3db0e18465dde97b996e698349c6f68bb44f4))
+- **apply**: keep a block that follows a layout outside it ([ca4fcde](https://github.com/rvben/confluence-cli/commit/ca4fcdebf864e69d21a9284c572a7c9858378403))
+- **pull**: keep line breaks and code spans that Markdown reads differently ([9b6c242](https://github.com/rvben/confluence-cli/commit/9b6c242533a2508c85670fbb68b3b7e8d097c935))
+- **pull**: keep the formatting of a page that names characters by entity ([7667f97](https://github.com/rvben/confluence-cli/commit/7667f97e0fbe2bb6bff216fa3239010eab03e501))
+- **apply**: keep markup characters in the title of a status ([c060586](https://github.com/rvben/confluence-cli/commit/c0605861b11a939e7f22c8e96c555407c5e5cb1d))
+- **apply**: leave a placeholder link inside a comment as text ([aff23bd](https://github.com/rvben/confluence-cli/commit/aff23bd0397272d1c6f95c5903cd0fb2e92ef36b))
+- **convert**: name the file and Markdown lines of a body that does not convert ([4166f2a](https://github.com/rvben/confluence-cli/commit/4166f2a20b185c9d4a5db8b5407c811baf7bdae6))
+- **pull**: write the pages that convert and mark what Markdown does not carry ([e8cd504](https://github.com/rvben/confluence-cli/commit/e8cd504ab767541bd024d48850d127fd44ed88c3))
+- **convert**: write placeholder links as apply writes them ([039fbf1](https://github.com/rvben/confluence-cli/commit/039fbf1f13a81c6d8da7e953c8b49c426f0da163))
+- **markdown**: keep on pull what Markdown cannot carry ([c5a01a8](https://github.com/rvben/confluence-cli/commit/c5a01a89f2470177ea9b7459f72cc701d5f6a76d))
+
 ## [0.1.40](https://github.com/rvben/confluence-cli/compare/v0.1.39...v0.1.40) - 2026-11-20
 
 ### Fixed
