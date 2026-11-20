@@ -592,11 +592,13 @@ pub async fn apply_path(
         doc.sidecar.remote_version = content.version;
         doc.sidecar.remote_parent_id = derived_parent_id;
         doc.sidecar.last_pulled_hash = Some(markdown_hash);
-        doc.sidecar.storage_hash = Some(storage_hash.clone());
-        doc.sidecar.remote_storage_hash = Some(storage_hash);
+        // What the remote holds is what was last written to it or pulled
+        // from it. An apply that publishes no body leaves that as it is.
         if body_published {
+            doc.sidecar.remote_storage_hash = Some(storage_hash.clone());
             doc.sidecar.storage_differs_from_remote = false;
         }
+        doc.sidecar.storage_hash = Some(storage_hash);
         doc.sidecar.last_sync_at = Some(Utc::now());
         // Track metadata so plan can detect future title/label/status/properties changes.
         doc.sidecar.last_pulled_title = Some(doc.frontmatter.title.clone());

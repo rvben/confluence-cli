@@ -611,6 +611,8 @@ async fn pull_marks_a_page_that_markdown_does_not_carry_until_an_update_rewrites
         );
         let index = find_index_md(&pull_dir);
         assert_eq!(sidecar(&index)["storage_differs_from_remote"], true);
+        let pulled_storage_hash = sidecar(&index)["remote_storage_hash"].clone();
+        assert!(pulled_storage_hash.is_string(), "{pulled_storage_hash}");
 
         let plan = cfg.run_json(&["plan", &pull_arg]);
         let item = &list_items(&plan, "plan")[0];
@@ -625,6 +627,7 @@ async fn pull_marks_a_page_that_markdown_does_not_carry_until_an_update_rewrites
         cfg.run(&["--yes", "apply", &pull_arg]);
         assert_eq!(remote_body(), wrapped_storage);
         assert_eq!(sidecar(&index)["storage_differs_from_remote"], true);
+        assert_eq!(sidecar(&index)["remote_storage_hash"], pulled_storage_hash);
 
         let edited = fs::read_to_string(&index)
             .expect("pulled markdown")
@@ -641,6 +644,7 @@ async fn pull_marks_a_page_that_markdown_does_not_carry_until_an_update_rewrites
         cfg.run(&["--yes", "apply", &pull_arg]);
         assert_eq!(remote_body(), "<p>Edited text</p>");
         assert!(sidecar(&index).get("storage_differs_from_remote").is_none());
+        assert_ne!(sidecar(&index)["remote_storage_hash"], pulled_storage_hash);
         let plan = cfg.run_json(&["plan", &pull_arg]);
         assert_eq!(
             string_field(&list_items(&plan, "plan")[0], "details"),
