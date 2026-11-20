@@ -420,11 +420,9 @@ pub(crate) fn render_markdown_storage(
     markdown: &str,
     allow_lossy: bool,
 ) -> Result<ConversionOutput> {
-    let (normalized_layouts, layout_fragments) = replace_layout_blocks(markdown, allow_lossy)?;
-    let (normalized_macros, macro_fragments) =
-        replace_confluence_macro_blocks(&normalized_layouts, allow_lossy)?;
-    let mut raw_fragments = StorageFragments::for_markdown(&normalized_macros);
-    let normalized = replace_inline_storage_fences(&normalized_macros, &mut raw_fragments);
+    let mut raw_fragments = StorageFragments::for_markdown(markdown);
+    let normalized_blocks = replace_confluence_blocks(markdown, allow_lossy, &mut raw_fragments)?;
+    let normalized = replace_inline_storage_fences(&normalized_blocks, &mut raw_fragments);
 
     let escapes_confluence_markup = has_unescaped_confluence_markup(&normalized);
     let events = parse_with_storage_fences(&normalized, &mut raw_fragments);
@@ -435,23 +433,6 @@ pub(crate) fn render_markdown_storage(
     let html_output = convert_checkbox_lists_to_task_lists(&html_output);
     let mut html_output = convert_generated_markup(&html_output);
     html_output = raw_fragments.restore(&html_output);
-    for idx in (0..layout_fragments.len()).rev() {
-        let fragment = &layout_fragments[idx];
-        html_output = html_output.replace(
-            &format!("<p>CONFLUENCE_LAYOUT_PLACEHOLDER_{idx}</p>"),
-            fragment,
-        );
-        html_output =
-            html_output.replace(&format!("CONFLUENCE_LAYOUT_PLACEHOLDER_{idx}"), fragment);
-    }
-    for idx in (0..macro_fragments.len()).rev() {
-        let fragment = &macro_fragments[idx];
-        html_output = html_output.replace(
-            &format!("<p>CONFLUENCE_MACRO_PLACEHOLDER_{idx}</p>"),
-            fragment,
-        );
-        html_output = html_output.replace(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"), fragment);
-    }
 
     let mut lossy = Vec::new();
     if escapes_confluence_markup {
@@ -3642,451 +3623,680 @@ fn inner_xml_fragment(node: Node<'_, '_>, source: &str) -> String {
         .collect::<String>()
 }
 
-fn replace_confluence_macro_blocks(
-    markdown: &str,
-    allow_lossy: bool,
-) -> Result<(String, Vec<String>)> {
-    let panel_macro_re =
-        Regex::new(r"(?ms)^:::confluence-(info|note|tip|warning)[ \t]*\n(.*?)\n:::[ \t]*(?:\n|$)")?;
-    let mut fragments = Vec::new();
-    let mut normalized = String::with_capacity(markdown.len());
-    let mut last = 0;
-    for captures in panel_macro_re.captures_iter(markdown) {
-        let Some(full_match) = captures.get(0) else {
-            continue;
-        };
-        normalized.push_str(&markdown[last..full_match.start()]);
-        let name = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let body_markdown = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
-        let body_storage = render_markdown_storage(body_markdown, allow_lossy)?.storage;
-        let idx = fragments.len();
-        fragments.push(format!(
-            r#"<ac:structured-macro ac:name="{name}"><ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:structured-macro>"#
-        ));
-        normalized.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
-        // The line break that ends the block ends the line of its
-        // placeholder, so the text that follows stays a block of its own.
-        if full_match.as_str().ends_with('\n') {
-            normalized.push('\n');
-        }
-        last = full_match.end();
-    }
-    normalized.push_str(&markdown[last..]);
-
-    let parameterized =
-        replace_parameterized_colon_macro_blocks(&normalized, allow_lossy, &mut fragments)?;
-
-    let expand_macro_re = Regex::new(
-        r"(?ms)^:::confluence-expand(?:[ \t]+([^\n]+))?[ \t]*\n(.*?)\n:::[ \t]*(?:\n|$)",
-    )?;
-    let mut expanded = String::with_capacity(parameterized.len());
-    last = 0;
-    for captures in expand_macro_re.captures_iter(&parameterized) {
-        let Some(full_match) = captures.get(0) else {
-            continue;
-        };
-        expanded.push_str(&parameterized[last..full_match.start()]);
-        let title = captures.get(1).map(|m| m.as_str().trim());
-        let body_markdown = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
-        let body_storage = render_markdown_storage(body_markdown, allow_lossy)?.storage;
-        let idx = fragments.len();
-        let title_param = title
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                format!(
-                    r#"<ac:parameter ac:name="title">{}</ac:parameter>"#,
-                    escape_xml(value)
-                )
-            })
-            .unwrap_or_default();
-        fragments.push(format!(
-            r#"<ac:structured-macro ac:name="expand">{title_param}<ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:structured-macro>"#
-        ));
-        expanded.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
-        // The line break that ends the block ends the line of its
-        // placeholder, so the text that follows stays a block of its own.
-        if full_match.as_str().ends_with('\n') {
-            expanded.push('\n');
-        }
-        last = full_match.end();
-    }
-    expanded.push_str(&parameterized[last..]);
-
-    let code_macro_re = Regex::new(
-        r"(?ms)^~~~confluence-code(?:[ \t]+([^\n~]+))?[ \t]*\n(.*?)\n~~~[ \t]*(?:\n|$)",
-    )?;
-    let mut code_normalized = String::with_capacity(expanded.len());
-    last = 0;
-    for captures in code_macro_re.captures_iter(&expanded) {
-        let Some(full_match) = captures.get(0) else {
-            continue;
-        };
-        code_normalized.push_str(&expanded[last..full_match.start()]);
-        let language = captures.get(1).map(|m| m.as_str().trim());
-        let block_body = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
-        let (parameters, code) = parse_code_macro_block(language, block_body)?;
-        let idx = fragments.len();
-        fragments.push(build_code_macro_storage(&parameters, &code));
-        code_normalized.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
-        // The line break that ends the block ends the line of its
-        // placeholder, so the text that follows stays a block of its own.
-        if full_match.as_str().ends_with('\n') {
-            code_normalized.push('\n');
-        }
-        last = full_match.end();
-    }
-    code_normalized.push_str(&expanded[last..]);
-
-    let noformat_macro_re =
-        Regex::new(r"(?ms)^~~~confluence-noformat[ \t]*\n(.*?)\n~~~[ \t]*(?:\n|$)")?;
-    let mut noformat_normalized = String::with_capacity(code_normalized.len());
-    last = 0;
-    for captures in noformat_macro_re.captures_iter(&code_normalized) {
-        let Some(full_match) = captures.get(0) else {
-            continue;
-        };
-        noformat_normalized.push_str(&code_normalized[last..full_match.start()]);
-        let block_body = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let (parameters, text) = parse_noformat_macro_block(block_body)?;
-        let idx = fragments.len();
-        fragments.push(build_noformat_macro_storage(&parameters, &text));
-        noformat_normalized.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
-        // The line break that ends the block ends the line of its
-        // placeholder, so the text that follows stays a block of its own.
-        if full_match.as_str().ends_with('\n') {
-            noformat_normalized.push('\n');
-        }
-        last = full_match.end();
-    }
-    noformat_normalized.push_str(&code_normalized[last..]);
-
-    Ok((noformat_normalized, fragments))
+/// What a fence line of Markdown says: the fence character, the length of
+/// its run and the text after it. Indentation is not looked at, so a fence
+/// inside a list item counts as one.
+fn fence_line(line: &str) -> Option<(char, usize, &str)> {
+    let line = line.trim_start();
+    let fence = line.chars().next().filter(|ch| matches!(ch, '`' | '~'))?;
+    let length = line.chars().take_while(|ch| *ch == fence).count();
+    let info = line[length..].trim();
+    (length >= 3 && !(fence == '`' && info.contains('`'))).then_some((fence, length, info))
 }
 
-fn replace_parameterized_colon_macro_blocks(
-    markdown: &str,
-    allow_lossy: bool,
-    fragments: &mut Vec<String>,
-) -> Result<String> {
-    let lines: Vec<&str> = markdown.lines().collect();
-    let mut output = String::new();
+/// Whether `close` is a line that closes the fence that the line `open`
+/// opens at the start of a line. A line indented by more than three spaces
+/// is text of the block.
+fn closes_fence(open: &str, close: &str) -> bool {
+    let indentation = close.len() - close.trim_start_matches(' ').len();
+    match (fence_line(open), fence_line(close)) {
+        (Some((fence, length, _)), Some((ch, run, ""))) => {
+            ch == fence && run >= length && indentation <= 3 && close[indentation..].starts_with(ch)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a line opens a code or noformat block with three tildes. Such a
+/// block holds longer runs of tildes as text, so only a line of three
+/// closes it.
+fn closes_at_three_tildes(open: &str) -> bool {
+    matches!(
+        fence_line(open),
+        Some(('~', 3, info)) if open.starts_with('~')
+            && matches!(fence_block(info), Some(BlockKind::Code(_) | BlockKind::Noformat))
+    )
+}
+
+/// Whether `close` is a line that closes the Confluence block that the
+/// fence line `open` opens.
+fn closes_block(open: &str, close: &str) -> bool {
+    if closes_at_three_tildes(open) {
+        close.trim_end_matches([' ', '\t', '\r', '\n']) == "~~~"
+    } else {
+        closes_fence(open, close)
+    }
+}
+
+/// Where each line of a text starts, and where the text ends.
+fn line_starts(lines: &[&str]) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(lines.len() + 1);
+    let mut offset = 0;
+    for line in lines {
+        starts.push(offset);
+        offset += line.len();
+    }
+    starts.push(offset);
+    starts
+}
+
+/// The elements whose lines Markdown reads as text up to their closing
+/// tag, whatever they say.
+const ELEMENTS_OF_TEXT_AS_WRITTEN: &[&str] = &["pre", "script", "style", "textarea"];
+
+/// Whether a block of raw markup is a comment, a processing instruction, a
+/// declaration, a section of character data or an element that holds text
+/// as written.
+fn holds_text_as_written(markup: &str) -> bool {
+    let markup = markup.trim_start();
+    let Some(tag) = markup.strip_prefix('<') else {
+        return false;
+    };
+    if tag.starts_with(['?', '!']) {
+        return true;
+    }
+    let name = tag
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .next()
+        .unwrap_or_default();
+    ELEMENTS_OF_TEXT_AS_WRITTEN
+        .iter()
+        .any(|element| name.eq_ignore_ascii_case(element))
+}
+
+/// What the parser says about the lines of Markdown that are not read as
+/// Markdown.
+struct LinesAsWritten {
+    /// For each line, the line after the fenced code block or the raw
+    /// markup of text as written that opens on it, when one does. Markdown
+    /// reads the lines of each as text, whatever they say. A fence can open
+    /// after the marker of a list item, and a line indented as code opens
+    /// none.
+    literal: Vec<Option<usize>>,
+    /// Whether each line is part of other raw markup. A Confluence block
+    /// inside it is one, and a line that opens none is text of the markup.
+    markup: Vec<bool>,
+}
+
+fn lines_as_written(markdown: &str, starts: &[usize]) -> LinesAsWritten {
+    let count = starts.len() - 1;
+    let line = |index: usize| &markdown[starts[index]..starts[index + 1]];
+    let line_of = |offset: usize| starts.partition_point(|start| *start <= offset) - 1;
+    let mut literal = vec![None; count];
+    let mut markup = vec![false; count];
+    // The line the parser reads from. A block of three tildes can end
+    // after the line where Markdown closes its fence, and the lines below
+    // it are read from its own end.
+    let mut from = 0;
+    'document: while from < count {
+        let offset = starts[from];
+        let events = Parser::new_ext(&markdown[offset..], markdown_options()).into_offset_iter();
+        for (event, range) in events {
+            if range.is_empty() {
+                continue;
+            }
+            let range = offset + range.start..offset + range.end;
+            let lines = line_of(range.start)..line_of(range.end - 1) + 1;
+            match event {
+                Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))) => {
+                    let open = line(lines.start);
+                    let close = (range.start == starts[lines.start]
+                        && closes_at_three_tildes(open))
+                    .then(|| {
+                        (lines.start + 1..count).find(|close| closes_block(open, line(*close)))
+                    })
+                    .flatten();
+                    match close {
+                        Some(close) if close + 1 != lines.end => {
+                            literal[lines.start] = Some(close + 1);
+                            from = close + 1;
+                            continue 'document;
+                        }
+                        _ => literal[lines.start] = Some(lines.end),
+                    }
+                }
+                Event::Start(Tag::HtmlBlock) if holds_text_as_written(&markdown[range]) => {
+                    literal[lines.start] = Some(lines.end);
+                }
+                Event::Start(Tag::HtmlBlock) => markup[lines].fill(true),
+                _ => {}
+            }
+        }
+        break;
+    }
+    LinesAsWritten { literal, markup }
+}
+
+/// The macros written as `:::confluence-<name>` with a body of their own
+/// form: parameter lines, and for some a body after them.
+const BUILT_IN_COLON_MACROS: &[&str] = &[
+    "anchor",
+    "excerpt",
+    "content-properties",
+    "content-properties-report",
+    "attachments",
+    "view-file",
+    "view-doc",
+    "view-xls",
+    "view-ppt",
+    "blog-posts",
+    "contributors",
+    "contributors-summary",
+    "recently-updated-dashboard",
+    "toc-zone",
+    "toc",
+    "children",
+    "excerpt-include",
+    "include-page",
+    "page-tree",
+    "page-tree-search",
+    "content-by-label",
+    "content-by-user",
+    "content-report-table",
+    "search",
+    "navmap",
+    "task-report",
+    "recently-updated",
+    "livesearch",
+    "page-index",
+    "labels-list",
+    "popular-labels",
+    "related-labels",
+    "recently-used-labels",
+    "gallery",
+    "favorite-pages",
+    "change-history",
+    "spaces-list",
+    "space-details",
+    "space-attachments",
+    "profile",
+    "status-list",
+    "network",
+];
+
+/// The macro a `:::confluence-...` line opens. The line starts at the first
+/// column: an indented one is text of a list item or of an indented code
+/// block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColonMacro<'a> {
+    /// An info, note, tip or warning panel. Its body is Markdown.
+    Panel(&'a str),
+    /// An expand block with its title, which may be empty. Its body is
+    /// Markdown.
+    Expand(&'a str),
+    BuiltIn(&'static str),
+    /// Any other macro, by its Confluence name.
+    Generic(&'a str),
+}
+
+impl ColonMacro<'_> {
+    fn label(&self) -> &str {
+        match self {
+            Self::Panel(name) | Self::Generic(name) => name,
+            Self::Expand(_) => "expand",
+            Self::BuiltIn(name) => name,
+        }
+    }
+}
+
+fn colon_macro(line: &str) -> Option<ColonMacro<'_>> {
+    let rest = line.trim_end().strip_prefix(":::confluence-")?;
+    let (name, argument) = match rest.split_once(char::is_whitespace) {
+        Some((name, argument)) => (name, argument.trim()),
+        None => (rest, ""),
+    };
+    match name {
+        "info" | "note" | "tip" | "warning" if argument.is_empty() => Some(ColonMacro::Panel(name)),
+        "expand" => Some(ColonMacro::Expand(argument)),
+        "macro" if !argument.is_empty() => Some(ColonMacro::Generic(argument)),
+        _ if argument.is_empty() => BUILT_IN_COLON_MACROS
+            .iter()
+            .find(|built_in| **built_in == name)
+            .map(|built_in| ColonMacro::BuiltIn(built_in)),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind<'a> {
+    Colon(ColonMacro<'a>),
+    /// A code macro with the language its opening line names.
+    Code(Option<&'a str>),
+    Noformat,
+    /// A layout section with the type its opening line names.
+    LayoutSection(&'a str),
+}
+
+/// The block a tilde fence with this info text opens.
+fn fence_block(info: &str) -> Option<BlockKind<'_>> {
+    let (name, argument) = match info.split_once(char::is_whitespace) {
+        Some((name, argument)) => (name, argument.trim()),
+        None => (info, ""),
+    };
+    match name {
+        "confluence-code" => Some(BlockKind::Code((!argument.is_empty()).then_some(argument))),
+        "confluence-noformat" if argument.is_empty() => Some(BlockKind::Noformat),
+        "confluence-layout-section" => Some(BlockKind::LayoutSection(argument)),
+        _ => None,
+    }
+}
+
+/// A Confluence block as Markdown writes it: a macro between a
+/// `:::confluence-...` line and a `:::` line, or a code macro, noformat
+/// macro or layout section between tilde fences.
+#[derive(Debug)]
+struct ConfluenceBlock<'a> {
+    kind: BlockKind<'a>,
+    /// The lines of the block, with the line break that ends the last one.
+    range: Range<usize>,
+    /// The lines between the opening and the closing line.
+    body: Range<usize>,
+}
+
+impl ConfluenceBlock<'_> {
+    /// The lines between the opening and the closing line, without the line
+    /// break that ends the last one.
+    fn body<'m>(&self, markdown: &'m str) -> &'m str {
+        let body = &markdown[self.body.clone()];
+        let body = body.strip_suffix('\n').unwrap_or(body);
+        body.strip_suffix('\r').unwrap_or(body)
+    }
+}
+
+/// The Confluence blocks of a Markdown document, outermost only: a block
+/// inside the body of another is found when that body is read.
+///
+/// A fenced code block is code whatever its lines read as, so nothing in it
+/// opens or closes a block. A `:::` block holds blocks of its own, each
+/// closed by its own `:::` line. A tilde fence closes at the first run of
+/// tildes at least as long as the one that opens it, which lets a block
+/// hold shorter fences.
+fn confluence_blocks(markdown: &str) -> Result<Vec<ConfluenceBlock<'_>>> {
+    if !markdown.contains("confluence-") {
+        return Ok(Vec::new());
+    }
+    let lines: Vec<&str> = markdown.split_inclusive('\n').collect();
+    let starts = line_starts(&lines);
+    let LinesAsWritten { literal, markup } = lines_as_written(markdown, &starts);
+    let block = |kind, open: usize, close: usize| ConfluenceBlock {
+        kind,
+        range: starts[open]..starts[close + 1],
+        body: starts[open + 1]..starts[close],
+    };
+
+    let mut blocks = Vec::new();
     let mut index = 0;
-
     while index < lines.len() {
-        let trimmed = lines[index].trim();
-        let generic_macro_name = trimmed
-            .strip_prefix(":::confluence-macro ")
-            .map(str::trim)
-            .filter(|name| !name.is_empty());
-        let macro_name = match trimmed {
-            ":::confluence-anchor" => Some("anchor"),
-            ":::confluence-excerpt" => Some("excerpt"),
-            ":::confluence-content-properties" => Some("content-properties"),
-            ":::confluence-content-properties-report" => Some("content-properties-report"),
-            ":::confluence-attachments" => Some("attachments"),
-            ":::confluence-view-file" => Some("view-file"),
-            ":::confluence-view-doc" => Some("view-doc"),
-            ":::confluence-view-xls" => Some("view-xls"),
-            ":::confluence-view-ppt" => Some("view-ppt"),
-            ":::confluence-blog-posts" => Some("blog-posts"),
-            ":::confluence-contributors" => Some("contributors"),
-            ":::confluence-contributors-summary" => Some("contributors-summary"),
-            ":::confluence-recently-updated-dashboard" => Some("recently-updated-dashboard"),
-            ":::confluence-toc-zone" => Some("toc-zone"),
-            ":::confluence-toc" => Some("toc"),
-            ":::confluence-children" => Some("children"),
-            ":::confluence-excerpt-include" => Some("excerpt-include"),
-            ":::confluence-include-page" => Some("include-page"),
-            ":::confluence-page-tree" => Some("page-tree"),
-            ":::confluence-page-tree-search" => Some("page-tree-search"),
-            ":::confluence-content-by-label" => Some("content-by-label"),
-            ":::confluence-content-by-user" => Some("content-by-user"),
-            ":::confluence-content-report-table" => Some("content-report-table"),
-            ":::confluence-search" => Some("search"),
-            ":::confluence-navmap" => Some("navmap"),
-            ":::confluence-task-report" => Some("task-report"),
-            ":::confluence-recently-updated" => Some("recently-updated"),
-            ":::confluence-livesearch" => Some("livesearch"),
-            ":::confluence-page-index" => Some("page-index"),
-            ":::confluence-labels-list" => Some("labels-list"),
-            ":::confluence-popular-labels" => Some("popular-labels"),
-            ":::confluence-related-labels" => Some("related-labels"),
-            ":::confluence-recently-used-labels" => Some("recently-used-labels"),
-            ":::confluence-gallery" => Some("gallery"),
-            ":::confluence-favorite-pages" => Some("favorite-pages"),
-            ":::confluence-change-history" => Some("change-history"),
-            ":::confluence-spaces-list" => Some("spaces-list"),
-            ":::confluence-space-details" => Some("space-details"),
-            ":::confluence-space-attachments" => Some("space-attachments"),
-            ":::confluence-profile" => Some("profile"),
-            ":::confluence-status-list" => Some("status-list"),
-            ":::confluence-network" => Some("network"),
-            _ => None,
-        };
-
-        if macro_name.is_none() && generic_macro_name.is_none() {
-            output.push_str(lines[index]);
-            output.push('\n');
-            index += 1;
+        let line = lines[index];
+        if let Some(end) = literal[index] {
+            let tilde_fence = fence_line(line).filter(|_| line.starts_with('~'));
+            if let Some((_, _, info)) = tilde_fence
+                && let Some(kind) = fence_block(info)
+            {
+                let close = end - 1;
+                if !closes_block(line, lines[close]) {
+                    match kind {
+                        BlockKind::LayoutSection(section_type) => {
+                            bail!("unterminated confluence layout section `{section_type}`")
+                        }
+                        _ => bail!("unterminated {} block", info.trim()),
+                    }
+                }
+                blocks.push(block(kind, index, close));
+            }
+            index = end;
             continue;
         }
-
-        let mut body_lines = Vec::new();
-        index += 1;
-        while index < lines.len() && lines[index].trim() != ":::" {
-            body_lines.push(lines[index]);
+        // Raw markup holds no code block of Markdown, so a fence inside it
+        // closes at the first line that closes it, wherever that is.
+        if markup[index]
+            && line.starts_with('~')
+            && let Some((_, _, info)) = fence_line(line)
+            && let Some(kind) = fence_block(info)
+            && let Some(close) =
+                (index + 1..lines.len()).find(|close| closes_block(line, lines[*close]))
+        {
+            blocks.push(block(kind, index, close));
+            index = close + 1;
+            continue;
+        }
+        let Some(colon) = colon_macro(line) else {
             index += 1;
-        }
-        let macro_label = macro_name.or(generic_macro_name).unwrap_or("macro");
-        if index >= lines.len() {
-            bail!("unterminated confluence {macro_label} block");
-        }
-
-        let body = body_lines.join("\n");
-        let fragment = match macro_name.unwrap_or("__generic__") {
-            "anchor" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence anchor macro")?;
-                build_default_parameter_macro_storage("anchor", "name", &parameters)
-            }
-            "excerpt" => {
-                let (parameters, body_storage) =
-                    parse_rich_text_macro_block("confluence excerpt macro", &body, allow_lossy)?;
-                build_rich_text_macro_storage("excerpt", &parameters, &body_storage)
-            }
-            "content-properties" => {
-                let (parameters, body_storage) = parse_rich_text_macro_block(
-                    "confluence content-properties macro",
-                    &body,
-                    allow_lossy,
-                )?;
-                build_legacy_rich_text_macro_storage("details", &parameters, &body_storage)
-            }
-            "content-properties-report" => {
-                let parameters = parse_macro_parameter_lines(
-                    &body,
-                    "confluence content-properties-report macro",
-                )?;
-                build_legacy_parameter_only_macro_storage("detailssummary", &parameters)
-            }
-            "attachments" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence attachments macro")?;
-                build_parameter_only_macro_storage("attachments", &parameters)
-            }
-            "view-file" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence view-file macro")?;
-                build_attachment_preview_macro_storage("view-file", &parameters)?
-            }
-            "view-doc" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence view-doc macro")?;
-                build_attachment_preview_macro_storage("viewdoc", &parameters)?
-            }
-            "view-xls" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence view-xls macro")?;
-                build_attachment_preview_macro_storage("viewxls", &parameters)?
-            }
-            "view-ppt" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence view-ppt macro")?;
-                build_attachment_preview_macro_storage("viewppt", &parameters)?
-            }
-            "blog-posts" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence blog-posts macro")?;
-                build_blog_posts_macro_storage(&parameters)
-            }
-            "contributors" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence contributors macro")?;
-                build_spaces_macro_storage("contributors", &parameters)
-            }
-            "contributors-summary" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence contributors-summary macro")?;
-                build_spaces_macro_storage("contributors-summary", &parameters)
-            }
-            "recently-updated-dashboard" => {
-                let parameters = parse_macro_parameter_lines(
-                    &body,
-                    "confluence recently-updated-dashboard macro",
-                )?;
-                build_spaces_macro_storage("recently-updated-dashboard", &parameters)
-            }
-            "toc-zone" => {
-                let (parameters, body_storage) =
-                    parse_rich_text_macro_block("confluence toc-zone macro", &body, allow_lossy)?;
-                build_rich_text_macro_storage("toc-zone", &parameters, &body_storage)
-            }
-            "toc" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence toc macro")?;
-                build_parameter_only_macro_storage("toc", &parameters)
-            }
-            "children" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence children macro")?;
-                build_children_macro_storage(&parameters)?
-            }
-            "excerpt-include" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence excerpt-include macro")?;
-                build_excerpt_include_macro_storage(&parameters)?
-            }
-            "include-page" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence include-page macro")?;
-                build_include_page_macro_storage(&parameters)?
-            }
-            "page-tree" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence page-tree macro")?;
-                build_page_tree_macro_storage(&parameters)?
-            }
-            "page-tree-search" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence page-tree-search macro")?;
-                build_page_tree_search_macro_storage(&parameters)
-            }
-            "content-by-label" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence content-by-label macro")?;
-                build_parameter_only_macro_storage("contentbylabel", &parameters)
-            }
-            "content-by-user" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence content-by-user macro")?;
-                build_default_user_parameter_macro_storage("content-by-user", "user", &parameters)
-            }
-            "content-report-table" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence content-report-table macro")?;
-                build_spaces_macro_storage("content-report-table", &parameters)
-            }
-            "search" => {
-                let (parameters, body_storage) =
-                    parse_generic_macro_block("confluence search macro", &body, allow_lossy)?;
-                build_generic_macro_storage("search", &parameters, body_storage.as_deref())?
-            }
-            "navmap" => {
-                let (parameters, body_storage) =
-                    parse_generic_macro_block("confluence navmap macro", &body, allow_lossy)?;
-                build_generic_macro_storage("navmap", &parameters, body_storage.as_deref())?
-            }
-            "task-report" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence task-report macro")?;
-                build_parameter_only_macro_storage("tasks-report-macro", &parameters)
-            }
-            "recently-updated" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence recently-updated macro")?;
-                build_recently_updated_macro_storage(&parameters)
-            }
-            "livesearch" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence livesearch macro")?;
-                build_space_key_macro_storage("livesearch", &parameters)
-            }
-            "page-index" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence page-index macro")?;
-                if parameters.is_empty() {
-                    build_simple_macro_storage("page-index")
-                } else {
-                    build_parameter_only_macro_storage("page-index", &parameters)
-                }
-            }
-            "labels-list" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence labels-list macro")?;
-                build_space_key_macro_storage("listlabels", &parameters)
-            }
-            "popular-labels" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence popular-labels macro")?;
-                build_space_key_macro_storage("popular-labels", &parameters)
-            }
-            "related-labels" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence related-labels macro")?;
-                build_parameter_only_macro_storage("related-labels", &parameters)
-            }
-            "recently-used-labels" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence recently-used-labels macro")?;
-                build_parameter_only_macro_storage("recently-used-labels", &parameters)
-            }
-            "gallery" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence gallery macro")?;
-                build_parameter_only_macro_storage("gallery", &parameters)
-            }
-            "favorite-pages" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence favorite-pages macro")?;
-                if parameters.is_empty() {
-                    build_simple_macro_storage("favpages")
-                } else {
-                    build_parameter_only_macro_storage("favpages", &parameters)
-                }
-            }
-            "change-history" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence change-history macro")?;
-                if parameters.is_empty() {
-                    build_simple_macro_storage("change-history")
-                } else {
-                    build_parameter_only_macro_storage("change-history", &parameters)
-                }
-            }
-            "spaces-list" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence spaces-list macro")?;
-                build_default_parameter_macro_storage("spaces", "scope", &parameters)
-            }
-            "space-details" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence space-details macro")?;
-                build_parameter_only_macro_storage("space-details", &parameters)
-            }
-            "space-attachments" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence space-attachments macro")?;
-                build_single_space_parameter_macro_storage(
-                    "space-attachments",
-                    "space",
-                    &parameters,
-                )
-            }
-            "profile" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence profile macro")?;
-                build_user_parameter_macro_storage("profile", "user", &parameters)
-            }
-            "status-list" => {
-                let parameters =
-                    parse_macro_parameter_lines(&body, "confluence status-list macro")?;
-                build_user_parameter_macro_storage("status-list", "username", &parameters)
-            }
-            "network" => {
-                let parameters = parse_macro_parameter_lines(&body, "confluence network macro")?;
-                build_network_macro_storage(&parameters)
-            }
-            _ => {
-                let generic_name = generic_macro_name.expect("generic macro name");
-                let (parameters, body_storage) = parse_generic_macro_block(
-                    &format!("confluence macro `{generic_name}`"),
-                    &body,
-                    allow_lossy,
-                )?;
-                build_generic_macro_storage(generic_name, &parameters, body_storage.as_deref())?
-            }
+            continue;
         };
-
-        let placeholder_index = fragments.len();
-        fragments.push(fragment);
-        output.push_str(&format!(
-            "CONFLUENCE_MACRO_PLACEHOLDER_{placeholder_index}\n"
-        ));
-        index += 1;
+        let mut depth = 1;
+        let mut close = index + 1;
+        while close < lines.len() {
+            if let Some(end) = literal[close] {
+                close = end;
+                continue;
+            }
+            if lines[close].trim_end() == ":::" {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            } else if colon_macro(lines[close]).is_some() {
+                depth += 1;
+            }
+            close += 1;
+        }
+        if close >= lines.len() {
+            if markup[index] {
+                index += 1;
+                continue;
+            }
+            bail!("unterminated confluence {} block", colon.label());
+        }
+        blocks.push(block(BlockKind::Colon(colon), index, close));
+        index = close + 1;
     }
+    Ok(blocks)
+}
 
-    if !markdown.ends_with('\n') && output.ends_with('\n') {
-        output.pop();
+/// Takes the Confluence blocks out of a Markdown document, each replaced by
+/// a line holding the placeholder of its storage.
+fn replace_confluence_blocks(
+    markdown: &str,
+    allow_lossy: bool,
+    fragments: &mut StorageFragments,
+) -> Result<String> {
+    let blocks = confluence_blocks(markdown)?;
+    let mut output = String::with_capacity(markdown.len());
+    let mut last = 0;
+    let mut blocks = blocks.iter().peekable();
+    while let Some(block) = blocks.next() {
+        output.push_str(&markdown[last..block.range.start]);
+        // A block is a block of its own, whatever the lines around it
+        // hold: a blank line on either side keeps Markdown from reading its
+        // placeholder into a paragraph.
+        if !output.is_empty() && !output.ends_with("\n\n") {
+            output.push('\n');
+        }
+        let mut end = block.range.end;
+        let body = block.body(markdown);
+        let storage = match block.kind {
+            BlockKind::LayoutSection(section_type) => {
+                let mut sections = vec![layout_section_storage(section_type, body, allow_lossy)?];
+                // Sections with nothing but blank lines between them are
+                // the sections of one layout.
+                while let Some(next) = blocks.next_if(|next| {
+                    matches!(next.kind, BlockKind::LayoutSection(_))
+                        && markdown[end..next.range.start].trim().is_empty()
+                }) {
+                    if let BlockKind::LayoutSection(section_type) = next.kind {
+                        sections.push(layout_section_storage(
+                            section_type,
+                            next.body(markdown),
+                            allow_lossy,
+                        )?);
+                    }
+                    end = next.range.end;
+                }
+                format!("<ac:layout>{}</ac:layout>", sections.concat())
+            }
+            BlockKind::Code(language) => {
+                let (parameters, code) = parse_code_macro_block(language, body)?;
+                build_code_macro_storage(&parameters, &code)
+            }
+            BlockKind::Noformat => {
+                let (parameters, text) = parse_noformat_macro_block(body)?;
+                build_noformat_macro_storage(&parameters, &text)
+            }
+            BlockKind::Colon(colon) => colon_macro_storage(colon, body, allow_lossy)?,
+        };
+        output.push_str(&fragments.hold(storage));
+        // The line break that ends the block ends the line of its
+        // placeholder, so the text that follows stays a block of its own.
+        if markdown[..end].ends_with('\n') {
+            output.push('\n');
+            let follows = markdown[end..].lines().next().unwrap_or_default();
+            if !follows.trim().is_empty() {
+                output.push('\n');
+            }
+        }
+        last = end;
     }
-
+    output.push_str(&markdown[last..]);
     Ok(output)
+}
+
+fn colon_macro_storage(colon: ColonMacro<'_>, body: &str, allow_lossy: bool) -> Result<String> {
+    match colon {
+        ColonMacro::Panel(name) => {
+            let body_storage = render_markdown_storage(body, allow_lossy)?.storage;
+            Ok(format!(
+                r#"<ac:structured-macro ac:name="{name}"><ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:structured-macro>"#
+            ))
+        }
+        ColonMacro::Expand(title) => {
+            let body_storage = render_markdown_storage(body, allow_lossy)?.storage;
+            let title_param = if title.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<ac:parameter ac:name="title">{}</ac:parameter>"#,
+                    escape_xml(title)
+                )
+            };
+            Ok(format!(
+                r#"<ac:structured-macro ac:name="expand">{title_param}<ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:structured-macro>"#
+            ))
+        }
+        ColonMacro::BuiltIn(name) => built_in_macro_storage(name, body, allow_lossy),
+        ColonMacro::Generic(name) => {
+            let (parameters, body_storage) = parse_generic_macro_block(
+                &format!("confluence macro `{name}`"),
+                body,
+                allow_lossy,
+            )?;
+            build_generic_macro_storage(name, &parameters, body_storage.as_deref())
+        }
+    }
+}
+
+fn built_in_macro_storage(name: &str, body: &str, allow_lossy: bool) -> Result<String> {
+    let storage = match name {
+        "anchor" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence anchor macro")?;
+            build_default_parameter_macro_storage("anchor", "name", &parameters)
+        }
+        "excerpt" => {
+            let (parameters, body_storage) =
+                parse_rich_text_macro_block("confluence excerpt macro", body, allow_lossy)?;
+            build_rich_text_macro_storage("excerpt", &parameters, &body_storage)
+        }
+        "content-properties" => {
+            let (parameters, body_storage) = parse_rich_text_macro_block(
+                "confluence content-properties macro",
+                body,
+                allow_lossy,
+            )?;
+            build_legacy_rich_text_macro_storage("details", &parameters, &body_storage)
+        }
+        "content-properties-report" => {
+            let parameters =
+                parse_macro_parameter_lines(body, "confluence content-properties-report macro")?;
+            build_legacy_parameter_only_macro_storage("detailssummary", &parameters)
+        }
+        "attachments" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence attachments macro")?;
+            build_parameter_only_macro_storage("attachments", &parameters)
+        }
+        "view-file" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence view-file macro")?;
+            build_attachment_preview_macro_storage("view-file", &parameters)?
+        }
+        "view-doc" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence view-doc macro")?;
+            build_attachment_preview_macro_storage("viewdoc", &parameters)?
+        }
+        "view-xls" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence view-xls macro")?;
+            build_attachment_preview_macro_storage("viewxls", &parameters)?
+        }
+        "view-ppt" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence view-ppt macro")?;
+            build_attachment_preview_macro_storage("viewppt", &parameters)?
+        }
+        "blog-posts" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence blog-posts macro")?;
+            build_blog_posts_macro_storage(&parameters)
+        }
+        "contributors" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence contributors macro")?;
+            build_spaces_macro_storage("contributors", &parameters)
+        }
+        "contributors-summary" => {
+            let parameters =
+                parse_macro_parameter_lines(body, "confluence contributors-summary macro")?;
+            build_spaces_macro_storage("contributors-summary", &parameters)
+        }
+        "recently-updated-dashboard" => {
+            let parameters =
+                parse_macro_parameter_lines(body, "confluence recently-updated-dashboard macro")?;
+            build_spaces_macro_storage("recently-updated-dashboard", &parameters)
+        }
+        "toc-zone" => {
+            let (parameters, body_storage) =
+                parse_rich_text_macro_block("confluence toc-zone macro", body, allow_lossy)?;
+            build_rich_text_macro_storage("toc-zone", &parameters, &body_storage)
+        }
+        "toc" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence toc macro")?;
+            build_parameter_only_macro_storage("toc", &parameters)
+        }
+        "children" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence children macro")?;
+            build_children_macro_storage(&parameters)?
+        }
+        "excerpt-include" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence excerpt-include macro")?;
+            build_excerpt_include_macro_storage(&parameters)?
+        }
+        "include-page" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence include-page macro")?;
+            build_include_page_macro_storage(&parameters)?
+        }
+        "page-tree" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence page-tree macro")?;
+            build_page_tree_macro_storage(&parameters)?
+        }
+        "page-tree-search" => {
+            let parameters =
+                parse_macro_parameter_lines(body, "confluence page-tree-search macro")?;
+            build_page_tree_search_macro_storage(&parameters)
+        }
+        "content-by-label" => {
+            let parameters =
+                parse_macro_parameter_lines(body, "confluence content-by-label macro")?;
+            build_parameter_only_macro_storage("contentbylabel", &parameters)
+        }
+        "content-by-user" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence content-by-user macro")?;
+            build_default_user_parameter_macro_storage("content-by-user", "user", &parameters)
+        }
+        "content-report-table" => {
+            let parameters =
+                parse_macro_parameter_lines(body, "confluence content-report-table macro")?;
+            build_spaces_macro_storage("content-report-table", &parameters)
+        }
+        "search" => {
+            let (parameters, body_storage) =
+                parse_generic_macro_block("confluence search macro", body, allow_lossy)?;
+            build_generic_macro_storage("search", &parameters, body_storage.as_deref())?
+        }
+        "navmap" => {
+            let (parameters, body_storage) =
+                parse_generic_macro_block("confluence navmap macro", body, allow_lossy)?;
+            build_generic_macro_storage("navmap", &parameters, body_storage.as_deref())?
+        }
+        "task-report" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence task-report macro")?;
+            build_parameter_only_macro_storage("tasks-report-macro", &parameters)
+        }
+        "recently-updated" => {
+            let parameters =
+                parse_macro_parameter_lines(body, "confluence recently-updated macro")?;
+            build_recently_updated_macro_storage(&parameters)
+        }
+        "livesearch" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence livesearch macro")?;
+            build_space_key_macro_storage("livesearch", &parameters)
+        }
+        "page-index" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence page-index macro")?;
+            if parameters.is_empty() {
+                build_simple_macro_storage("page-index")
+            } else {
+                build_parameter_only_macro_storage("page-index", &parameters)
+            }
+        }
+        "labels-list" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence labels-list macro")?;
+            build_space_key_macro_storage("listlabels", &parameters)
+        }
+        "popular-labels" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence popular-labels macro")?;
+            build_space_key_macro_storage("popular-labels", &parameters)
+        }
+        "related-labels" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence related-labels macro")?;
+            build_parameter_only_macro_storage("related-labels", &parameters)
+        }
+        "recently-used-labels" => {
+            let parameters =
+                parse_macro_parameter_lines(body, "confluence recently-used-labels macro")?;
+            build_parameter_only_macro_storage("recently-used-labels", &parameters)
+        }
+        "gallery" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence gallery macro")?;
+            build_parameter_only_macro_storage("gallery", &parameters)
+        }
+        "favorite-pages" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence favorite-pages macro")?;
+            if parameters.is_empty() {
+                build_simple_macro_storage("favpages")
+            } else {
+                build_parameter_only_macro_storage("favpages", &parameters)
+            }
+        }
+        "change-history" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence change-history macro")?;
+            if parameters.is_empty() {
+                build_simple_macro_storage("change-history")
+            } else {
+                build_parameter_only_macro_storage("change-history", &parameters)
+            }
+        }
+        "spaces-list" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence spaces-list macro")?;
+            build_default_parameter_macro_storage("spaces", "scope", &parameters)
+        }
+        "space-details" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence space-details macro")?;
+            build_parameter_only_macro_storage("space-details", &parameters)
+        }
+        "space-attachments" => {
+            let parameters =
+                parse_macro_parameter_lines(body, "confluence space-attachments macro")?;
+            build_single_space_parameter_macro_storage("space-attachments", "space", &parameters)
+        }
+        "profile" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence profile macro")?;
+            build_user_parameter_macro_storage("profile", "user", &parameters)
+        }
+        "status-list" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence status-list macro")?;
+            build_user_parameter_macro_storage("status-list", "username", &parameters)
+        }
+        "network" => {
+            let parameters = parse_macro_parameter_lines(body, "confluence network macro")?;
+            build_network_macro_storage(&parameters)
+        }
+        _ => bail!("unknown confluence macro block `{name}`"),
+    };
+    Ok(storage)
 }
 
 fn parse_rich_text_macro_block(
@@ -4146,98 +4356,11 @@ fn parse_macro_parameter_lines(body: &str, context: &str) -> Result<BTreeMap<Str
     Ok(parameters)
 }
 
-fn replace_layout_blocks(markdown: &str, allow_lossy: bool) -> Result<(String, Vec<String>)> {
-    let lines: Vec<&str> = markdown.lines().collect();
-    let mut fragments = Vec::new();
-    let mut output = String::new();
-    let mut index = 0;
-
-    while index < lines.len() {
-        if !lines[index]
-            .trim_start()
-            .starts_with("~~~~confluence-layout-section")
-        {
-            output.push_str(lines[index]);
-            output.push('\n');
-            index += 1;
-            continue;
-        }
-
-        let (next_index, layout_storage) = parse_layout_group(&lines, index, allow_lossy)?;
-        let idx = fragments.len();
-        fragments.push(layout_storage);
-        output.push_str(&format!("CONFLUENCE_LAYOUT_PLACEHOLDER_{idx}\n"));
-        index = next_index;
+fn layout_section_storage(section_type: &str, body: &str, allow_lossy: bool) -> Result<String> {
+    if section_type.is_empty() {
+        bail!("missing confluence layout section type");
     }
-
-    if !markdown.ends_with('\n') && output.ends_with('\n') {
-        output.pop();
-    }
-
-    Ok((output, fragments))
-}
-
-fn parse_layout_group(lines: &[&str], start: usize, allow_lossy: bool) -> Result<(usize, String)> {
-    let mut index = start;
-    let mut sections = Vec::new();
-
-    loop {
-        let (next_index, section_storage) = parse_layout_section_block(lines, index, allow_lossy)?;
-        sections.push(section_storage);
-        index = next_index;
-
-        let mut scan = index;
-        while scan < lines.len() && lines[scan].trim().is_empty() {
-            scan += 1;
-        }
-        // Blank lines after the last section stay, which is what keeps the
-        // layout apart from the block that follows it.
-        if scan >= lines.len()
-            || !lines[scan]
-                .trim_start()
-                .starts_with("~~~~confluence-layout-section")
-        {
-            break;
-        }
-        index = scan;
-    }
-
-    Ok((
-        index,
-        format!("<ac:layout>{}</ac:layout>", sections.join("")),
-    ))
-}
-
-fn parse_layout_section_block(
-    lines: &[&str],
-    start: usize,
-    allow_lossy: bool,
-) -> Result<(usize, String)> {
-    let header = lines
-        .get(start)
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("missing layout section header"))?;
-    let section_re = Regex::new(r"^~~~~confluence-layout-section(?:[ \t]+([^\n]+))?[ \t]*$")?;
-    let captures = section_re
-        .captures(header.trim_end())
-        .ok_or_else(|| anyhow::anyhow!("invalid confluence layout section header: {header}"))?;
-    let section_type = captures
-        .get(1)
-        .map(|m| m.as_str().trim())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("missing layout section type in: {header}"))?;
-
-    let mut body_lines = Vec::new();
-    let mut index = start + 1;
-    while index < lines.len() && lines[index].trim_end() != "~~~~" {
-        body_lines.push(lines[index]);
-        index += 1;
-    }
-    if index >= lines.len() {
-        bail!("unterminated confluence layout section `{section_type}`");
-    }
-
-    let (metadata, cells) = parse_layout_section_body(&body_lines)?;
+    let (metadata, cells) = parse_layout_section_body(body)?;
     let mut attrs = vec![format!(r#"ac:type="{}""#, escape_xml(section_type))];
     if let Some(breakout_mode) = metadata.get("breakout-mode") {
         attrs.push(format!(
@@ -4254,24 +4377,35 @@ fn parse_layout_section_block(
         .collect::<Result<Vec<_>>>()?
         .join("");
 
-    Ok((
-        index + 1,
-        format!(
-            r#"<ac:layout-section {}>{}</ac:layout-section>"#,
-            attrs.join(" "),
-            cells_xml
-        ),
+    Ok(format!(
+        r#"<ac:layout-section {}>{}</ac:layout-section>"#,
+        attrs.join(" "),
+        cells_xml
     ))
 }
 
-fn parse_layout_section_body(lines: &[&str]) -> Result<(BTreeMap<String, String>, Vec<String>)> {
+/// The line that starts a cell of a layout section.
+const LAYOUT_CELL_LINE: &str = "--- cell ---";
+
+fn parse_layout_section_body(body: &str) -> Result<(BTreeMap<String, String>, Vec<String>)> {
+    let lines: Vec<&str> = body.lines().collect();
     let mut metadata = BTreeMap::new();
     let mut cells = Vec::new();
     let mut current_cell = Vec::new();
     let mut saw_cell = false;
+    let whole_lines: Vec<&str> = body.split_inclusive('\n').collect();
+    let literal = lines_as_written(body, &line_starts(&whole_lines)).literal;
+    // The line after the code block or raw markup being read, whose lines
+    // belong to the cell, whatever they read as.
+    let mut literal_until = 0;
 
-    for line in lines {
-        if line.trim_end() == "--- cell ---" {
+    for (index, line) in lines.iter().enumerate() {
+        if index >= literal_until
+            && let Some(end) = literal[index]
+        {
+            literal_until = end;
+        }
+        if index >= literal_until && line.trim_end() == LAYOUT_CELL_LINE {
             if saw_cell {
                 cells.push(current_cell.join("\n").trim_end().to_string());
                 current_cell.clear();
@@ -7289,6 +7423,267 @@ SELECT ']]>' AS sentinel;
             started.elapsed() < std::time::Duration::from_secs(10),
             "took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn line_of_tildes_that_markdown_reads_as_code_does_not_close_a_block() {
+        let error = render_markdown_storage("~~~~confluence-code\nline\n    ~~~~\n", false)
+            .expect_err("the block is not closed");
+
+        assert_eq!(error.to_string(), "unterminated confluence-code block");
+        assert_eq!(
+            storage_of("~~~~confluence-code\nline\n   ~~~~\n"),
+            r#"<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[line]]></ac:plain-text-body></ac:structured-macro>"#
+        );
+    }
+
+    #[test]
+    fn macro_line_that_opens_no_block_inside_raw_markup_is_text_of_the_markup() {
+        for markdown in [
+            "<div>\n:::confluence-info\n</div>",
+            "<?x\n:::confluence-info\n?>",
+            "<?x\n:::confluence-info\nhello\n:::\n?>",
+            "<![CDATA[\n:::confluence-info\nhello\n:::\n]]>",
+            "<!DOCTYPE x [\n:::confluence-info\nhello\n:::\n]>",
+            "<div>\n~~~confluence-code\nx\n</div>",
+        ] {
+            assert_eq!(storage_of(markdown), markdown);
+        }
+    }
+
+    #[test]
+    fn macro_block_inside_raw_markup_is_a_macro() {
+        assert_eq!(
+            storage_of("<div>\n:::confluence-info\nhello\n:::\n</div>"),
+            concat!(
+                "<div>\n",
+                r#"<ac:structured-macro ac:name="info"><ac:rich-text-body><p>hello</p></ac:rich-text-body></ac:structured-macro>"#,
+                "\n</div>",
+            )
+        );
+        assert_eq!(
+            storage_of("<div>\n~~~confluence-code\nx\n\ny\n~~~\n</div>"),
+            concat!(
+                "<div>\n",
+                r#"<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[x"#,
+                "\n\ny]]></ac:plain-text-body></ac:structured-macro>\n</div>",
+            )
+        );
+    }
+
+    #[test]
+    fn three_tildes_close_a_code_or_noformat_block_opened_by_three() {
+        let code = |text: &str| {
+            format!(
+                r#"<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[{text}]]></ac:plain-text-body></ac:structured-macro>"#
+            )
+        };
+
+        // A longer run of tildes is text of the block, and so is an indented
+        // one.
+        assert_eq!(
+            storage_of("~~~confluence-code\nx\n~~~~\ny\n~~~\n"),
+            code("x\n~~~~\ny")
+        );
+        assert_eq!(
+            storage_of(":::confluence-info\n~~~confluence-noformat\n~~~~\n~~~~~\nx\n~~~\n:::\n"),
+            concat!(
+                r#"<ac:structured-macro ac:name="info"><ac:rich-text-body>"#,
+                r#"<ac:structured-macro ac:name="noformat"><ac:plain-text-body><![CDATA[~~~~"#,
+                "\n~~~~~\nx]]></ac:plain-text-body></ac:structured-macro>",
+                "</ac:rich-text-body></ac:structured-macro>",
+            )
+        );
+        assert_eq!(
+            storage_of("~~~confluence-code\nline\n ~~~\nmore\n~~~\n"),
+            code("line\n ~~~\nmore")
+        );
+        // What follows the block is read from the line after it.
+        assert_eq!(
+            storage_of("~~~confluence-code\nx\n~~~~\ny\n~~~\n\n```\n:::confluence-info\n```\n"),
+            format!(
+                "{}\n<pre><code>:::confluence-info\n</code></pre>",
+                code("x\n~~~~\ny")
+            )
+        );
+        let error = markdown_to_storage("~~~confluence-code\nx\n~~~~\n", false)
+            .expect_err("no line of three tildes closes the block");
+        assert_eq!(error.to_string(), "unterminated confluence-code block");
+        // A longer fence closes where Markdown closes it.
+        assert_eq!(
+            storage_of("~~~~confluence-code\nx\n~~~\ny\n~~~~~\n"),
+            code("x\n~~~\ny")
+        );
+    }
+
+    #[test]
+    fn code_fence_is_where_markdown_reads_one() {
+        let info = "<ac:structured-macro ac:name=\"info\"><ac:rich-text-body><p>hello</p></ac:rich-text-body></ac:structured-macro>";
+        assert_eq!(
+            storage_of("- ```js\n  code\n  ```\n\n:::confluence-info\nhello\n:::\n"),
+            format!(
+                "<ul>\n<li>\n<pre><code class=\"language-js\">code\n</code></pre>\n</li>\n</ul>\n{info}"
+            )
+        );
+        assert_eq!(
+            storage_of("a\n\n    ```\n\n:::confluence-info\nhello\n:::\n"),
+            format!("<p>a</p>\n<pre><code>```\n</code></pre>\n{info}")
+        );
+        assert_eq!(
+            storage_of(
+                "~~~~confluence-layout-section two_equal\n--- cell ---\n- ```js\n  code\n  ```\n--- cell ---\nsecond\n~~~~\n"
+            ),
+            "<ac:layout><ac:layout-section ac:type=\"two_equal\"><ac:layout-cell><ul>\n<li>\n<pre><code class=\"language-js\">code\n</code></pre>\n</li>\n</ul></ac:layout-cell><ac:layout-cell><p>second</p></ac:layout-cell></ac:layout-section></ac:layout>"
+        );
+    }
+
+    #[test]
+    fn macro_line_in_markup_that_holds_text_as_written_is_part_of_that_text() {
+        for markdown in [
+            "<pre>\n:::confluence-info\n</pre>",
+            "<PRE class=\"x\">\n:::confluence-info\nx\n:::\n</PRE>",
+            "<textarea>\n~~~confluence-code\n</textarea>",
+            "<style>\n:::confluence-toc\n:::\n</style>",
+        ] {
+            assert_eq!(storage_of(markdown), markdown);
+        }
+        // Any other element holds Markdown, and its name only starts alike.
+        let info = r#"<ac:structured-macro ac:name="info"><ac:rich-text-body><p>x</p></ac:rich-text-body></ac:structured-macro>"#;
+        for element in ["div", "preview"] {
+            assert_eq!(
+                storage_of(&format!(
+                    "<{element}>\n:::confluence-info\nx\n:::\n</{element}>\n"
+                )),
+                format!("<{element}>\n{info}\n</{element}>")
+            );
+        }
+    }
+
+    #[test]
+    fn macro_line_in_a_comment_is_part_of_the_comment() {
+        assert_eq!(
+            storage_of("<!--\n:::confluence-info\n-->\n\ntext\n"),
+            "<!--\n:::confluence-info\n-->\n<p>text</p>"
+        );
+        assert_eq!(
+            storage_of(":::confluence-info\n<!--\n:::\n-->\n\nhello\n:::\n"),
+            "<ac:structured-macro ac:name=\"info\"><ac:rich-text-body><!--\n:::\n-->\n<p>hello</p></ac:rich-text-body></ac:structured-macro>"
+        );
+    }
+
+    fn storage_of(markdown: &str) -> String {
+        render_markdown_storage(markdown, false)
+            .expect("renders")
+            .storage
+    }
+
+    #[test]
+    fn macro_block_inside_a_macro_block_closes_with_its_own_line() {
+        assert_eq!(
+            storage_of(":::confluence-info\n:::confluence-note\nin\n:::\nout\n:::\n\nafter"),
+            concat!(
+                r#"<ac:structured-macro ac:name="info"><ac:rich-text-body>"#,
+                r#"<ac:structured-macro ac:name="note"><ac:rich-text-body><p>in</p></ac:rich-text-body></ac:structured-macro>"#,
+                "\n<p>out</p></ac:rich-text-body></ac:structured-macro>\n<p>after</p>"
+            )
+        );
+        assert_eq!(
+            storage_of(":::confluence-macro panel\n---\n:::confluence-toc\n:::\n:::"),
+            concat!(
+                r#"<ac:structured-macro ac:name="panel"><ac:rich-text-body>"#,
+                r#"<ac:structured-macro ac:name="toc"></ac:structured-macro>"#,
+                "</ac:rich-text-body></ac:structured-macro>"
+            )
+        );
+    }
+
+    #[test]
+    fn indented_macro_lines_are_not_a_macro_block() {
+        assert_eq!(
+            storage_of("text\n\n    :::confluence-toc\n    :::"),
+            "<p>text</p>\n<pre><code>:::confluence-toc\n:::</code></pre>"
+        );
+    }
+
+    #[test]
+    fn panel_without_a_body_ends_at_its_own_closing_line() {
+        assert_eq!(
+            storage_of(":::confluence-info\n:::\n\ntext\n\n:::confluence-toc\n:::"),
+            concat!(
+                r#"<ac:structured-macro ac:name="info"><ac:rich-text-body></ac:rich-text-body></ac:structured-macro>"#,
+                "\n<p>text</p>\n",
+                r#"<ac:structured-macro ac:name="toc"></ac:structured-macro>"#
+            )
+        );
+    }
+
+    #[test]
+    fn macro_block_shown_in_a_code_block_stays_code() {
+        for (markdown, shown) in [
+            (
+                "```\n:::confluence-toc\n:::\n```",
+                ":::confluence-toc\n:::\n",
+            ),
+            (
+                "```\n:::confluence-info\nb\n:::\n```",
+                ":::confluence-info\nb\n:::\n",
+            ),
+            (
+                "````\n~~~confluence-code\nx\n~~~\n````",
+                "~~~confluence-code\nx\n~~~\n",
+            ),
+            (
+                "```\n~~~~confluence-layout-section single\n--- cell ---\nx\n~~~~\n```",
+                "~~~~confluence-layout-section single\n--- cell ---\nx\n~~~~\n",
+            ),
+        ] {
+            assert_eq!(
+                storage_of(markdown),
+                format!("<pre><code>{shown}</code></pre>"),
+                "{markdown}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_block_inside_a_panel_keeps_a_line_that_reads_as_the_end_of_the_panel() {
+        assert_eq!(
+            storage_of(":::confluence-info\n```\n:::\n```\n:::"),
+            concat!(
+                r#"<ac:structured-macro ac:name="info"><ac:rich-text-body>"#,
+                "<pre><code>:::\n</code></pre>",
+                "</ac:rich-text-body></ac:structured-macro>"
+            )
+        );
+    }
+
+    #[test]
+    fn text_that_spells_the_stand_in_of_a_block_stays_text() {
+        let storage = storage_of(
+            "`CONFLUENCE_MACRO_PLACEHOLDER_0` `CONFLUENCE_LAYOUT_PLACEHOLDER_0`\n\n:::confluence-toc\n:::\n\n~~~~confluence-layout-section single\n--- cell ---\nx\n~~~~",
+        );
+        assert!(
+            storage.starts_with(
+                "<p><code>CONFLUENCE_MACRO_PLACEHOLDER_0</code> <code>CONFLUENCE_LAYOUT_PLACEHOLDER_0</code></p>"
+            ),
+            "{storage}"
+        );
+        assert_eq!(storage.matches(r#"ac:name="toc""#).count(), 1, "{storage}");
+        assert_eq!(storage.matches("<ac:layout>").count(), 1, "{storage}");
+    }
+
+    #[test]
+    fn layout_cell_keeps_a_code_block_that_shows_a_cell_line() {
+        assert_eq!(
+            storage_of(
+                "~~~~confluence-layout-section single\n--- cell ---\n~~~confluence-code\n--- cell ---\n~~~\n~~~~"
+            ),
+            concat!(
+                r#"<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell>"#,
+                r#"<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[--- cell ---]]></ac:plain-text-body></ac:structured-macro>"#,
+                "</ac:layout-cell></ac:layout-section></ac:layout>"
+            )
         );
     }
 }
