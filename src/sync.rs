@@ -5188,6 +5188,19 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn paragraph_after_a_macro_stays_a_paragraph_of_its_own() {
+        for block in [
+            r#"<ac:structured-macro ac:name="info"><ac:rich-text-body><p>b</p></ac:rich-text-body></ac:structured-macro>"#,
+            r#"<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">T</ac:parameter><ac:rich-text-body><p>b</p></ac:rich-text-body></ac:structured-macro>"#,
+            r#"<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[x]]></ac:plain-text-body></ac:structured-macro>"#,
+            r#"<ac:structured-macro ac:name="noformat"><ac:plain-text-body><![CDATA[x]]></ac:plain-text-body></ac:structured-macro>"#,
+        ] {
+            assert_keeps(&format!("{block}<p>after</p>"));
+            assert_keeps(&format!("<p>before</p>{block}<p>after</p>"));
+        }
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");

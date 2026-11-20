@@ -3664,6 +3664,11 @@ fn replace_confluence_macro_blocks(
             r#"<ac:structured-macro ac:name="{name}"><ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:structured-macro>"#
         ));
         normalized.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
+        // The line break that ends the block ends the line of its
+        // placeholder, so the text that follows stays a block of its own.
+        if full_match.as_str().ends_with('\n') {
+            normalized.push('\n');
+        }
         last = full_match.end();
     }
     normalized.push_str(&markdown[last..]);
@@ -3698,6 +3703,11 @@ fn replace_confluence_macro_blocks(
             r#"<ac:structured-macro ac:name="expand">{title_param}<ac:rich-text-body>{body_storage}</ac:rich-text-body></ac:structured-macro>"#
         ));
         expanded.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
+        // The line break that ends the block ends the line of its
+        // placeholder, so the text that follows stays a block of its own.
+        if full_match.as_str().ends_with('\n') {
+            expanded.push('\n');
+        }
         last = full_match.end();
     }
     expanded.push_str(&parameterized[last..]);
@@ -3718,6 +3728,11 @@ fn replace_confluence_macro_blocks(
         let idx = fragments.len();
         fragments.push(build_code_macro_storage(&parameters, &code));
         code_normalized.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
+        // The line break that ends the block ends the line of its
+        // placeholder, so the text that follows stays a block of its own.
+        if full_match.as_str().ends_with('\n') {
+            code_normalized.push('\n');
+        }
         last = full_match.end();
     }
     code_normalized.push_str(&expanded[last..]);
@@ -3736,6 +3751,11 @@ fn replace_confluence_macro_blocks(
         let idx = fragments.len();
         fragments.push(build_noformat_macro_storage(&parameters, &text));
         noformat_normalized.push_str(&format!("CONFLUENCE_MACRO_PLACEHOLDER_{idx}"));
+        // The line break that ends the block ends the line of its
+        // placeholder, so the text that follows stays a block of its own.
+        if full_match.as_str().ends_with('\n') {
+            noformat_normalized.push('\n');
+        }
         last = full_match.end();
     }
     noformat_normalized.push_str(&code_normalized[last..]);
