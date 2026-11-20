@@ -1,0 +1,39 @@
+<ul>
+<li>
+<p><input disabled="" type="checkbox"/>
+a</p>
+<pre><code>code
+</code></pre>
+</li>
+<li>
+<p><input disabled="" type="checkbox" checked=""/>
+b</p>
+<ul>
+<li>
+<p><input disabled="" type="checkbox"/>
+c</p>
+</li>
+<li>
+<p>plain</p>
+</li>
+<li>
+<p><input disabled="" type="checkbox" checked=""/>
+d</p>
+<p>para</p>
+</li>
+</ul>
+</li>
+<li>
+<p>plain <em>x</em></p>
+<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>e</ac:task-body></ac:task></ac:task-list>
+</li>
+</ul>
+<ol>
+<li><input disabled="" type="checkbox" checked=""/>
+n
+<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>f<sup class="footnote-reference"><a href="#z">1</a></sup></ac:task-body></ac:task></ac:task-list>
+</li>
+</ol>
+<div class="footnote-definition" id="z"><sup class="footnote-definition-label">1</sup>
+<p>note</p>
+</div>

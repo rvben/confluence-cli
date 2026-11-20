@@ -3,8 +3,9 @@
 [[repos]]
 repo = "builtin"
 hooks = [
-    { id = "trailing-whitespace" },
-    { id = "end-of-file-fixer" },
+    # The corpus holds documents and storage byte for byte.
+    { id = "trailing-whitespace", exclude = "^tests/corpus/" },
+    { id = "end-of-file-fixer", exclude = "^tests/corpus/" },
     { id = "check-added-large-files" },
 ]
 

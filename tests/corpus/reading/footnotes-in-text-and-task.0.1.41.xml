@@ -1,0 +1,8 @@
+<p>Intro<sup class="footnote-reference"><a href="#a">1</a></sup></p>
+<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>Task<sup class="footnote-reference"><a href="#b">2</a></sup></ac:task-body></ac:task></ac:task-list>
+<div class="footnote-definition" id="a"><sup class="footnote-definition-label">1</sup>
+<p>one</p>
+</div>
+<div class="footnote-definition" id="b"><sup class="footnote-definition-label">2</sup>
+<p>two</p>
+</div>

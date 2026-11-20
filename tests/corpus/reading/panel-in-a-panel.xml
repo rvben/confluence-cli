@@ -1,0 +1,3 @@
+<ac:structured-macro ac:name="info"><ac:rich-text-body><p>outer</p>
+<ac:structured-macro ac:name="note"><ac:rich-text-body><p>inner</p></ac:rich-text-body></ac:structured-macro>
+<p>after</p></ac:rich-text-body></ac:structured-macro>

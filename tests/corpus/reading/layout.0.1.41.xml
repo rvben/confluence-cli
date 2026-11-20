@@ -1,0 +1,3 @@
+<p>Above.</p>
+<ac:layout><ac:layout-section ac:type="two_equal"><ac:layout-cell><p>Left <em>text</em>.</p>
+<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>task</ac:task-body></ac:task></ac:task-list></ac:layout-cell><ac:layout-cell><ac:structured-macro ac:name="info"><ac:rich-text-body><p>Right.</p></ac:rich-text-body></ac:structured-macro></ac:layout-cell></ac:layout-section><ac:layout-section ac:type="single"><ac:layout-cell><p>One cell.</p></ac:layout-cell></ac:layout-section></ac:layout>

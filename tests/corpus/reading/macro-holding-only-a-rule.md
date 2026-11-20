@@ -1,0 +1,3 @@
+:::confluence-macro sample
+---
+:::

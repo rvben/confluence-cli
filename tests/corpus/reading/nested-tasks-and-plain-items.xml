@@ -1,0 +1,25 @@
+<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body><p>a</p>
+<pre><code>code
+</code></pre></ac:task-body></ac:task><ac:task><ac:task-status>complete</ac:task-status><ac:task-body><p>b</p>
+<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>c</ac:task-body></ac:task></ac:task-list>
+<ul>
+<li>
+<p>plain</p>
+</li>
+</ul>
+<ac:task-list><ac:task><ac:task-status>complete</ac:task-status><ac:task-body><p>d</p>
+<p>para</p></ac:task-body></ac:task></ac:task-list></ac:task-body></ac:task></ac:task-list>
+<ul>
+<li>
+<p>plain <em>x</em></p>
+<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>e</ac:task-body></ac:task></ac:task-list>
+</li>
+</ul>
+<ol>
+<li>[X] n
+<ac:task-list><ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>f<sup class="footnote-reference"><a href="#z">1</a></sup></ac:task-body></ac:task></ac:task-list>
+</li>
+</ol>
+<div class="footnote-definition" id="z"><sup class="footnote-definition-label">1</sup>
+<p>note</p>
+</div>

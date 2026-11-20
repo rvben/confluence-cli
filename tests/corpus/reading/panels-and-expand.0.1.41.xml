@@ -1,0 +1,8 @@
+<p><ac:structured-macro ac:name="info"><ac:rich-text-body><p>Info <em>text</em>.</p></ac:rich-text-body></ac:structured-macro>
+<ac:structured-macro ac:name="note"><ac:rich-text-body><p>Note.</p></ac:rich-text-body></ac:structured-macro>
+<ac:structured-macro ac:name="warning"><ac:rich-text-body><p>Warning.</p></ac:rich-text-body></ac:structured-macro>
+<ac:structured-macro ac:name="tip"><ac:rich-text-body><p>Tip.</p></ac:rich-text-body></ac:structured-macro>
+<ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">Details</ac:parameter><ac:rich-text-body><p>Hidden</p>
+<ul>
+<li>item</li>
+</ul></ac:rich-text-body></ac:structured-macro></p>
