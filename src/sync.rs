@@ -2265,22 +2265,6 @@ fn rewrite_page_links(
     paths: &BTreeMap<String, PathBuf>,
     items: &BTreeMap<String, ContentItem>,
 ) -> String {
-    let mut remote_links = Vec::new();
-    for (content_id, target_dir) in paths {
-        let target_index = target_dir.join("index.md");
-        let relative = diff_paths(&target_index, current_dir).unwrap_or(target_index);
-        let replacement = relative.to_string_lossy().replace('\\', "/");
-        let patterns = [
-            // The boundary keeps an id from matching the start of a longer one.
-            format!(r#"https?://[^\s\)]+/pages/{content_id}\b(?:/[^\s\)]*)?"#),
-            format!(r#"/pages/{content_id}\b(?:/[^\s\)]*)?"#),
-            format!(r#"viewpage\.action\?pageId={content_id}\b"#),
-        ];
-        for pattern in patterns {
-            let re = Regex::new(&pattern).expect("valid page link regex");
-            remote_links.push((re, replacement.clone()));
-        }
-    }
     let local_target = |destination: &str| {
         if destination.starts_with("confluence-page://") {
             // A link pulled without a body keeps its placeholder, which is
@@ -2292,11 +2276,23 @@ fn rewrite_page_links(
             }
             return resolve_placeholder_to_local_path(destination, current_dir, paths, items);
         }
-        let mut rewritten = destination.to_string();
-        for (re, replacement) in &remote_links {
-            rewritten = re.replace_all(&rewritten, replacement.as_str()).to_string();
+        let address = PageAddress::parse(destination)?;
+        let index = paths.get(address.content_id)?.join("index.md");
+        let mut local = diff_paths(&index, current_dir)
+            .unwrap_or(index)
+            .to_string_lossy()
+            .replace('\\', "/");
+        // Apply writes what follows the file back after the address of the
+        // page.
+        if !address.query.is_empty() {
+            local.push('?');
+            local.push_str(&address.query);
         }
-        (rewritten != destination).then_some(rewritten)
+        if let Some(fragment) = address.fragment {
+            local.push('#');
+            local.push_str(fragment);
+        }
+        Some(local)
     };
     let mut rewritten = String::with_capacity(markdown.len());
     let mut rest = 0;
@@ -2310,6 +2306,65 @@ fn rewrite_page_links(
     }
     rewritten.push_str(&markdown[rest..]);
     rewritten
+}
+
+/// The address of a page on a Confluence site, read whole: an address that
+/// goes on after the page, or names it only in passing, is not one.
+struct PageAddress<'a> {
+    content_id: &'a str,
+    /// The query, without the parameter that names the page.
+    query: String,
+    fragment: Option<&'a str>,
+}
+
+impl<'a> PageAddress<'a> {
+    fn parse(address: &'a str) -> Option<Self> {
+        static TITLED: LazyLock<Regex> = LazyLock::new(|| {
+            // The title after the id is for the reader: the id names the page.
+            Regex::new(r"^(?:/[^/]+)*?/spaces/[^/]+/pages/([0-9]+)(?:/[^/]*)?$")
+                .expect("valid page path regex")
+        });
+        let (address, fragment) = split_target_fragment(address);
+        let (location, query) = match address.split_once('?') {
+            Some((location, query)) => (location, Some(query)),
+            None => (address, None),
+        };
+        let path = ["http://", "https://"]
+            .iter()
+            .find_map(|scheme| {
+                let site = location.get(scheme.len()..)?;
+                if !location[..scheme.len()].eq_ignore_ascii_case(scheme) {
+                    return None;
+                }
+                Some(&site[site.find('/')?..])
+            })
+            .or_else(|| {
+                (location.starts_with('/') && !location.starts_with("//")).then_some(location)
+            })?;
+        if let Some(titled) = TITLED.captures(path) {
+            return Some(Self {
+                content_id: titled.get(1)?.as_str(),
+                query: query.unwrap_or_default().to_string(),
+                fragment,
+            });
+        }
+        if !path.ends_with("/pages/viewpage.action") {
+            return None;
+        }
+        let mut content_id = None;
+        let mut others = Vec::new();
+        for parameter in query?.split('&') {
+            match parameter.strip_prefix("pageId=") {
+                Some(id) if content_id.is_none() => content_id = Some(id),
+                _ => others.push(parameter),
+            }
+        }
+        Some(Self {
+            content_id: content_id?,
+            query: others.join("&"),
+            fragment,
+        })
+    }
 }
 
 /// A link or an image that Markdown writes inline, as `[label](destination)`.
@@ -5769,6 +5824,76 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn address_of_a_page_is_read_whole() {
+        let paths = BTreeMap::from([("12".to_string(), PathBuf::from("/tmp/root/short--12"))]);
+        let current = PathBuf::from("/tmp/root/current--1");
+        let rewrite = |address: &str| {
+            rewrite_page_links(
+                &format!("[a]({address})"),
+                &current,
+                &paths,
+                &BTreeMap::new(),
+            )
+        };
+        for (address, local) in [
+            ("/wiki/spaces/S/pages/12/Short", "../short--12/index.md"),
+            ("/wiki/spaces/S/pages/12", "../short--12/index.md"),
+            ("/wiki/spaces/S/pages/12/", "../short--12/index.md"),
+            ("/spaces/~jdoe/pages/12/Short", "../short--12/index.md"),
+            (
+                "/wiki/spaces/S/pages/12/Short#Section",
+                "../short--12/index.md#Section",
+            ),
+            (
+                "/wiki/spaces/S/pages/12#Section",
+                "../short--12/index.md#Section",
+            ),
+            (
+                "/wiki/spaces/S/pages/12/Short?focusedCommentId=5",
+                "../short--12/index.md?focusedCommentId=5",
+            ),
+            (
+                "/wiki/spaces/S/pages/12/Short?focusedCommentId=5#comment-5",
+                "../short--12/index.md?focusedCommentId=5#comment-5",
+            ),
+            (
+                "/wiki/pages/viewpage.action?pageId=12",
+                "../short--12/index.md",
+            ),
+            (
+                "/pages/viewpage.action?pageId=12&focusedCommentId=5#comment-5",
+                "../short--12/index.md?focusedCommentId=5#comment-5",
+            ),
+            (
+                "/pages/viewpage.action?focusedCommentId=5&pageId=12",
+                "../short--12/index.md?focusedCommentId=5",
+            ),
+        ] {
+            assert_eq!(rewrite(address), format!("[a]({local})"), "{address}");
+        }
+        for address in [
+            "/wiki/spaces/S/pages/12-x",
+            "/wiki/spaces/S/pages/12.5",
+            "/wiki/spaces/S/pages/123/Long",
+            "/wiki/spaces/S/pages/12/Short/extra",
+            "/wiki/spaces/S/pages/edit-v2/12",
+            "/wiki/spaces/S/pages/12/Short;x=/pages/12",
+            "/wiki/pages/viewpage.action?pageId=123",
+            "/wiki/pages/viewpage.action?pageId=12x",
+            "/wiki/pages/viewpage.action?spaceKey=S&title=/pages/12",
+            "/wiki/pages/editpage.action?pageId=12",
+            "/wiki/pages/viewpage.action#pageId=12",
+            "/search?text=/spaces/S/pages/12",
+            "/search#/spaces/S/pages/12",
+            "//other.example.org/wiki/spaces/S/pages/12",
+            "wiki/spaces/S/pages/12",
+            "mailto:/wiki/spaces/S/pages/12",
+        ] {
+            assert_eq!(rewrite(address), format!("[a]({address})"), "{address}");
+        }
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");
@@ -7266,8 +7391,8 @@ mod round_trip_tests {
     #[test]
     fn raw_storage_next_to_a_link_to_a_page_of_the_same_pull_stays_whole() {
         for storage in [
-            r#"<p><ac:link><ri:page /></ac:link> <ac:link><ri:url ri:value="https://example.com/wiki/pages/456/Sibling" /><ac:plain-text-link-body><![CDATA[Sibling]]></ac:plain-text-link-body></ac:link></p>"#,
-            r#"<p>a <ac:link ac:unknown="1"><ri:url ri:value="https://example.com/wiki/pages/456/Sibling" /></ac:link> b <a href="https://example.com/wiki/pages/456/Sibling">c</a></p>"#,
+            r#"<p><ac:link><ri:page /></ac:link> <ac:link><ri:url ri:value="https://example.com/wiki/spaces/MFS/pages/456/Sibling" /><ac:plain-text-link-body><![CDATA[Sibling]]></ac:plain-text-link-body></ac:link></p>"#,
+            r#"<p>a <ac:link ac:unknown="1"><ri:url ri:value="https://example.com/wiki/spaces/MFS/pages/456/Sibling" /></ac:link> b <a href="https://example.com/wiki/spaces/MFS/pages/456/Sibling">c</a></p>"#,
         ] {
             let applied = apply_storage(&pull_next_to_sibling(storage)).expect("apply");
 
@@ -7277,14 +7402,14 @@ mod round_trip_tests {
 
     #[test]
     fn link_spread_over_lines_to_a_page_of_the_same_pull_survives() {
-        let storage = "<p>See <a title=\"tip\"\nhref=\"https://example.com/wiki/pages/456/Sibling\">one<br />two</a>.</p>";
+        let storage = "<p>See <a title=\"tip\"\nhref=\"https://example.com/wiki/spaces/MFS/pages/456/Sibling\">one<br />two</a>.</p>";
         let applied = apply_storage(&pull_next_to_sibling(storage)).expect("apply");
         assert_eq!(canonical(&applied), canonical(storage));
     }
 
     #[test]
     fn raw_storage_after_a_quoted_raw_block_stays_whole() {
-        let storage = r#"<blockquote><ac:emoticon ac:name="smile" /></blockquote><ac:structured-macro ac:name="html"><ac:plain-text-body><![CDATA[see https://example.com/wiki/pages/456/Sibling now]]></ac:plain-text-body></ac:structured-macro>"#;
+        let storage = r#"<blockquote><ac:emoticon ac:name="smile" /></blockquote><ac:structured-macro ac:name="html"><ac:plain-text-body><![CDATA[see https://example.com/wiki/spaces/MFS/pages/456/Sibling now]]></ac:plain-text-body></ac:structured-macro>"#;
         let applied = apply_storage(&pull_next_to_sibling(storage)).expect("apply");
         assert_eq!(canonical(&applied), canonical(storage));
     }
