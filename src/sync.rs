@@ -8271,6 +8271,17 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn task_list_next_to_a_list_stays_apart_from_it() {
+        let tasks = "<ac:task-list><ac:task><ac:task-status>complete</ac:task-status><ac:task-body>done</ac:task-body></ac:task></ac:task-list>";
+
+        assert_round_trips(&format!("{tasks}<ul><li>ordinary</li></ul>"));
+        assert_round_trips(&format!("<ul><li>ordinary</li></ul>{tasks}"));
+        assert_round_trips(&format!(
+            "<ul><li>ordinary{tasks}</li><li>other<ul><li>below</li></ul>{tasks}</li></ul>"
+        ));
+    }
+
+    #[test]
     fn leading_metadata_block_is_not_published() {
         for markdown in [
             "---\ninternal-id: 123\n---\n\nBody",

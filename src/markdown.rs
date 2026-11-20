@@ -495,11 +495,18 @@ fn render_text_storage(markdown: &str, allow_lossy: bool) -> Result<ConversionOu
 
     let escapes_confluence_markup = has_unescaped_confluence_markup(&normalized);
     let events = parse_with_storage_fences(&normalized, &mut raw_fragments);
+    let task_body = TaskBody {
+        start: raw_fragments.hold("<ac:task-body>".to_string()),
+        end: raw_fragments.hold("</ac:task-body>".to_string()),
+    };
     let mut html_output = String::new();
-    html::push_html(&mut html_output, events.into_iter());
+    html::push_html(
+        &mut html_output,
+        with_task_lists(&events, &task_body).into_iter(),
+    );
+    let html_output = task_body.without_layout_around(&html_output);
     // Raw storage blocks and macros are restored afterwards, so they stay as
     // written, and link bodies are not yet wrapped as literal text.
-    let html_output = convert_checkbox_lists_to_task_lists(&html_output);
     let mut html_output = convert_generated_markup(&html_output);
     html_output = raw_fragments.restore(&html_output);
 
@@ -5462,42 +5469,173 @@ fn wrap_cdata(value: &str) -> String {
     value.replace("]]>", "]]]]><![CDATA[>")
 }
 
-fn convert_checkbox_lists_to_task_lists(html: &str) -> String {
-    let ul_re = Regex::new(
-        r#"(?s)<ul>\s*((?:<li>\s*<input[^>]*type="checkbox"[^>]*/?>\s*.*?</li>\s*)+)</ul>"#,
-    )
-    .expect("valid checkbox list regex");
-    // Only the white space of the layout surrounds the body. A space that
-    // does not break is part of it.
-    let li_re = Regex::new(
-        r#"(?s)<li>\s*<input([^>]*)type="checkbox"([^>]*)/?>[ \t\r\n]*(.*?)[ \t\r\n]*</li>"#,
-    )
-    .expect("valid checkbox item regex");
-
-    ul_re
-        .replace_all(html, |captures: &regex::Captures<'_>| {
-            let items = &captures[1];
-            let mut tasks = Vec::new();
-            for item in li_re.captures_iter(items) {
-                let attrs = format!("{} {}", &item[1], &item[2]);
-                let status = if attrs.contains("checked") {
-                    "complete"
-                } else {
-                    "incomplete"
-                };
-                let body = &item[3];
-                tasks.push(format!(
-                    "<ac:task><ac:task-status>{status}</ac:task-status><ac:task-body>{body}</ac:task-body></ac:task>"
+/// The events of Markdown with the tasks of its bulleted lists written as
+/// Confluence task lists. A task list holds tasks only, so a list that
+/// also holds plain items becomes task lists and lists, each item where it
+/// stands.
+fn with_task_lists<'a>(events: &[Event<'a>], task_body: &TaskBody) -> Vec<Event<'a>> {
+    let mut output = Vec::with_capacity(events.len());
+    let mut at = 0;
+    while at < events.len() {
+        if !matches!(events[at], Event::Start(Tag::List(None))) {
+            output.push(events[at].clone());
+            at += 1;
+            continue;
+        }
+        let list_end = end_of_container(events, at);
+        let mut task_list_is_open = false;
+        let mut list_is_open = false;
+        let mut item = at + 1;
+        while item < list_end {
+            let item_end = end_of_container(events, item);
+            let content = &events[item + 1..item_end];
+            if let Some((complete, body)) = task_of(content) {
+                if list_is_open {
+                    output.push(events[list_end].clone());
+                    list_is_open = false;
+                }
+                if !task_list_is_open {
+                    open_task_list(&mut output);
+                    task_list_is_open = true;
+                }
+                let status = if complete { "complete" } else { "incomplete" };
+                output.push(Event::Html(
+                    format!(
+                        "<ac:task><ac:task-status>{status}</ac:task-status>{}",
+                        task_body.start
+                    )
+                    .into(),
                 ));
-            }
-
-            if tasks.is_empty() {
-                captures[0].to_string()
+                output.extend(with_task_lists(&body, task_body));
+                output.push(Event::Html(format!("{}</ac:task>", task_body.end).into()));
             } else {
-                format!("<ac:task-list>{}</ac:task-list>", tasks.join(""))
+                if task_list_is_open {
+                    output.push(Event::Html(TASK_LIST_END.into()));
+                    task_list_is_open = false;
+                }
+                if !list_is_open {
+                    output.push(events[at].clone());
+                    list_is_open = true;
+                }
+                output.push(events[item].clone());
+                output.extend(with_task_lists(content, task_body));
+                output.push(events[item_end].clone());
             }
-        })
-        .to_string()
+            item = item_end + 1;
+        }
+        if task_list_is_open {
+            output.push(Event::Html(TASK_LIST_END.into()));
+        }
+        if list_is_open {
+            output.push(events[list_end].clone());
+        }
+        at = list_end + 1;
+    }
+    output
+}
+
+const TASK_LIST_END: &str = "</ac:task-list>\n";
+
+/// Opens a task list. Like a list, it starts on a line of its own after
+/// the text of an item.
+fn open_task_list(output: &mut Vec<Event<'_>>) {
+    let follows_a_block = matches!(
+        output.last(),
+        None | Some(Event::Start(_) | Event::Html(_))
+            | Some(Event::End(
+                TagEnd::Paragraph
+                    | TagEnd::Heading(_)
+                    | TagEnd::BlockQuote(_)
+                    | TagEnd::CodeBlock
+                    | TagEnd::HtmlBlock
+                    | TagEnd::List(_)
+                    | TagEnd::Item
+                    | TagEnd::Table
+                    | TagEnd::DefinitionList
+            ))
+    );
+    let line_break = if follows_a_block { "" } else { "\n" };
+    output.push(Event::Html(format!("{line_break}<ac:task-list>").into()));
+}
+
+/// The placeholders of the tags that open and close the body of a task
+/// written from a list item. Nothing else in a document spells them.
+struct TaskBody {
+    start: String,
+    end: String,
+}
+
+impl TaskBody {
+    /// Rendered Markdown without the white space that the renderer lays
+    /// out around the blocks of a task body. A space that does not break
+    /// is part of the body.
+    fn without_layout_around(&self, html: &str) -> String {
+        const LAYOUT: [char; 4] = [' ', '\t', '\r', '\n'];
+        let mut after_starts = html.split(&self.start);
+        let mut trimmed = after_starts.next().unwrap_or_default().to_string();
+        for part in after_starts {
+            trimmed.push_str(&self.start);
+            trimmed.push_str(part.trim_start_matches(LAYOUT));
+        }
+        let mut before_ends = trimmed.split(&self.end).peekable();
+        let mut output = String::with_capacity(trimmed.len());
+        while let Some(part) = before_ends.next() {
+            if before_ends.peek().is_some() {
+                output.push_str(part.trim_end_matches(LAYOUT));
+                output.push_str(&self.end);
+            } else {
+                output.push_str(part);
+            }
+        }
+        output
+    }
+}
+
+/// The index of the event that ends the container opening at `start`.
+fn end_of_container(events: &[Event<'_>], start: usize) -> usize {
+    let mut depth = 0usize;
+    for (index, event) in events.iter().enumerate().skip(start) {
+        match event {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => {
+                depth -= 1;
+                if depth == 0 {
+                    return index;
+                }
+            }
+            _ => {}
+        }
+    }
+    events.len() - 1
+}
+
+/// Whether the task that the content of a list item opens with is complete,
+/// and the body of that task. A body that is one paragraph is the text of
+/// that paragraph.
+fn task_of<'a>(content: &[Event<'a>]) -> Option<(bool, Vec<Event<'a>>)> {
+    match content {
+        [Event::TaskListMarker(complete), body @ ..] => Some((*complete, body.to_vec())),
+        [
+            paragraph @ Event::Start(Tag::Paragraph),
+            Event::TaskListMarker(complete),
+            rest @ ..,
+        ] => {
+            let body = match rest {
+                [text @ .., Event::End(TagEnd::Paragraph)]
+                    if !text
+                        .iter()
+                        .any(|event| matches!(event, Event::End(TagEnd::Paragraph))) =>
+                {
+                    text.to_vec()
+                }
+                _ => std::iter::once(paragraph.clone())
+                    .chain(rest.iter().cloned())
+                    .collect(),
+            };
+            Some((*complete, body))
+        }
+        _ => None,
+    }
 }
 
 /// Text with every line ending in a line feed alone. A file written with
@@ -8206,6 +8344,118 @@ SELECT ']]>' AS sentinel;
         assert_eq!(parsed.title, "Before and after ---");
         assert_eq!(parsed.labels, ["a---"]);
         assert_eq!(body, "First\n\n---\n\nLast");
+    }
+
+    fn task(status: &str, body: &str) -> String {
+        format!(
+            "<ac:task><ac:task-status>{status}</ac:task-status><ac:task-body>{body}</ac:task-body></ac:task>"
+        )
+    }
+
+    #[test]
+    fn footnote_in_a_task_has_the_number_of_its_definition() {
+        let storage = storage_of(
+            "Intro[^a]\n\n- [ ] Task[^b]\n  - [x] Nested[^c]\n- plain[^d]\n\n[^a]: one\n[^b]: two\n[^c]: three\n[^d]: four\n",
+        );
+
+        for (name, number) in [("a", 1), ("b", 2), ("c", 3), ("d", 4)] {
+            assert!(
+                storage.contains(&format!(
+                    r##"<sup class="footnote-reference"><a href="#{name}">{number}</a></sup>"##
+                )),
+                "reference {name} in {storage}"
+            );
+            assert!(
+                storage.contains(&format!(
+                    r#"id="{name}"><sup class="footnote-definition-label">{number}</sup>"#
+                )),
+                "definition {name} in {storage}"
+            );
+        }
+    }
+
+    #[test]
+    fn footnote_in_a_task_is_written_like_one_in_a_list_item() {
+        let task = storage_of("- [ ] Task[^a&b]\n\n[^a&b]: one\n");
+        let item = storage_of("- Task[^a&b]\n\n[^a&b]: one\n");
+        let reference = |storage: &str| {
+            let start = storage.find("<sup").expect("a reference");
+            let end = storage.find("</sup>").expect("the end of the reference");
+            storage[start..end].to_string()
+        };
+
+        assert_eq!(reference(&task), reference(&item));
+    }
+
+    #[test]
+    fn white_space_in_markup_that_spells_a_task_body_is_kept() {
+        let comment = "<!-- <ac:task-body>   keep   </ac:task-body> -->";
+
+        assert_eq!(
+            storage_of(&format!("- [ ] task\n\n{comment}")),
+            format!(
+                "<ac:task-list>{}</ac:task-list>\n{comment}",
+                task("incomplete", "task")
+            )
+        );
+    }
+
+    #[test]
+    fn list_of_tasks_and_plain_items_keeps_every_item_in_its_place() {
+        let done = task("complete", "done");
+        let open = task("incomplete", "open");
+
+        assert_eq!(
+            storage_of("- [x] done\n- ordinary\n- other\n- [ ] open\n"),
+            format!(
+                "<ac:task-list>{done}</ac:task-list>\n<ul>\n<li>ordinary</li>\n<li>other</li>\n</ul>\n<ac:task-list>{open}</ac:task-list>"
+            )
+        );
+        assert_eq!(
+            storage_of("- ordinary\n- [x] done\n- [ ] open\n- other\n"),
+            format!(
+                "<ul>\n<li>ordinary</li>\n</ul>\n<ac:task-list>{done}{open}</ac:task-list>\n<ul>\n<li>other</li>\n</ul>"
+            )
+        );
+        assert_eq!(
+            storage_of("- [ ]\n- ordinary\n"),
+            format!(
+                "<ac:task-list>{}</ac:task-list>\n<ul>\n<li>ordinary</li>\n</ul>",
+                task("incomplete", "")
+            )
+        );
+    }
+
+    #[test]
+    fn task_is_a_task_wherever_its_list_stands() {
+        let done = task("complete", "done");
+        let open = task("incomplete", "open");
+
+        // Below an item of another list, and after one that holds a list.
+        assert_eq!(
+            storage_of("- plain\n  - [ ] open\n- [x] done\n"),
+            format!(
+                "<ul>\n<li>plain\n<ac:task-list>{open}</ac:task-list>\n</li>\n</ul>\n<ac:task-list>{done}</ac:task-list>"
+            )
+        );
+        // A task that holds a list of tasks and of plain items.
+        assert_eq!(
+            storage_of("- [x] done\n  - [ ] open\n  - plain\n"),
+            format!(
+                "<ac:task-list>{}</ac:task-list>",
+                task(
+                    "complete",
+                    &format!(
+                        "done\n<ac:task-list>{open}</ac:task-list>\n<ul>\n<li>plain</li>\n</ul>"
+                    )
+                )
+            )
+        );
+        // With an empty line between the items.
+        assert_eq!(
+            storage_of("- [x] done\n\n- [ ] open\n"),
+            format!("<ac:task-list>{done}{open}</ac:task-list>")
+        );
     }
 
     fn storage_of(markdown: &str) -> String {
