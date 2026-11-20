@@ -2278,6 +2278,18 @@ fn rewrite_page_links(
         }
         let address = PageAddress::parse(destination)?;
         let index = paths.get(address.content_id)?.join("index.md");
+        // Another site numbers its pages too. The site of the pull is the
+        // one its pages are shown at.
+        if let Some(site) = address.site
+            && !items.values().any(|item| {
+                item.web_url
+                    .as_deref()
+                    .and_then(split_site)
+                    .is_some_and(|(shown_at, _)| shown_at.eq_ignore_ascii_case(site))
+            })
+        {
+            return None;
+        }
         let mut local = diff_paths(&index, current_dir)
             .unwrap_or(index)
             .to_string_lossy()
@@ -2311,6 +2323,8 @@ fn rewrite_page_links(
 /// The address of a page on a Confluence site, read whole: an address that
 /// goes on after the page, or names it only in passing, is not one.
 struct PageAddress<'a> {
+    /// The host and port, of an address that names its site.
+    site: Option<&'a str>,
     content_id: &'a str,
     /// The query, without the parameter that names the page.
     query: String,
@@ -2329,20 +2343,14 @@ impl<'a> PageAddress<'a> {
             Some((location, query)) => (location, Some(query)),
             None => (address, None),
         };
-        let path = ["http://", "https://"]
-            .iter()
-            .find_map(|scheme| {
-                let site = location.get(scheme.len()..)?;
-                if !location[..scheme.len()].eq_ignore_ascii_case(scheme) {
-                    return None;
-                }
-                Some(&site[site.find('/')?..])
-            })
-            .or_else(|| {
-                (location.starts_with('/') && !location.starts_with("//")).then_some(location)
-            })?;
+        let (site, path) = match split_site(location) {
+            Some((site, path)) => (Some(site), path),
+            None if location.starts_with('/') && !location.starts_with("//") => (None, location),
+            None => return None,
+        };
         if let Some(titled) = TITLED.captures(path) {
             return Some(Self {
+                site,
                 content_id: titled.get(1)?.as_str(),
                 query: query.unwrap_or_default().to_string(),
                 fragment,
@@ -2360,11 +2368,23 @@ impl<'a> PageAddress<'a> {
             }
         }
         Some(Self {
+            site,
             content_id: content_id?,
             query: others.join("&"),
             fragment,
         })
     }
+}
+
+/// The host and port of a web address, and what follows them.
+fn split_site(address: &str) -> Option<(&str, &str)> {
+    ["http://", "https://"].iter().find_map(|scheme| {
+        let rest = address.get(scheme.len()..)?;
+        if !address[..scheme.len()].eq_ignore_ascii_case(scheme) {
+            return None;
+        }
+        Some(rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len())))
+    })
 }
 
 /// A link or an image that Markdown writes inline, as `[label](destination)`.
@@ -5045,7 +5065,7 @@ mod round_trip_tests {
             "<!--\n\nsee /wiki/spaces/S/pages/12 -->\n\ntext",
         ] {
             assert_eq!(
-                rewrite_page_links(markdown, &current, &paths, &BTreeMap::new()),
+                rewrite_page_links(markdown, &current, &paths, &pull_of_short()),
                 markdown
             );
         }
@@ -5062,7 +5082,7 @@ mod round_trip_tests {
                 ),
                 &current,
                 &paths,
-                &BTreeMap::new(),
+                &pull_of_short(),
             );
             assert_eq!(
                 rewritten,
@@ -5086,7 +5106,7 @@ mod round_trip_tests {
             ),
         ] {
             assert_eq!(
-                rewrite_page_links(markdown, &current, &paths, &BTreeMap::new()),
+                rewrite_page_links(markdown, &current, &paths, &pull_of_short()),
                 rewritten.unwrap_or(markdown),
             );
         }
@@ -5745,7 +5765,7 @@ mod round_trip_tests {
         let paths = BTreeMap::from([("12".to_string(), PathBuf::from("/tmp/root/short--12"))]);
         let current = PathBuf::from("/tmp/root/current--1");
         let rewrite =
-            |markdown: &str| rewrite_page_links(markdown, &current, &paths, &BTreeMap::new());
+            |markdown: &str| rewrite_page_links(markdown, &current, &paths, &pull_of_short());
         let address = "https://example.atlassian.net/wiki/spaces/S/pages/12/Short";
         let placeholder = build_page_placeholder_url(&PageLinkPlaceholder {
             content_id: Some("12".to_string()),
@@ -5817,7 +5837,7 @@ mod round_trip_tests {
                 rewritten.map(str::to_string).unwrap_or(markdown.clone()),
             );
             assert_eq!(
-                rewrite_page_links(&markdown, &current, &paths, &BTreeMap::new()),
+                rewrite_page_links(&markdown, &current, &paths, &pull_of_short()),
                 markdown
             );
         }
@@ -5832,7 +5852,7 @@ mod round_trip_tests {
                 &format!("[a]({address})"),
                 &current,
                 &paths,
-                &BTreeMap::new(),
+                &pull_of_short(),
             )
         };
         for (address, local) in [
@@ -5891,6 +5911,74 @@ mod round_trip_tests {
         ] {
             assert_eq!(rewrite(address), format!("[a]({address})"), "{address}");
         }
+    }
+
+    /// The pull of page 12, which its site shows at example.atlassian.net.
+    fn pull_of_short() -> BTreeMap<String, ContentItem> {
+        BTreeMap::from([(
+            "12".to_string(),
+            page_shown_at(
+                "12",
+                Some("https://example.atlassian.net/wiki/spaces/S/pages/12/Short"),
+            ),
+        )])
+    }
+
+    /// A page of a pull that the site shows at `web_url`.
+    fn page_shown_at(id: &str, web_url: Option<&str>) -> ContentItem {
+        ContentItem {
+            id: id.to_string(),
+            kind: ContentKind::Page,
+            title: "Short".to_string(),
+            status: "current".to_string(),
+            space_id: None,
+            space_key: Some("S".to_string()),
+            parent_id: None,
+            version: None,
+            body_storage: None,
+            labels: vec![],
+            properties: BTreeMap::new(),
+            web_url: web_url.map(str::to_string),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn address_on_another_site_is_not_the_address_of_a_pulled_page() {
+        let paths = BTreeMap::from([("12".to_string(), PathBuf::from("/tmp/root/short--12"))]);
+        let current = PathBuf::from("/tmp/root/current--1");
+        let site = pull_of_short();
+        let unknown_site = BTreeMap::from([("12".to_string(), page_shown_at("12", None))]);
+        let rewrite = |address: &str, items: &BTreeMap<String, ContentItem>| {
+            rewrite_page_links(&format!("[a]({address})"), &current, &paths, items)
+        };
+        let local = "[a](../short--12/index.md)";
+        for address in [
+            "https://example.atlassian.net/wiki/spaces/S/pages/12/Short",
+            "http://example.atlassian.net/wiki/spaces/S/pages/12/Short",
+            "HTTPS://Example.Atlassian.NET/wiki/pages/viewpage.action?pageId=12",
+            "/wiki/spaces/S/pages/12/Short",
+        ] {
+            assert_eq!(rewrite(address, &site), local, "{address}");
+        }
+        for address in [
+            "https://other.example.org/wiki/spaces/S/pages/12/Short",
+            "https://other.example.org/wiki/pages/viewpage.action?pageId=12",
+            "https://example.atlassian.net.example.org/wiki/spaces/S/pages/12/Short",
+            "https://example.atlassian.net:8443/wiki/spaces/S/pages/12/Short",
+            "https://example.atlassian.net@other.example.org/wiki/spaces/S/pages/12/Short",
+        ] {
+            assert_eq!(rewrite(address, &site), format!("[a]({address})"));
+        }
+        // Without the address of a pulled page there is no telling which
+        // site an address names, except for one that names none.
+        let address = "https://example.atlassian.net/wiki/spaces/S/pages/12/Short";
+        assert_eq!(rewrite(address, &unknown_site), format!("[a]({address})"));
+        assert_eq!(
+            rewrite("/wiki/spaces/S/pages/12/Short", &unknown_site),
+            local
+        );
     }
 
     #[test]
@@ -7281,7 +7369,7 @@ mod round_trip_tests {
                 body_storage: None,
                 labels: vec![],
                 properties: BTreeMap::new(),
-                web_url: None,
+                web_url: Some("https://example.com/wiki/spaces/MFS/pages/456/Sibling".to_string()),
                 created_at: None,
                 updated_at: None,
             },
