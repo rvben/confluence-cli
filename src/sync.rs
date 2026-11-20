@@ -5427,6 +5427,19 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn code_keeps_the_empty_lines_at_its_end() {
+        for name in ["code", "noformat"] {
+            for parameters in ["", r#"<ac:parameter ac:name="title">T</ac:parameter>"#] {
+                for text in ["a\n", "a\n\n\n", "\n", "\n\na", "", "a\n---", "a\n---\n"] {
+                    assert_keeps(&format!(
+                        r#"<ac:structured-macro ac:name="{name}">{parameters}<ac:plain-text-body><![CDATA[{text}]]></ac:plain-text-body></ac:structured-macro><p>after</p>"#
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");

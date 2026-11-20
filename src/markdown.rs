@@ -2333,9 +2333,21 @@ fn tilde_fence(body: &str, least: usize) -> String {
     "~".repeat(least.max(longest + 1))
 }
 
+/// The lines of a code or noformat block between its fences: the parameter
+/// lines and the text. Text that is empty takes a line after parameter
+/// lines, which says that the dashes before it end them.
+fn plain_text_body(parameters: &BTreeMap<String, String>, text: &str) -> String {
+    let mut lines = macro_header(parameters, text);
+    if !(lines.is_empty() && text.is_empty()) {
+        lines.push_str(text);
+        lines.push('\n');
+    }
+    lines
+}
+
 fn render_code_macro_block(node: Node<'_, '_>) -> Option<String> {
     let code_body = namespaced_child(node, AC_NS, "plain-text-body")?;
-    let code = code_body.text().unwrap_or_default().trim_end_matches('\n');
+    let code = code_body.text().unwrap_or_default();
     let mut parameters = collect_macro_parameters(node);
     let language = parameters
         .remove("language")
@@ -2346,27 +2358,19 @@ fn render_code_macro_block(node: Node<'_, '_>) -> Option<String> {
         Some(language) => format!("{fence}confluence-code {language}\n"),
         None => format!("{fence}confluence-code\n"),
     };
-    markdown.push_str(&macro_header(&parameters, code));
-    markdown.push_str(code);
-    if !code.is_empty() {
-        markdown.push('\n');
-    }
+    markdown.push_str(&plain_text_body(&parameters, code));
     markdown.push_str(&fence);
     Some(markdown)
 }
 
 fn render_noformat_macro_block(node: Node<'_, '_>) -> Option<String> {
     let body = namespaced_child(node, AC_NS, "plain-text-body")?;
-    let text = body.text().unwrap_or_default().trim_end_matches('\n');
+    let text = body.text().unwrap_or_default();
     let parameters = collect_macro_parameters(node);
 
     let fence = tilde_fence(text, 3);
     let mut markdown = format!("{fence}confluence-noformat\n");
-    markdown.push_str(&macro_header(&parameters, text));
-    markdown.push_str(text);
-    if !text.is_empty() {
-        markdown.push('\n');
-    }
+    markdown.push_str(&plain_text_body(&parameters, text));
     markdown.push_str(&fence);
     Some(markdown)
 }
@@ -4577,16 +4581,33 @@ fn parse_code_macro_block(
         parameters.insert("language".to_string(), language.to_string());
     }
 
-    let trimmed_body = block_body.trim_end_matches('\n');
-    if let Some((header, code)) = trimmed_body.split_once("\n---\n") {
-        let parsed_header = parse_code_macro_header(header)?;
-        for (name, value) in parsed_header {
-            parameters.insert(name, value);
-        }
-        Ok((parameters, code.to_string()))
-    } else {
-        Ok((parameters, trimmed_body.to_string()))
+    let (header, code) = split_macro_header(block_body);
+    if let Some(header) = header {
+        parameters.extend(parse_code_macro_header(header)?);
     }
+    Ok((parameters, code.to_string()))
+}
+
+/// The parameter lines and the text of a code or noformat block. The
+/// parameter lines end at the first `---` line after the first line that
+/// a line of the text follows, which may be an empty one: dashes on the
+/// last line of a block are text. Every line break of the text is kept:
+/// the one that puts the closing fence on a line of its own is not part of
+/// the body of a block.
+fn split_macro_header(block_body: &str) -> (Option<&str>, &str) {
+    let mut offset = 0;
+    let mut header = None;
+    let mut text = block_body;
+    for (index, line) in block_body.split_inclusive('\n').enumerate() {
+        let end = offset + line.len();
+        if index > 0 && line.strip_suffix('\n') == Some(MACRO_HEADER_END) {
+            header = Some(&block_body[..offset]);
+            text = &block_body[end..];
+            break;
+        }
+        offset = end;
+    }
+    (header, text)
 }
 
 fn parse_code_macro_header(header: &str) -> Result<BTreeMap<String, String>> {
@@ -4594,13 +4615,12 @@ fn parse_code_macro_header(header: &str) -> Result<BTreeMap<String, String>> {
 }
 
 fn parse_noformat_macro_block(block_body: &str) -> Result<(BTreeMap<String, String>, String)> {
-    let trimmed_body = block_body.trim_end_matches('\n');
-    if let Some((header, text)) = trimmed_body.split_once("\n---\n") {
-        let parameters = parse_macro_parameter_lines(header, "confluence noformat macro")?;
-        Ok((parameters, text.to_string()))
-    } else {
-        Ok((BTreeMap::new(), trimmed_body.to_string()))
-    }
+    let (header, text) = split_macro_header(block_body);
+    let parameters = match header {
+        Some(header) => parse_macro_parameter_lines(header, "confluence noformat macro")?,
+        None => BTreeMap::new(),
+    };
+    Ok((parameters, text.to_string()))
 }
 
 fn build_code_macro_storage(parameters: &BTreeMap<String, String>, code: &str) -> String {
@@ -7700,6 +7720,46 @@ SELECT ']]>' AS sentinel;
             ),
         ] {
             assert_eq!(storage_of(markdown), storage, "{markdown:?}");
+        }
+    }
+
+    #[test]
+    fn dashes_that_end_the_text_of_a_code_or_noformat_block_are_text() {
+        assert_eq!(
+            storage_of("~~~confluence-code yaml\nname: example\n---\n~~~\n"),
+            concat!(
+                r#"<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">yaml</ac:parameter>"#,
+                "<ac:plain-text-body><![CDATA[name: example\n---]]></ac:plain-text-body></ac:structured-macro>",
+            )
+        );
+        assert_eq!(
+            storage_of("~~~confluence-noformat\nname: example\n---\n~~~\n"),
+            concat!(
+                r#"<ac:structured-macro ac:name="noformat">"#,
+                "<ac:plain-text-body><![CDATA[name: example\n---]]></ac:plain-text-body></ac:structured-macro>",
+            )
+        );
+    }
+
+    #[test]
+    fn code_or_noformat_macro_keeps_its_parameters_and_its_text() {
+        for name in ["code", "noformat"] {
+            for text in [
+                "",
+                "\n",
+                "name: example\n---",
+                "name: example\n---\n",
+                "---",
+            ] {
+                for parameters in ["", r#"<ac:parameter ac:name="title">T</ac:parameter>"#] {
+                    let storage = format!(
+                        r#"<ac:structured-macro ac:name="{name}">{parameters}<ac:plain-text-body><![CDATA[{text}]]></ac:plain-text-body></ac:structured-macro>"#
+                    );
+                    let markdown = storage_to_markdown(&storage);
+
+                    assert_eq!(storage_of(&markdown), storage, "pulled as {markdown:?}");
+                }
+            }
         }
     }
 
