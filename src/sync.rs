@@ -2461,9 +2461,9 @@ fn name_user_mentions(markdown: &str, names: &BTreeMap<UserReference, Option<Str
     named
 }
 
-/// Applies a rewrite to the Markdown around raw storage blocks and links
-/// written as inline tags. Both hold markup that apply writes back as it
-/// stands, so an address inside them stays as pulled.
+/// Applies a rewrite to the Markdown around raw storage blocks, comments
+/// and links written as inline tags. They hold markup that apply writes
+/// back as it stands, so an address inside them stays as pulled.
 fn rewrite_outside_raw_markup(markdown: &str, rewrite: impl Fn(&str) -> String) -> String {
     let mut rewritten = String::with_capacity(markdown.len());
     let mut rest = 0;
@@ -2475,9 +2475,9 @@ fn rewrite_outside_raw_markup(markdown: &str, rewrite: impl Fn(&str) -> String) 
     rewritten
 }
 
-/// Ranges of the raw storage blocks and the links written as inline tags in
-/// pulled Markdown, in order, followed by the empty range at the end of the
-/// text.
+/// Ranges of the raw storage blocks, the comments and the links written as
+/// inline tags in pulled Markdown, in order, followed by the empty range at
+/// the end of the text.
 fn raw_markup_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
     static LINK_TAG: LazyLock<Regex> = LazyLock::new(|| {
         // A blank line ends the Markdown block that holds the tag, so a
@@ -2485,7 +2485,7 @@ fn raw_markup_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
         Regex::new(r"<a\s(?:[^>\n]|\n[^>\n])*\n?>(?:[^\n]|\n[^\n])*?</a>")
             .expect("valid inline link tag regex")
     });
-    let mut ranges = Vec::new();
+    let mut ranges = comment_ranges(markdown);
     let mut rest = 0;
     for block in raw_storage_block_ranges(markdown) {
         ranges.extend(
@@ -2496,7 +2496,41 @@ fn raw_markup_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
         rest = block.end;
         ranges.push(block);
     }
-    ranges
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start < last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+/// Ranges of the comments in pulled Markdown. A comment is one where Markdown
+/// reads HTML: `<!--` in a code span or after a backslash is text.
+fn comment_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
+    static COMMENT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<!--.*?-->").expect("valid comment regex"));
+    if !markdown.contains("<!--") {
+        return Vec::new();
+    }
+    pulldown_cmark::Parser::new_ext(markdown, crate::markdown::markdown_options())
+        .into_offset_iter()
+        .filter(|(event, _)| {
+            matches!(
+                event,
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::HtmlBlock)
+                    | pulldown_cmark::Event::InlineHtml(_)
+            )
+        })
+        .flat_map(|(_, html)| {
+            COMMENT
+                .find_iter(&markdown[html.clone()])
+                .map(move |comment| html.start + comment.start()..html.start + comment.end())
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Ranges of the raw storage blocks in pulled Markdown, each from its opening
@@ -4801,6 +4835,41 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn address_inside_a_comment_stays_as_pulled() {
+        let paths = BTreeMap::from([("12".to_string(), PathBuf::from("/tmp/root/short--12"))]);
+        let current = PathBuf::from("/tmp/root/current--1");
+        for markdown in [
+            "<!-- see /wiki/spaces/S/pages/12/Short -->",
+            "<!--\n\nsee /wiki/spaces/S/pages/12 -->\n\ntext",
+        ] {
+            assert_eq!(
+                rewrite_page_links(markdown, &current, &paths, &BTreeMap::new()),
+                markdown
+            );
+        }
+    }
+
+    #[test]
+    fn address_after_text_that_reads_as_the_start_of_a_comment_is_rewritten() {
+        let paths = BTreeMap::from([("12".to_string(), PathBuf::from("/tmp/root/short--12"))]);
+        let current = PathBuf::from("/tmp/root/current--1");
+        for opening in ["`<!--`", "\\<!--"] {
+            let rewritten = rewrite_page_links(
+                &format!(
+                    "{opening} then [a](https://example.atlassian.net/wiki/spaces/S/pages/12/Short) and `-->`\n"
+                ),
+                &current,
+                &paths,
+                &BTreeMap::new(),
+            );
+            assert_eq!(
+                rewritten,
+                format!("{opening} then [a](../short--12/index.md) and `-->`\n")
+            );
+        }
+    }
+
+    #[test]
     fn mention_in_a_layout_cell_is_found_and_given_a_name() {
         let user = UserReference::AccountId("abc".to_string());
         let storage = r#"<ac:layout><ac:layout-section ac:type="two_equal"><ac:layout-cell><p>left <ac:link><ri:user ri:account-id="abc" /></ac:link></p></ac:layout-cell><ac:layout-cell><p><code>[abc](confluence-user://user?account-id=abc&amp;label=generated)</code></p><p>right <ac:link><ri:user ri:account-id="abc" /></ac:link></p></ac:layout-cell></ac:layout-section></ac:layout>"#;
@@ -4977,6 +5046,50 @@ mod round_trip_tests {
                 applied.matches("<p>").count(),
                 storage.matches("<p>").count(),
                 "{storage}\n{applied}"
+            );
+        }
+    }
+
+    #[test]
+    fn comment_stays_a_comment() {
+        for storage in [
+            "<p><code>run<!--internal note--></code></p>",
+            "<p>Instructions<!--editor note--></p>",
+            "<p><!--editor note-->Instructions</p>",
+            "<p>a <strong>b<!--note--></strong></p>",
+            "<ul><li>item<!--note--></li></ul>",
+            "<table><tbody><tr><td>cell<!--note--></td></tr></tbody></table>",
+            "<h2>Title<!--note--></h2>",
+        ] {
+            let markdown = storage_to_markdown(storage);
+            let applied = apply_storage(&markdown).expect("applies");
+            assert!(
+                crate::storage::same_document(&applied, storage),
+                "{storage}\n{markdown}\n{applied}"
+            );
+            assert_eq!(applied.matches("<!--").count(), 1, "{applied}");
+        }
+        assert!(!crate::storage::same_document(
+            "<p>Instructions<!--editor note--></p>",
+            "<p>Instructions</p>"
+        ));
+    }
+
+    #[test]
+    fn comment_between_blocks_stays_between_them() {
+        for storage in [
+            "<p>a</p><!--between--><p>b</p>",
+            "<!--first--><p>a</p>",
+            "<p>a</p><!--one\n\ntwo-->",
+            "<blockquote><!--note--><p>a</p></blockquote>",
+            r#"<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell><!--note--><p>a</p></ac:layout-cell></ac:layout-section></ac:layout>"#,
+            r#"<ac:structured-macro ac:name="info"><ac:rich-text-body><p>a<!--note--></p></ac:rich-text-body></ac:structured-macro>"#,
+        ] {
+            let markdown = storage_to_markdown(storage);
+            let applied = apply_storage(&markdown).expect("applies");
+            assert!(
+                crate::storage::same_document(&applied, storage),
+                "{storage}\n{markdown}\n{applied}"
             );
         }
     }

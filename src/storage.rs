@@ -199,6 +199,10 @@ fn write_canonical(node: Node<'_, '_>, preformatted: bool, out: &mut String) {
         write_canonical_text(node, preformatted, out);
         return;
     }
+    if node.is_comment() {
+        out.push_str(&format!("<!--{}-->", node.text().unwrap_or_default()));
+        return;
+    }
     if !node.is_element() {
         return;
     }
@@ -581,7 +585,6 @@ mod tests {
                 r#"<ac:structured-macro ac:name="toc" ac:schema-version="1" ac:macro-id="7f" ac:local-id="9" />"#,
                 r#"<ac:macro ac:name="toc" />"#,
             ),
-            ("<p>a</p><!-- note -->", "<p>a</p>"),
             ("<p>a<br />b</p>", "<p>a<br></br>b</p>"),
             ("<p>\na\n</p>", "<p>a</p>"),
             ("<p>x<br />\ny</p>", "<p>x<br />y</p>"),
@@ -590,6 +593,7 @@ mod tests {
                 "<p><em>one</em>\n<em>two</em></p>",
                 "<p><em>one</em> <em>two</em></p>",
             ),
+            ("<p>a</p>\n<!-- note -->", "<p>a</p><!-- note -->"),
             (
                 "<p>a</p>\n<ac:structured-macro ac:name=\"toc\" />\n<p>b</p>",
                 r#"<p>a</p><ac:structured-macro ac:name="toc" /><p>b</p>"#,
@@ -616,6 +620,8 @@ mod tests {
     fn storage_that_reads_differently_is_another_document() {
         for (left, right) in [
             ("<p>a</p>", "<p>b</p>"),
+            ("<p>a</p><!-- note -->", "<p>a</p>"),
+            ("<p>a<!-- note --></p>", "<p>a<!-- other --></p>"),
             ("<p>a</p>", "<div><p>a</p></div>"),
             ("<p>a b</p>", "<p>ab</p>"),
             ("<p>a\n<em>b</em></p>", "<p>a<em>b</em></p>"),

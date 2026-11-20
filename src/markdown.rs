@@ -1069,11 +1069,17 @@ fn render_top_level_block(node: Node<'_, '_>, source: &str) -> Option<String> {
             render_block_element(node, source)
                 .unwrap_or_else(|| fallback_block_markdown(node, source)),
         ),
+        NodeType::Comment => Some(fallback_block_markdown(node, source)),
         _ => None,
     }
 }
 
 fn render_block_element(node: Node<'_, '_>, source: &str) -> Option<String> {
+    // Markdown has a place for a comment between blocks only, so a block
+    // that holds one is kept as storage.
+    if node.descendants().any(|descendant| descendant.is_comment()) {
+        return None;
+    }
     if is_confluence_node(node) {
         return render_confluence_block(node, source);
     }
@@ -2548,6 +2554,7 @@ fn edge_beside(node: Node<'_, '_>, after: bool) -> Edge {
 fn render_code_span(node: Node<'_, '_>, source: &str) -> Option<String> {
     let text: String = node
         .children()
+        .filter(|child| child.is_text())
         .filter_map(|child| child.text())
         .collect::<String>()
         .replace(['\n', '\r'], " ");
@@ -2568,7 +2575,7 @@ fn render_code_span(node: Node<'_, '_>, source: &str) -> Option<String> {
             && !is_confluence_node(neighbour)
     });
     if node.attributes().len() > 0
-        || node.children().any(|child| child.is_element())
+        || node.children().any(|child| !child.is_text())
         || text.is_empty()
         || touches_code_span
     {
