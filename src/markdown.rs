@@ -3272,12 +3272,26 @@ fn prefix_markdown_block(block: &str, prefix: &str) -> String {
         .join("\n")
 }
 
+/// Whether a line opens or closes a code fence, a macro block or a cell of
+/// a layout section.
+fn reads_as_block_syntax(line: &str) -> bool {
+    fence_line(line).is_some()
+        || colon_macro(line).is_some()
+        || matches!(line.trim_end(), ":::" | LAYOUT_CELL_LINE)
+}
+
 fn fallback_block_markdown(node: Node<'_, '_>, source: &str) -> String {
     let raw = raw_xml_fragment(node, source);
     // A blank line ends a Markdown HTML block, and what follows it would be
     // read as Markdown, so such a fragment needs the fence as well.
     let has_blank_line = raw.trim().lines().any(|line| line.trim().is_empty());
-    if contains_confluence_markup(node) || is_confluence_node(node) || has_blank_line {
+    // Inside the fence a line is markup whatever it reads as.
+    let has_block_syntax = raw.trim().lines().any(reads_as_block_syntax);
+    if contains_confluence_markup(node)
+        || is_confluence_node(node)
+        || has_blank_line
+        || has_block_syntax
+    {
         confluence_raw_block(raw)
     } else {
         raw.trim().to_string()

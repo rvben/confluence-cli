@@ -5301,6 +5301,34 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn preformatted_text_keeps_lines_that_read_as_block_syntax() {
+        let info = |body: &str| {
+            format!(
+                r#"<ac:structured-macro ac:name="info"><ac:rich-text-body>{body}</ac:rich-text-body></ac:structured-macro>"#
+            )
+        };
+        let layout = |cell: &str| {
+            format!(
+                r#"<ac:layout><ac:layout-section ac:type="two_equal"><ac:layout-cell>{cell}</ac:layout-cell><ac:layout-cell><p>right</p></ac:layout-cell></ac:layout-section></ac:layout>"#
+            )
+        };
+        for text in [
+            "a\n:::\nb",
+            "x\n:::confluence-toc\n:::\n",
+            "x\n:::confluence-info\nb",
+            "a\n```\nb",
+            "a\n~~~confluence-code\nb",
+            "a\n--- cell ---\nb",
+        ] {
+            let pre = format!("<pre>{text}</pre>");
+            assert_keeps(&format!("{pre}<p>after</p>"));
+            assert_keeps(&format!("{pre}{}", info("<p>b</p>")));
+            assert_keeps(&format!("{}<p>after</p>", info(&pre)));
+            assert_keeps(&format!("{}<p>after</p>", layout(&pre)));
+        }
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");
