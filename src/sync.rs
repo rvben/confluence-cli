@@ -2757,8 +2757,10 @@ fn placeholder_to_storage_macro(target: &str, body_html: &str) -> Option<String>
 
 fn status_placeholder_to_storage_macro(target: &str, body_html: &str) -> Option<String> {
     let placeholder = parse_status_placeholder_url(target)?;
+    // The link text is markup, in which a character reference stands for
+    // the character the title holds.
     let title = if !body_html.trim().is_empty() && !body_html.contains('<') {
-        body_html.trim().to_string()
+        crate::markdown::decode_character_references(body_html.trim())
     } else {
         placeholder.title
     };
@@ -4083,6 +4085,18 @@ mod tests {
         assert!(
             storage
                 .contains("<ac:plain-text-link-body><![CDATA[@Ruben]]></ac:plain-text-link-body>")
+        );
+    }
+
+    #[test]
+    fn status_placeholder_keeps_a_title_that_holds_markup_characters() {
+        let storage = resolve_placeholder_links(
+            r#"<p><a href="confluence-status://status?title=R%26D&amp;colour=Green">R&amp;D &lt;1&gt;</a></p>"#,
+        );
+
+        assert_eq!(
+            storage,
+            r#"<p><ac:structured-macro ac:name="status"><ac:parameter ac:name="title">R&amp;D &lt;1&gt;</ac:parameter><ac:parameter ac:name="colour">Green</ac:parameter></ac:structured-macro></p>"#
         );
     }
 
