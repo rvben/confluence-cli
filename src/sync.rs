@@ -5288,6 +5288,19 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn layout_cell_keeps_text_that_reads_as_the_start_of_a_cell() {
+        for cell in [
+            "<p>--- cell ---</p>",
+            "<p>a<br />--- cell ---<br />b</p>",
+            "<p>a</p><p>--- cell ---</p><p>b</p>",
+        ] {
+            assert_keeps(&format!(
+                r#"<ac:layout><ac:layout-section ac:type="two_equal"><ac:layout-cell>{cell}</ac:layout-cell><ac:layout-cell><p>right</p></ac:layout-cell></ac:layout-section></ac:layout>"#
+            ));
+        }
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");

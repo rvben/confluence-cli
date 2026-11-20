@@ -3206,8 +3206,8 @@ fn starts_entity(rest: &str) -> bool {
 }
 
 /// Escapes rendered inline content whose lines would otherwise open a
-/// heading, list, block quote, definition, thematic break, metadata block
-/// or setext underline. Lines
+/// heading, list, block quote, definition, thematic break, metadata block,
+/// setext underline or cell of a layout section. Lines
 /// begin at the start of the content and after each hard line break.
 fn escape_block_starts(inline: &str) -> String {
     inline
@@ -3233,7 +3233,10 @@ fn escape_block_start(line: &str) -> String {
             (content.len() - rest.len() <= 6 && followed_by_space_or_end(rest)).then_some(0)
         }
         Some('>') => Some(0),
-        Some('-') => (followed_by_space_or_end(&content[1..]) || only(&['-', ' '])).then_some(0),
+        Some('-') => (followed_by_space_or_end(&content[1..])
+            || only(&['-', ' '])
+            || content.trim_end() == LAYOUT_CELL_LINE)
+            .then_some(0),
         Some('+') => (followed_by_space_or_end(&content[1..]) || only(&['+'])).then_some(0),
         Some('=') => only(&['=']).then_some(0),
         Some(':') => Some(0),
