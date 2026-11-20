@@ -76,6 +76,11 @@ pub struct Sidecar {
     /// Markdown body as of the last pull/apply, used to render a real plan diff.
     #[serde(default)]
     pub last_pulled_body_markdown: Option<String>,
+    /// Whether the storage this document converts to says something else than
+    /// the storage it was pulled from. The first body change applied to such
+    /// a page also publishes that difference.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub storage_differs_from_remote: bool,
 }
 
 #[derive(Debug, Clone)]

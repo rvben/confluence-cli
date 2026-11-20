@@ -12,16 +12,42 @@ const DATA_CENTER_AUTHORIZATION: &str = "Bearer simulated-token";
 
 pub struct ConfluenceSimulator {
     server: MockServer,
+    state: Arc<Mutex<SimulatorState>>,
 }
 
 impl ConfluenceSimulator {
     pub async fn start() -> Self {
         let server = MockServer::start().await;
+        let responder = SimulatorResponder::default();
+        let state = Arc::clone(&responder.state);
         Mock::given(any())
-            .respond_with(SimulatorResponder::default())
+            .respond_with(responder)
             .mount(&server)
             .await;
-        Self { server }
+        Self { server, state }
+    }
+
+    /// Stores a page as another client left it, with a body this CLI would
+    /// not send itself, and returns its ID.
+    pub fn add_page(&self, title: &str, parent_id: Option<&str>, body_storage: &str) -> String {
+        let mut state = self.state.lock().unwrap();
+        state.next_id += 1;
+        let id = (1000 + state.next_id).to_string();
+        state.content.insert(
+            id.clone(),
+            SimulatedContent {
+                id: id.clone(),
+                content_type: "page".to_string(),
+                title: title.to_string(),
+                status: "current".to_string(),
+                parent_id: parent_id.map(str::to_string),
+                version: 1,
+                body_storage: body_storage.to_string(),
+                labels: BTreeSet::new(),
+                properties: BTreeMap::new(),
+            },
+        );
+        id
     }
 
     pub fn base_url(&self) -> String {

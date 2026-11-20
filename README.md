@@ -201,6 +201,10 @@ Pulls are staged beside the destination and installed as one snapshot. A pull re
 
 Filtered `pull space --since ...` exports require a new or empty destination because a partial result cannot safely replace a complete snapshot. Attachment names are confined to their page's `attachments/` directory.
 
+A page is written only when its Markdown converts back to valid storage. When some pages of a pull do not, the rest are still written, and the pull exits 2 and names each page it left out. For every such page, `.confluence-pull-failures/<slug>--<content-id>/` in the destination holds `remote.xml` (the storage Confluence returned), `generated.md` (the Markdown made from it), and, when that Markdown converts at all, `generated.xml` (the storage it converts to). A link from a page that is written to a page that was left out stays the remote link. Pages below a page that was left out keep their place and their remote parent.
+
+Markdown does not carry every detail of storage: a wrapping `<div>`, for example, has no Markdown form. `pull` compares the storage each page converts back to with the storage Confluence returned, and reports how many pages differ. `plan` names those pages, because the first update applied to one also rewrites that markup.
+
 ### Edit
 
 Each page has a predictable local layout:
@@ -222,7 +226,7 @@ The sidecar records remote IDs, versions, hashes, and attachment mappings. It is
 confluence plan ./docs/handbook --diff
 ```
 
-`plan` validates the complete tree and compares it with the state captured by `pull`. It never contacts Confluence and never writes remotely.
+`plan` validates the complete tree and compares it with the state captured by `pull`. It never contacts Confluence and never writes remotely. A page whose pulled Markdown does not carry its remote markup exactly is listed even when it is unchanged, and an update of such a page says that it also rewrites that markup.
 
 For an interactive review, open the same directory in the Proof Desk:
 

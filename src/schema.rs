@@ -274,7 +274,10 @@ fn output_fields_for(path: &str) -> Vec<Value> {
 
         "config path" => vec![json!({"name": "config_path", "type": "string"})],
 
-        "pull page" | "pull tree" | "pull space" => vec![json!({"name": "path", "type": "string"})],
+        "pull page" | "pull tree" | "pull space" => vec![
+            json!({"name": "path", "type": "string"}),
+            json!({"name": "storage_differs_from_remote", "type": "boolean"}),
+        ],
 
         "doctor" => vec![
             json!({"name": "config_path", "type": "string"}),
@@ -603,6 +606,7 @@ fn enrich_v03(document: &mut Value) {
             object.insert("partial_success_possible".into(), json!(true));
         }
         if name.starts_with("pull ") {
+            object.insert("partial_success_possible".into(), json!(true));
             object.insert("mutating".into(), json!(true));
             object.insert("idempotent".into(), json!(false));
             object.insert("overwrites_when".into(), json!(["--force"]));

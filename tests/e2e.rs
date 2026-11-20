@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -489,6 +489,189 @@ async fn simulated_cloud_supports_the_live_canary_contract() {
     })
     .await
     .expect("simulated canary task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_marks_a_page_that_markdown_does_not_carry_until_an_update_rewrites_it() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    let wrapped_storage = "<div><p>Wrapped text</p></div>";
+    let page_id = simulator.add_page("Wrapped", Some("100"), wrapped_storage);
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().expect("pull destination");
+        let pull_dir = temp.path().join("pull");
+        let pull_arg = pull_dir.to_string_lossy().into_owned();
+        let sidecar = |index: &PathBuf| -> Value {
+            serde_json::from_str(
+                &fs::read_to_string(index.with_file_name(".confluence.json")).expect("sidecar"),
+            )
+            .expect("sidecar JSON")
+        };
+        let remote_body = || {
+            let fetched = cfg.run_json(&["page", "get", &page_id, "--show-body"]);
+            string_field(first_item(&fetched, "page get"), "body_storage").to_string()
+        };
+
+        let pulled = cfg
+            .command()
+            .args(["pull", "page", &page_id, &pull_arg, "-o", "json"])
+            .output()
+            .expect("pull");
+        assert!(pulled.status.success(), "{pulled:?}");
+        let listing: Value = serde_json::from_slice(&pulled.stdout).expect("pull JSON");
+        assert_eq!(
+            list_items(&listing, "pull")[0]["storage_differs_from_remote"],
+            true
+        );
+        assert!(
+            String::from_utf8_lossy(&pulled.stderr).contains("1 of 1 pulled pages"),
+            "{pulled:?}"
+        );
+        let index = find_index_md(&pull_dir);
+        assert_eq!(sidecar(&index)["storage_differs_from_remote"], true);
+
+        let plan = cfg.run_json(&["plan", &pull_arg]);
+        let item = &list_items(&plan, "plan")[0];
+        assert_eq!(item["action"], "noop");
+        assert_eq!(item["content_id"], page_id.as_str());
+        assert!(
+            string_field(item, "details").contains("the first update also rewrites markup"),
+            "{item}"
+        );
+
+        // An apply with nothing to publish leaves the page, and its mark, alone.
+        cfg.run(&["--yes", "apply", &pull_arg]);
+        assert_eq!(remote_body(), wrapped_storage);
+        assert_eq!(sidecar(&index)["storage_differs_from_remote"], true);
+
+        let edited = fs::read_to_string(&index)
+            .expect("pulled markdown")
+            .replace("Wrapped text", "Edited text");
+        fs::write(&index, edited).expect("edit markdown");
+        let plan = cfg.run_json(&["plan", &pull_arg]);
+        let item = &list_items(&plan, "plan")[0];
+        assert_eq!(item["action"], "update_content");
+        assert!(
+            string_field(item, "details").contains("also rewrites markup"),
+            "{item}"
+        );
+
+        cfg.run(&["--yes", "apply", &pull_arg]);
+        assert_eq!(remote_body(), "<p>Edited text</p>");
+        assert!(sidecar(&index).get("storage_differs_from_remote").is_none());
+        let plan = cfg.run_json(&["plan", &pull_arg]);
+        assert_eq!(
+            string_field(&list_items(&plan, "plan")[0], "details"),
+            "no changes detected"
+        );
+    })
+    .await
+    .expect("simulated pull task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_writes_the_rest_of_a_tree_when_a_page_does_not_convert() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    // A code macro holds plain text, so this body is one the converter
+    // refuses to write back.
+    let broken_storage = r#"<ac:structured-macro ac:name="code"><ac:rich-text-body><p>x</p></ac:rich-text-body></ac:structured-macro>"#;
+    let root_id = simulator.add_page("Tree root", Some("100"), "<p>Root text</p>");
+    let broken_id = simulator.add_page("Broken", Some(&root_id), broken_storage);
+    let leaf_id = simulator.add_page("Leaf", Some(&broken_id), "<p>Leaf text</p>");
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().expect("pull destination");
+        let pull_dir = temp.path().join("pull");
+        let pull_arg = pull_dir.to_string_lossy().into_owned();
+
+        let pulled = cfg
+            .command()
+            .args(["pull", "tree", &root_id, &pull_arg, "-o", "json"])
+            .output()
+            .expect("pull");
+        assert_eq!(pulled.status.code(), Some(2), "{pulled:?}");
+        assert!(pulled.stdout.is_empty(), "{pulled:?}");
+        let error: Value = serde_json::from_slice(&pulled.stderr).expect("error JSON");
+        let error = &error["error"];
+        assert_eq!(error["kind"], "invalid_input");
+        assert!(string_field(error, "message").contains("1 of 3"), "{error}");
+        let details = &error["details"];
+        assert_eq!(details["written"].as_array().map(Vec::len), Some(2));
+        let page = &details["pages"][0];
+        assert_eq!(page["content_id"], broken_id.as_str());
+        assert_eq!(page["title"], "Broken");
+        assert!(
+            string_field(page, "error").contains("requires ac:plain-text-body"),
+            "{page}"
+        );
+        let artifacts = PathBuf::from(string_field(page, "artifacts"));
+        assert!(artifacts.starts_with(&pull_dir), "{artifacts:?}");
+        assert_eq!(
+            fs::read_to_string(artifacts.join("remote.xml")).expect("remote storage"),
+            broken_storage
+        );
+        assert_eq!(
+            fs::read_to_string(artifacts.join("generated.xml")).expect("generated storage"),
+            broken_storage
+        );
+        assert!(artifacts.join("generated.md").is_file());
+
+        let root_index = find_index_md_by_title(&pull_dir, "Tree root");
+        let leaf_index = find_index_md_by_title(&pull_dir, "Leaf");
+        assert!(
+            fs::read_to_string(&leaf_index)
+                .expect("leaf markdown")
+                .contains("Leaf text")
+        );
+        let broken_dir = leaf_index
+            .parent()
+            .and_then(Path::parent)
+            .expect("directory of the page left out");
+        assert!(
+            broken_dir.starts_with(root_index.parent().expect("root directory")),
+            "{broken_dir:?}"
+        );
+        assert!(!broken_dir.join("index.md").exists());
+
+        // The pages that were written sync as usual: the leaf keeps the parent
+        // it has remotely, and a second pull may replace the snapshot.
+        let plan = cfg.run_json(&["plan", &pull_arg]);
+        assert_eq!(&list_items(&plan, "plan")[0]["action"], "noop");
+        let edited = fs::read_to_string(&leaf_index)
+            .expect("leaf markdown")
+            .replace("Leaf text", "Edited leaf");
+        fs::write(&leaf_index, edited).expect("edit leaf");
+        cfg.run(&["--yes", "apply", &pull_arg]);
+        let leaf = cfg.run_json(&["page", "get", &leaf_id, "--show-body"]);
+        let leaf = first_item(&leaf, "page get");
+        assert_eq!(string_field(leaf, "body_storage"), "<p>Edited leaf</p>");
+        assert_eq!(string_field(leaf, "parent_id"), broken_id);
+        let broken = cfg.run_json(&["page", "get", &broken_id, "--show-body"]);
+        assert_eq!(
+            string_field(first_item(&broken, "page get"), "body_storage"),
+            broken_storage
+        );
+
+        let again = cfg
+            .command()
+            .args(["pull", "tree", &root_id, &pull_arg, "-o", "json"])
+            .output()
+            .expect("second pull");
+        assert_eq!(again.status.code(), Some(2), "{again:?}");
+        assert!(
+            fs::read_to_string(&leaf_index)
+                .expect("leaf markdown")
+                .contains("Edited leaf")
+        );
+    })
+    .await
+    .expect("simulated pull task");
 }
 
 fn simulated_cloud_config(simulator: &ConfluenceSimulator, config_home: &TempDir) -> E2eConfig {

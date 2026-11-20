@@ -107,7 +107,7 @@ enum Commands {
     },
     /// Export pages, trees, or spaces to the local Markdown format
     #[command(
-        after_help = "Examples:\n  confluence pull page DOCS:Home ./docs/home\n  confluence pull tree DOCS:Home ./docs/site\n  confluence pull space DOCS ./docs"
+        after_help = "A page whose Markdown does not convert back to valid storage is left out: the other pages are written, the command exits 2, and .confluence-pull-failures/ in the destination keeps that page's remote storage and generated Markdown for inspection.\n\nExamples:\n  confluence pull page DOCS:Home ./docs/home\n  confluence pull tree DOCS:Home ./docs/site\n  confluence pull space DOCS ./docs"
     )]
     Pull {
         #[command(subcommand)]
@@ -135,7 +135,7 @@ enum Commands {
     },
     /// Preview local changes without contacting or modifying Confluence
     #[command(
-        after_help = "`plan` reads local Markdown and sidecar state only. Remote drift is checked by `apply`.\n\nExample:\n  confluence plan ./docs --diff"
+        after_help = "`plan` reads local Markdown and sidecar state only. Remote drift is checked by `apply`. A page whose pulled Markdown does not carry its remote markup exactly is named, because its first update also rewrites that markup.\n\nExample:\n  confluence plan ./docs --diff"
     )]
     Plan(PlanArgs),
     /// Browse Confluence and review a local Markdown sync plan interactively
@@ -2270,15 +2270,30 @@ async fn handle_pull(
     if output.is_json() {
         let items = written
             .iter()
-            .map(|path| json!({ "path": path }))
+            .map(|page| {
+                json!({
+                    "path": page.path,
+                    "storage_differs_from_remote": page.storage_differs_from_remote,
+                })
+            })
             .collect::<Vec<_>>();
         print_items_json(&items, items.len(), items.len(), 0)?;
     } else {
         let items = written
             .iter()
-            .map(|path| path.display().to_string())
+            .map(|page| page.path.display().to_string())
             .collect::<Vec<_>>();
         print_list(&items);
+    }
+    let differing = written
+        .iter()
+        .filter(|page| page.storage_differs_from_remote)
+        .count();
+    if differing > 0 {
+        crate::output::print_message(&format!(
+            "{differing} of {} pulled pages hold markup that Markdown does not carry as it is stored; the first update applied to such a page rewrites that markup. `confluence plan` names them.",
+            written.len()
+        ));
     }
     Ok(())
 }

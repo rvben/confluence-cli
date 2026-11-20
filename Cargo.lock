@@ -522,6 +522,7 @@ dependencies = [
  "html2md",
  "keyring",
  "libc",
+ "markup5ever",
  "mime_guess",
  "open",
  "owo-colors",

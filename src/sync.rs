@@ -38,13 +38,49 @@ struct LinkIndex {
     by_directory: BTreeMap<PathBuf, LinkTarget>,
 }
 
+/// What `plan` says of a page whose pulled Markdown converts to storage that
+/// differs from the remote storage: updating the page publishes that
+/// difference along with the change.
+const REWRITES_REMOTE_MARKUP: &str =
+    "also rewrites markup of this page that Markdown does not carry as it is stored";
+
+/// Directory inside a pulled snapshot that holds what was fetched and
+/// generated for the pages whose Markdown does not convert back to valid
+/// storage. Nothing in it is a document, so `plan` and `apply` pass it by.
+const PULL_FAILURES_DIR: &str = ".confluence-pull-failures";
+
+/// A page that a pull wrote as a local document.
+#[derive(Debug, Clone)]
+pub struct PulledPage {
+    pub path: PathBuf,
+    /// See [`Sidecar::storage_differs_from_remote`].
+    pub storage_differs_from_remote: bool,
+}
+
+/// A page that a pull fetched and could not write as a local document.
+#[derive(Debug)]
+struct UnconvertiblePage {
+    content_id: Option<String>,
+    title: String,
+    error: String,
+    /// Where the generated Markdown, the storage it converts to and the
+    /// remote storage are kept for inspection.
+    artifacts: PathBuf,
+}
+
+/// A page as fetched, on its way to becoming a local document.
+struct FetchedPage {
+    document: LocalDocument,
+    remote_storage: String,
+}
+
 pub async fn pull_page(
     provider: &dyn ConfluenceProvider,
     reference: &str,
     root: &Path,
     recursive: bool,
     force: bool,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<PulledPage>> {
     validate_pull_destination(root, force)?;
     let root_id = provider.resolve_page_ref(reference).await?;
     let root_item = provider
@@ -63,7 +99,7 @@ pub async fn pull_space(
     space: &str,
     root: &Path,
     force: bool,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<PulledPage>> {
     validate_pull_destination(root, force)?;
     let mut items = provider
         .list_space_content(ContentKind::Page, space)
@@ -82,7 +118,7 @@ pub async fn pull_space_since(
     root: &Path,
     since: &str,
     force: bool,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<PulledPage>> {
     validate_pull_destination(root, force)?;
     validate_filtered_pull_destination(root)?;
     let space = crate::provider::escape_cql_literal(space);
@@ -204,13 +240,29 @@ pub fn plan_path(
                 } else {
                     None
                 };
+                let rewrite = if doc.sidecar.storage_differs_from_remote {
+                    format!("; {REWRITES_REMOTE_MARKUP}")
+                } else {
+                    String::new()
+                };
                 plan.items.push(PlanItem {
                     action: PlanActionKind::UpdateContent,
                     title: doc.frontmatter.title.clone(),
                     content_id: doc.sidecar.content_id.clone(),
                     path: doc.directory.clone(),
-                    details: format!("changed: {}", changes.join(", ")),
+                    details: format!("changed: {}{rewrite}", changes.join(", ")),
                     diff,
+                });
+            } else if doc.sidecar.storage_differs_from_remote {
+                plan.items.push(PlanItem {
+                    action: PlanActionKind::Noop,
+                    title: doc.frontmatter.title.clone(),
+                    content_id: doc.sidecar.content_id.clone(),
+                    path: doc.directory.clone(),
+                    details: format!(
+                        "no changes detected; the first update {REWRITES_REMOTE_MARKUP}"
+                    ),
+                    diff: None,
                 });
             }
         }
@@ -443,6 +495,7 @@ pub async fn apply_path(
         let kind = doc.frontmatter.content_kind();
         let title = doc.frontmatter.title.clone();
 
+        let mut body_published = true;
         let content = if let Some(content_id) = doc.sidecar.content_id.clone() {
             let remote = preflight_remotes.remove(&content_id).ok_or_else(|| {
                 crate::output::typed_error(
@@ -485,6 +538,7 @@ pub async fn apply_path(
                 });
                 updated
             } else {
+                body_published = false;
                 remote
             }
         } else {
@@ -540,6 +594,9 @@ pub async fn apply_path(
         doc.sidecar.last_pulled_hash = Some(markdown_hash);
         doc.sidecar.storage_hash = Some(storage_hash.clone());
         doc.sidecar.remote_storage_hash = Some(storage_hash);
+        if body_published {
+            doc.sidecar.storage_differs_from_remote = false;
+        }
         doc.sidecar.last_sync_at = Some(Utc::now());
         // Track metadata so plan can detect future title/label/status/properties changes.
         doc.sidecar.last_pulled_title = Some(doc.frontmatter.title.clone());
@@ -768,6 +825,7 @@ async fn reconcile_local_link_updates(
         doc.sidecar.remote_version = updated.version;
         doc.sidecar.storage_hash = Some(final_hash.clone());
         doc.sidecar.remote_storage_hash = Some(final_hash);
+        doc.sidecar.storage_differs_from_remote = false;
         doc.sidecar.last_pulled_hash = Some(markdown_body_hash(&doc.body_markdown));
         doc.sidecar.last_pulled_body_markdown = Some(doc.body_markdown.clone());
         doc.sidecar.last_sync_at = Some(Utc::now());
@@ -781,7 +839,7 @@ async fn pull_items(
     provider: &dyn ConfluenceProvider,
     root: &Path,
     items: Vec<ContentItem>,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<PulledPage>> {
     let parent = root
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -792,22 +850,93 @@ async fn pull_items(
         .tempdir_in(parent)
         .with_context(|| format!("failed to stage pull beside {}", root.display()))?;
     let staged_root = staging.path().join("snapshot");
-    let staged_paths = write_items(provider, &staged_root, items).await?;
-    install_staged_snapshot(&staged_root, root)?;
+    let (written, unconvertible) = write_items(provider, &staged_root, items).await?;
+    install_pulled_pages(&staged_root, root, written, unconvertible)
+}
 
-    staged_paths
-        .into_iter()
-        .map(|path| {
-            let relative = path.strip_prefix(&staged_root).with_context(|| {
-                format!(
-                    "staged path {} escaped snapshot {}",
-                    path.display(),
-                    staged_root.display()
-                )
-            })?;
-            Ok(root.join(relative))
+/// Moves a staged snapshot to its destination and reports its pages there.
+/// The snapshot is installed also when some pages were left out, and the
+/// result is then the error that names them.
+fn install_pulled_pages(
+    staged_root: &Path,
+    root: &Path,
+    mut written: Vec<PulledPage>,
+    mut unconvertible: Vec<UnconvertiblePage>,
+) -> Result<Vec<PulledPage>> {
+    install_staged_snapshot(staged_root, root)?;
+
+    let installed = |path: &Path| -> Result<PathBuf> {
+        let relative = path.strip_prefix(staged_root).with_context(|| {
+            format!(
+                "staged path {} escaped snapshot {}",
+                path.display(),
+                staged_root.display()
+            )
+        })?;
+        Ok(root.join(relative))
+    };
+    for page in &mut written {
+        page.path = installed(&page.path)?;
+    }
+    for page in &mut unconvertible {
+        page.artifacts = installed(&page.artifacts)?;
+    }
+    if unconvertible.is_empty() {
+        return Ok(written);
+    }
+    Err(unconvertible_pages_error(&written, &unconvertible))
+}
+
+/// Reports the pages a pull left out. The pages that convert are already
+/// written, so the error names both.
+fn unconvertible_pages_error(
+    written: &[PulledPage],
+    unconvertible: &[UnconvertiblePage],
+) -> anyhow::Error {
+    let summary = unconvertible
+        .iter()
+        .map(|page| {
+            format!(
+                "{} ({}): {}",
+                page.content_id.as_deref().unwrap_or("unknown ID"),
+                page.title,
+                page.error,
+            )
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join("; ");
+    crate::output::typed_error_with_details(
+        crate::output::ErrorKind::InvalidInput,
+        format!(
+            "{} of {} pulled pages do not convert back to valid storage and were left out: {summary}",
+            unconvertible.len(),
+            written.len() + unconvertible.len(),
+        ),
+        Some(format!(
+            "Pages written: {}. For each page left out, {} holds generated.md, the generated.xml it converts to and the remote.xml it came from; report them as a conversion bug.",
+            written.len(),
+            unconvertible
+                .first()
+                .and_then(|page| page.artifacts.parent())
+                .map_or_else(
+                    || PULL_FAILURES_DIR.to_string(),
+                    |dir| dir.display().to_string()
+                ),
+        )),
+        serde_json::json!({
+            "operation": "pull",
+            "written": written.iter().map(|page| &page.path).collect::<Vec<_>>(),
+            "pages": unconvertible
+                .iter()
+                .map(|page| serde_json::json!({
+                    "content_id": page.content_id,
+                    "title": page.title,
+                    "error": page.error,
+                    "artifacts": page.artifacts,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    )
 }
 
 fn install_staged_snapshot(staged_root: &Path, root: &Path) -> Result<()> {
@@ -882,12 +1011,15 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<()> {
         ));
     }
 
+    let failures_dir = root.join(PULL_FAILURES_DIR);
     let docs = load_local_documents(root)?;
     if docs.is_empty() {
-        if fs::read_dir(root)?.next().is_none() {
-            return Ok(());
+        for entry in fs::read_dir(root)? {
+            if entry?.path() != failures_dir {
+                return Err(dirty_pull_destination_error(root));
+            }
         }
-        return Err(dirty_pull_destination_error(root));
+        return Ok(());
     }
 
     // Missing pulled attachments are local changes even when a normal plan would
@@ -903,7 +1035,7 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<()> {
 
     for entry in WalkDir::new(root) {
         let entry = entry?;
-        if entry.path() == root {
+        if entry.path() == root || entry.path().starts_with(&failures_dir) {
             continue;
         }
         if entry.file_type().is_dir() {
@@ -968,7 +1100,7 @@ async fn write_items(
     provider: &dyn ConfluenceProvider,
     root: &Path,
     items: Vec<ContentItem>,
-) -> Result<Vec<PathBuf>> {
+) -> Result<(Vec<PulledPage>, Vec<UnconvertiblePage>)> {
     let mut item_map = BTreeMap::new();
     for item in items {
         item_map.insert(item.id.clone(), item);
@@ -993,8 +1125,7 @@ async fn write_items(
             ));
         }
     }
-    let mut docs_to_write = Vec::new();
-    let mut written = Vec::new();
+    let mut fetched = Vec::new();
     for item in item_map.values() {
         let Some(dir) = paths.get(&item.id) else {
             continue;
@@ -1066,79 +1197,133 @@ async fn write_items(
             last_pulled_properties_hash: Some(props_hash),
             last_pulled_parent: Some(frontmatter.parent.clone()),
             last_pulled_body_markdown: Some(body_markdown.clone()),
+            storage_differs_from_remote: false,
         };
-        docs_to_write.push(LocalDocument {
-            directory: dir.clone(),
-            markdown_path: dir.join("index.md"),
-            sidecar_path: dir.join(".confluence.json"),
-            frontmatter,
-            body_markdown,
-            sidecar,
+        fetched.push(FetchedPage {
+            document: LocalDocument {
+                directory: dir.clone(),
+                markdown_path: dir.join("index.md"),
+                sidecar_path: dir.join(".confluence.json"),
+                frontmatter,
+                body_markdown,
+                sidecar,
+            },
+            remote_storage: item.body_storage.clone().unwrap_or_default(),
         });
     }
 
-    for doc in stamp_storage_hashes(docs_to_write)? {
-        save_document(&doc)?;
-        written.push(doc.directory.clone());
-    }
-
-    Ok(written)
+    store_fetched_pages(root, fetched)
 }
 
-/// Records on each pulled document the hash of the storage its Markdown
-/// converts back to. Every document is converted before any is returned, so
-/// a failure reports all affected pages rather than only the first.
-fn stamp_storage_hashes(docs: Vec<LocalDocument>) -> Result<Vec<LocalDocument>> {
-    let link_index = build_link_index(&docs);
-    let total = docs.len();
-    let mut stamped = Vec::with_capacity(total);
-    let mut failures = Vec::new();
-    for mut doc in docs {
-        match render_body_storage(
-            &doc,
-            &link_index,
-            false,
-            effective_web_path_prefix(&doc.sidecar, None),
-        ) {
-            Ok(storage) => {
-                doc.sidecar.storage_hash = Some(sha256_hex(storage.as_bytes()));
-                stamped.push(doc);
-            }
-            Err(error) => failures.push(serde_json::json!({
-                "content_id": doc.sidecar.content_id,
-                "title": doc.frontmatter.title,
-                "error": format!("{error:#}"),
-            })),
+/// Writes the fetched pages that convert back to storage as local documents,
+/// and keeps the rest for inspection outside the document tree.
+fn store_fetched_pages(
+    root: &Path,
+    fetched: Vec<FetchedPage>,
+) -> Result<(Vec<PulledPage>, Vec<UnconvertiblePage>)> {
+    let (documents, failures) = stamp_storage_hashes(fetched);
+    let mut written = Vec::with_capacity(documents.len());
+    for doc in documents {
+        save_document(&doc)?;
+        written.push(PulledPage {
+            path: doc.directory,
+            storage_differs_from_remote: doc.sidecar.storage_differs_from_remote,
+        });
+    }
+    let unconvertible = failures
+        .iter()
+        .map(|(page, error)| keep_unconvertible_page(root, page, error))
+        .collect::<Result<Vec<_>>>()?;
+    // A page that is left out has no document, so its directory holds at
+    // most the pages beneath it. The deepest goes first, so a directory whose
+    // pages were all left out goes too.
+    let mut left_out: Vec<&Path> = failures
+        .iter()
+        .map(|(page, _)| page.document.directory.as_path())
+        .collect();
+    left_out.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
+    for directory in left_out {
+        let attachments = directory.join("attachments");
+        if attachments.exists() {
+            fs::remove_dir_all(&attachments)
+                .with_context(|| format!("failed to remove {}", attachments.display()))?;
+        }
+        if directory.exists() && fs::read_dir(directory)?.next().is_none() {
+            fs::remove_dir(directory)
+                .with_context(|| format!("failed to remove {}", directory.display()))?;
         }
     }
-    if failures.is_empty() {
-        return Ok(stamped);
-    }
 
-    let summary = failures
-        .iter()
-        .map(|failure| {
-            format!(
-                "{} ({}): {}",
-                failure["content_id"].as_str().unwrap_or("unknown ID"),
-                failure["title"].as_str().unwrap_or_default(),
-                failure["error"].as_str().unwrap_or_default(),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(crate::output::typed_error_with_details(
-        crate::output::ErrorKind::Unexpected,
-        format!(
-            "{} of {total} pulled pages do not convert back to valid storage: {summary}",
-            failures.len()
-        ),
-        Some(
-            "Nothing was written. Pull the remaining pages individually, and report the listed pages as a conversion bug."
-                .to_string(),
-        ),
-        serde_json::json!({ "operation": "pull", "pages": failures }),
-    ))
+    Ok((written, unconvertible))
+}
+
+/// Converts the Markdown of each fetched page back to storage. A page that
+/// converts gets the hash of that storage and whether it still says what the
+/// remote storage says. A page that does not convert is returned with the
+/// reason, so one such page does not keep the others from being written.
+fn stamp_storage_hashes(
+    fetched: Vec<FetchedPage>,
+) -> (Vec<LocalDocument>, Vec<(FetchedPage, String)>) {
+    let link_index = build_link_index(fetched.iter().map(|page| &page.document));
+    let mut stamped = Vec::with_capacity(fetched.len());
+    let mut failures = Vec::new();
+    for mut page in fetched {
+        match render_body_storage(
+            &page.document,
+            &link_index,
+            false,
+            effective_web_path_prefix(&page.document.sidecar, None),
+        ) {
+            Ok(storage) => {
+                let sidecar = &mut page.document.sidecar;
+                sidecar.storage_hash = Some(sha256_hex(storage.as_bytes()));
+                sidecar.storage_differs_from_remote =
+                    !crate::storage::same_document(&storage, &page.remote_storage);
+                stamped.push(page.document);
+            }
+            Err(error) => failures.push((page, format!("{error:#}"))),
+        }
+    }
+    (stamped, failures)
+}
+
+/// Keeps what a pull has of a page it leaves out: the Markdown generated for
+/// it, the storage that Markdown converts to when conversion gets that far,
+/// and the remote storage.
+fn keep_unconvertible_page(
+    root: &Path,
+    page: &FetchedPage,
+    error: &str,
+) -> Result<UnconvertiblePage> {
+    let document = &page.document;
+    let artifacts = root.join(PULL_FAILURES_DIR).join(document_dir_name(
+        &document.frontmatter.title,
+        document.sidecar.content_id.as_deref(),
+    ));
+    fs::create_dir_all(&artifacts)
+        .with_context(|| format!("failed to create {}", artifacts.display()))?;
+    let write = |name: &str, contents: &str| {
+        let path = artifacts.join(name);
+        fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))
+    };
+    write(
+        "generated.md",
+        &crate::markdown::render_document(&document.frontmatter, &document.body_markdown)?,
+    )?;
+    if let Ok(converted) = crate::markdown::render_markdown_storage(&document.body_markdown, false)
+    {
+        write(
+            "generated.xml",
+            &resolve_placeholder_links(&converted.storage),
+        )?;
+    }
+    write("remote.xml", &page.remote_storage)?;
+    Ok(UnconvertiblePage {
+        content_id: document.sidecar.content_id.clone(),
+        title: document.frontmatter.title.clone(),
+        error: error.to_string(),
+        artifacts,
+    })
 }
 
 fn safe_attachment_file_name(title: &str) -> Result<&str> {
@@ -1233,7 +1418,7 @@ impl LinkIndex {
     }
 }
 
-fn build_link_index(docs: &[LocalDocument]) -> LinkIndex {
+fn build_link_index<'a>(docs: impl IntoIterator<Item = &'a LocalDocument>) -> LinkIndex {
     let mut index = LinkIndex::default();
     for doc in docs {
         let target = LinkTarget {
@@ -2267,6 +2452,65 @@ mod tests {
         )
         .expect("write sidecar");
         page_dir
+    }
+
+    /// Marks the document in `page_dir` as pulled from storage that its
+    /// Markdown does not carry exactly.
+    fn mark_storage_as_different(page_dir: &Path) {
+        let sidecar_path = page_dir.join(".confluence.json");
+        let mut sidecar: Sidecar =
+            serde_json::from_str(&fs::read_to_string(&sidecar_path).expect("read sidecar"))
+                .expect("parse sidecar");
+        sidecar.storage_differs_from_remote = true;
+        fs::write(
+            sidecar_path,
+            serde_json::to_string_pretty(&sidecar).expect("serialize sidecar"),
+        )
+        .expect("write sidecar");
+    }
+
+    #[test]
+    fn plan_names_an_unchanged_page_whose_first_update_rewrites_remote_markup() {
+        let dir = tempdir().expect("tempdir");
+        let page_dir = write_clean_managed_document(dir.path(), "# Root");
+        mark_storage_as_different(&page_dir);
+
+        let plan = plan_path(dir.path(), false, false, false).expect("plan");
+
+        assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
+        let item = &plan.items[0];
+        assert_eq!(item.action, PlanActionKind::Noop);
+        assert_eq!(item.content_id.as_deref(), Some("123"));
+        assert_eq!(item.path, page_dir);
+        assert_eq!(
+            item.details,
+            "no changes detected; the first update also rewrites markup of this page that Markdown does not carry as it is stored"
+        );
+        validate_pull_destination(dir.path(), false).expect("the page is still clean");
+    }
+
+    #[test]
+    fn plan_says_when_an_update_also_rewrites_remote_markup() {
+        let dir = tempdir().expect("tempdir");
+        let page_dir = write_clean_managed_document(dir.path(), "# Root");
+        let edited = fs::read_to_string(page_dir.join("index.md"))
+            .expect("read markdown")
+            .replace("# Root", "# Edited");
+        fs::write(page_dir.join("index.md"), edited).expect("edit markdown");
+
+        let plan = plan_path(dir.path(), false, false, false).expect("plan");
+        assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
+        assert_eq!(plan.items[0].action, PlanActionKind::UpdateContent);
+        assert_eq!(plan.items[0].details, "changed: body, markdown");
+
+        mark_storage_as_different(&page_dir);
+        let plan = plan_path(dir.path(), false, false, false).expect("plan");
+        assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
+        assert_eq!(plan.items[0].action, PlanActionKind::UpdateContent);
+        assert_eq!(
+            plan.items[0].details,
+            "changed: body, markdown; also rewrites markup of this page that Markdown does not carry as it is stored"
+        );
     }
 
     #[test]
@@ -4618,20 +4862,48 @@ mod round_trip_tests {
         }
     }
 
-    #[test]
-    fn pull_names_every_page_it_cannot_convert() {
-        let docs = vec![
-            pulled_document("101", "Fine", "plain text"),
-            pulled_document("202", "Broken one", "an <unclosed> tag"),
-            pulled_document("303", "Broken two", "another <open attr> tag"),
-        ];
+    /// A page as a pull fetched it, placed in `root`.
+    fn fetched_page(root: &Path, content_id: &str, title: &str, markdown: &str) -> FetchedPage {
+        let mut document = pulled_document(content_id, title, markdown);
+        document.directory = root.join(document_dir_name(title, Some(content_id)));
+        document.markdown_path = document.directory.join("index.md");
+        document.sidecar_path = document.directory.join(".confluence.json");
+        FetchedPage {
+            document,
+            remote_storage: format!("<p>{markdown}</p>"),
+        }
+    }
 
-        let error = stamp_storage_hashes(docs).expect_err("unconvertible pages fail the pull");
+    #[test]
+    fn pull_writes_the_pages_that_convert_and_keeps_the_rest_for_inspection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staged = temp.path().join("staged");
+        let root = temp.path().join("pulled");
+        let mut child = fetched_page(&staged, "404", "Child", "child text");
+        child.document.directory = staged.join("broken-one--202").join("child--404");
+        child.document.markdown_path = child.document.directory.join("index.md");
+        child.document.sidecar_path = child.document.directory.join(".confluence.json");
+        child.document.sidecar.remote_parent_id = Some("202".to_string());
+        let fetched = vec![
+            fetched_page(&staged, "101", "Fine", "plain text"),
+            fetched_page(&staged, "202", "Broken one", "an <unclosed> tag"),
+            fetched_page(&staged, "303", "Broken two", "another <open attr> tag"),
+            child,
+        ];
+        for page in &fetched {
+            fs::create_dir_all(page.document.directory.join("attachments")).expect("page dir");
+        }
+        fs::write(staged.join("broken-two--303/attachments/a.txt"), "a").expect("attachment");
+
+        let (written, unconvertible) = store_fetched_pages(&staged, fetched).expect("store");
+        let error = install_pulled_pages(&staged, &root, written, unconvertible)
+            .expect_err("pages that do not convert fail the pull");
         let error = error
             .downcast::<crate::output::CliError>()
             .expect("typed error");
 
-        assert!(error.message.contains("2 of 3"), "{}", error.message);
+        assert_eq!(error.kind, crate::output::ErrorKind::InvalidInput);
+        assert!(error.message.contains("2 of 4"), "{}", error.message);
         assert!(
             error.message.contains("202 (Broken one)"),
             "{}",
@@ -4643,7 +4915,15 @@ mod round_trip_tests {
             error.message
         );
         assert!(!error.message.contains("101"), "{}", error.message);
-        let pages = error.details.expect("details")["pages"].clone();
+        let details = error.details.expect("details");
+        assert_eq!(
+            details["written"],
+            serde_json::json!([
+                root.join("fine--101"),
+                root.join("broken-one--202/child--404")
+            ])
+        );
+        let pages = &details["pages"];
         assert_eq!(pages[0]["content_id"], "202");
         assert_eq!(pages[1]["title"], "Broken two");
         assert!(
@@ -4651,16 +4931,119 @@ mod round_trip_tests {
                 .as_str()
                 .is_some_and(|message| message.contains("unclosed"))
         );
+        let artifacts = root.join(".confluence-pull-failures/broken-one--202");
+        assert_eq!(pages[0]["artifacts"], serde_json::json!(artifacts));
+        assert!(
+            fs::read_to_string(artifacts.join("generated.md"))
+                .expect("generated markdown")
+                .ends_with("an <unclosed> tag")
+        );
+        assert_eq!(
+            fs::read_to_string(artifacts.join("generated.xml")).expect("generated storage"),
+            "<p>an <unclosed> tag</p>"
+        );
+        assert_eq!(
+            fs::read_to_string(artifacts.join("remote.xml")).expect("remote storage"),
+            "<p>an <unclosed> tag</p>"
+        );
+
+        assert!(root.join("fine--101/index.md").is_file());
+        assert!(root.join("broken-one--202/child--404/index.md").is_file());
+        assert!(!root.join("broken-one--202/index.md").exists());
+        assert!(!root.join("broken-one--202/attachments").exists());
+        assert!(!root.join("broken-two--303").exists());
+
+        // The pages that were left out are not documents, so the rest of the
+        // snapshot plans as unchanged, the child keeps its remote parent, and
+        // a later pull may replace the snapshot.
+        let plan = plan_path(&root, false, true, false).expect("plan");
+        assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
+        assert_eq!(plan.items[0].action, PlanActionKind::Noop);
+        validate_pull_destination(&root, false).expect("snapshot can be pulled again");
+    }
+
+    #[test]
+    fn pull_destination_that_holds_only_pages_left_out_can_be_pulled_again() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staged = temp.path().join("staged");
+        let root = temp.path().join("pulled");
+        let fetched = vec![fetched_page(&staged, "202", "Broken", "an <unclosed> tag")];
+        let (written, unconvertible) = store_fetched_pages(&staged, fetched).expect("store");
+        install_pulled_pages(&staged, &root, written, unconvertible).expect_err("left out");
+
+        validate_pull_destination(&root, false).expect("nothing of the user's is in the way");
+        fs::write(root.join("notes.txt"), "mine").expect("unmanaged file");
+        validate_pull_destination(&root, false).expect_err("an unmanaged file is in the way");
     }
 
     #[test]
     fn pull_records_the_storage_hash_of_every_convertible_page() {
-        let docs = vec![pulled_document("101", "Fine", "plain text")];
-        let stamped = stamp_storage_hashes(docs).expect("convertible pages succeed");
+        let fetched = vec![fetched_page(
+            Path::new("/tmp/root"),
+            "101",
+            "Fine",
+            "plain text",
+        )];
+        let (stamped, failures) = stamp_storage_hashes(fetched);
+        assert!(failures.is_empty());
         assert_eq!(
             stamped[0].sidecar.storage_hash.as_deref(),
             Some(sha256_hex("<p>plain text</p>".as_bytes()).as_str())
         );
+        assert!(!stamped[0].sidecar.storage_differs_from_remote);
+    }
+
+    /// Pulls one page with the given remote storage and returns its sidecar.
+    fn pulled_sidecar(remote_storage: &str) -> Sidecar {
+        let mut page = fetched_page(
+            Path::new("/tmp/root"),
+            "101",
+            "Page",
+            &storage_to_markdown(remote_storage),
+        );
+        page.remote_storage = remote_storage.to_string();
+        let (mut stamped, failures) = stamp_storage_hashes(vec![page]);
+        assert!(failures.is_empty(), "{remote_storage} does not convert");
+        stamped.remove(0).sidecar
+    }
+
+    #[test]
+    fn pull_records_whether_the_converted_storage_still_says_what_the_remote_says() {
+        for same in [
+            "<p>plain <strong>text</strong></p>",
+            "<p>a <b>b</b> <i>c</i></p>",
+            r#"<p local-id="abc">a</p><ul><li><p>one</p></li></ul>"#,
+            "<pre><code>code</code></pre>",
+            r#"<table class="wrapped"><tbody><tr><th>H</th></tr></tbody></table>"#,
+            "<p>a&nbsp;b &eacute;</p>",
+            r#"<ac:structured-macro ac:name="details" ac:schema-version="1" ac:macro-id="7f"><ac:rich-text-body><p>x</p></ac:rich-text-body></ac:structured-macro>"#,
+            r#"<p><ac:link><ri:user ri:userkey="abc" /></ac:link></p>"#,
+        ] {
+            assert!(
+                !pulled_sidecar(same).storage_differs_from_remote,
+                "{same} pulled as {:?}",
+                storage_to_markdown(same)
+            );
+        }
+        for different in [
+            "<div><p>a</p></div>",
+            "<p><span>a</span> b</p>",
+            r#"<p><img src="https://example.com/a.png" /></p>"#,
+        ] {
+            assert!(
+                pulled_sidecar(different).storage_differs_from_remote,
+                "{different} pulled as {:?}",
+                storage_to_markdown(different)
+            );
+        }
+    }
+
+    #[test]
+    fn sidecar_of_a_page_that_converts_exactly_does_not_mention_it() {
+        let sidecar = serde_json::to_value(pulled_sidecar("<p>a</p>")).expect("sidecar");
+        assert!(sidecar.get("storage_differs_from_remote").is_none());
+        let sidecar = serde_json::to_value(pulled_sidecar("<div><p>a</p></div>")).expect("sidecar");
+        assert_eq!(sidecar["storage_differs_from_remote"], true);
     }
 
     #[test]
