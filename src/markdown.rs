@@ -1233,6 +1233,18 @@ fn render_layout(node: Node<'_, '_>, source: &str) -> Option<String> {
     if sections.is_empty() {
         return None;
     }
+    // Layout sections that follow each other in Markdown are the sections
+    // of one layout, so a layout right after another one stays storage.
+    let follows_a_layout = node
+        .prev_siblings()
+        .skip(1)
+        .find(|sibling| !sibling.is_text() || !sibling.text().unwrap_or_default().trim().is_empty())
+        .is_some_and(|sibling| {
+            sibling.tag_name().namespace() == Some(AC_NS) && sibling.tag_name().name() == "layout"
+        });
+    if follows_a_layout {
+        return Some(confluence_raw_block(raw_xml_fragment(node, source)));
+    }
     if node.children().any(|child| {
         child.is_element()
             && (child.tag_name().namespace() != Some(AC_NS)

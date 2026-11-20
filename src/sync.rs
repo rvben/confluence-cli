@@ -5370,6 +5370,23 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn layouts_that_follow_each_other_stay_apart() {
+        let layout = |text: &str| {
+            format!(
+                r#"<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell><p>{text}</p></ac:layout-cell></ac:layout-section></ac:layout>"#
+            )
+        };
+        assert_keeps(&format!("{}{}", layout("a"), layout("b")));
+        assert_keeps(&format!("{}\n{}{}", layout("a"), layout("b"), layout("c")));
+        assert_keeps(&format!("{}<p>between</p>{}", layout("a"), layout("b")));
+        // A layout that follows text is still written as layout sections.
+        assert!(
+            storage_to_markdown(&format!("<p>before</p>{}", layout("a")))
+                .contains("confluence-layout-section single")
+        );
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");
