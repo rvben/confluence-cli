@@ -1128,9 +1128,12 @@ fn render_top_level_block(node: Node<'_, '_>, source: &str) -> Option<String> {
 }
 
 fn render_block_element(node: Node<'_, '_>, source: &str) -> Option<String> {
-    // Markdown has a place for a comment between blocks only, so a block
-    // that holds one is kept as storage.
-    if node.descendants().any(|descendant| descendant.is_comment()) {
+    // Markdown has a place for a comment or a processing instruction
+    // between blocks only, so a block that holds one is kept as storage.
+    if node
+        .descendants()
+        .any(|descendant| descendant.is_comment() || descendant.is_pi())
+    {
         return None;
     }
     if is_confluence_node(node) {

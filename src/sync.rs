@@ -5477,6 +5477,14 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn processing_instruction_is_kept() {
+        assert_keeps("<p>a</p><?x y?><p>b</p>");
+        assert_keeps("<p>a<?x y?>b</p>");
+        assert_keeps("<ul><li>a<?x y?></li></ul>");
+        assert!(storage_to_markdown("<p>a<?x y?>b</p>").contains("<?x y?>"));
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");
