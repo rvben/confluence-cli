@@ -5462,6 +5462,21 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn paragraph_that_reads_as_a_table_stays_a_paragraph() {
+        for paragraph in [
+            "a | b<br />--- | ---",
+            "| a |<br />|---|",
+            "| a | b |<br />| - | - |<br />| c | d |",
+            "| a | b |<br />|:--|--:|",
+            "a | b<br />:-- | --:",
+            "| a |<br />| b |",
+        ] {
+            assert_keeps(&format!("<p>{paragraph}</p>"));
+            assert_keeps(&format!("<ul><li>{paragraph}</li></ul>"));
+        }
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");

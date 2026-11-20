@@ -3300,7 +3300,7 @@ fn starts_entity(rest: &str) -> bool {
 
 /// Escapes rendered inline content whose lines would otherwise open a
 /// heading, list, block quote, definition, thematic break, metadata block,
-/// setext underline or cell of a layout section. Lines
+/// setext underline, table or cell of a layout section. Lines
 /// begin at the start of the content and after each hard line break.
 fn escape_block_starts(inline: &str) -> String {
     inline
@@ -3319,6 +3319,9 @@ fn escape_block_start(line: &str) -> String {
     let only = |allowed: &[char]| {
         !content.trim_end().is_empty() && content.trim_end().chars().all(|ch| allowed.contains(&ch))
     };
+    // The row under the first row of a table.
+    let table_delimiter_row =
+        only(&['|', '-', ':', ' ']) && content.contains('-') && content.contains('|');
 
     let escape_at = match content.chars().next() {
         Some('#') => {
@@ -3328,11 +3331,13 @@ fn escape_block_start(line: &str) -> String {
         Some('>') => Some(0),
         Some('-') => (followed_by_space_or_end(&content[1..])
             || only(&['-', ' '])
+            || table_delimiter_row
             || content.trim_end() == LAYOUT_CELL_LINE)
             .then_some(0),
         Some('+') => (followed_by_space_or_end(&content[1..]) || only(&['+'])).then_some(0),
         Some('=') => only(&['=']).then_some(0),
         Some(':') => Some(0),
+        Some('|') => table_delimiter_row.then_some(0),
         Some(first) if first.is_ascii_digit() => {
             let digits = content.len()
                 - content
