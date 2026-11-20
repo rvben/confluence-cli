@@ -3657,6 +3657,31 @@ fn reads_as_block_syntax(line: &str) -> bool {
         || matches!(line.trim_end(), ":::" | LAYOUT_CELL_LINE)
 }
 
+/// Whether Markdown reads the whole fragment as one block of markup. An
+/// element it reads as text of a paragraph has its content read as Markdown.
+fn reads_as_one_block_of_markup(fragment: &str) -> bool {
+    let mut blocks = 0;
+    let mut depth = 0;
+    for event in Parser::new_ext(fragment, markdown_options()) {
+        match event {
+            Event::Start(Tag::HtmlBlock) if depth == 0 => {
+                blocks += 1;
+                depth += 1;
+            }
+            Event::Start(_) => {
+                if depth == 0 {
+                    return false;
+                }
+                depth += 1;
+            }
+            Event::End(_) => depth -= 1,
+            _ if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    blocks == 1
+}
+
 fn fallback_block_markdown(node: Node<'_, '_>, source: &str) -> String {
     let raw = raw_xml_fragment(node, source);
     // A blank line ends a Markdown HTML block, and what follows it would be
@@ -3668,6 +3693,7 @@ fn fallback_block_markdown(node: Node<'_, '_>, source: &str) -> String {
         || is_confluence_node(node)
         || has_blank_line
         || has_block_syntax
+        || !reads_as_one_block_of_markup(raw.trim())
     {
         confluence_raw_block(raw)
     } else {
@@ -9242,6 +9268,28 @@ SELECT ']]>' AS sentinel;
         let markdown = storage_to_markdown(storage);
         assert_eq!(markdown, format!("```confluence-storage\n{storage}\n```"));
         assert_eq!(storage_of(&markdown), storage);
+    }
+
+    #[test]
+    fn element_that_markdown_reads_as_text_of_a_paragraph_round_trips() {
+        for element in ["<foo>a*b*c</foo>", "<font color=\"red\">a `b` c</font>"] {
+            let storage = format!("{element}<p>after</p>");
+            let markdown = storage_to_markdown(&storage);
+            assert_eq!(
+                markdown,
+                format!("```confluence-storage\n{element}\n```\n\nafter")
+            );
+            assert_eq!(storage_of(&markdown), format!("{element}\n<p>after</p>"));
+        }
+        // Markdown reads an element that stands alone on its lines as markup.
+        assert_eq!(
+            storage_to_markdown("<div>a*b*c</div><p>after</p>"),
+            "<div>a*b*c</div>\n\nafter"
+        );
+        assert_eq!(
+            storage_to_markdown("<foo>\na*b*c\n</foo><p>after</p>"),
+            "<foo>\na*b*c\n</foo>\n\nafter"
+        );
     }
 
     #[test]
