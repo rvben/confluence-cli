@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::ops::Range;
@@ -1670,8 +1670,35 @@ fn render_task_list(node: Node<'_, '_>, source: &str) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Whether each parameter of a macro can be written as a `name: value`
+/// line and read back as it is: a name once, without a colon, and a name
+/// and a text value on one line without white space at their edges.
+fn parameters_fit_lines(node: Node<'_, '_>) -> bool {
+    let fits = |text: &str| text == text.trim() && !text.contains(['\n', '\r']);
+    let mut names = HashSet::new();
+    node.children()
+        .filter(|child| {
+            child.is_element()
+                && child.tag_name().namespace() == Some(AC_NS)
+                && child.tag_name().name() == "parameter"
+        })
+        .all(|parameter| {
+            let name = parameter.attribute((AC_NS, "name")).unwrap_or_default();
+            let text: String = parameter
+                .children()
+                .filter(|child| child.is_text())
+                .filter_map(|child| child.text())
+                .collect();
+            let is_text = parameter.children().all(|child| !child.is_element());
+            fits(name) && !name.contains(':') && names.insert(name) && (!is_text || fits(&text))
+        })
+}
+
 fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<String> {
     let name = node.attribute((AC_NS, "name"))?;
+    if !parameters_fit_lines(node) {
+        return Some(confluence_raw_block(raw_xml_fragment(node, source)));
+    }
     if name == "anchor" {
         return render_default_parameter_macro_block("anchor", "name", node);
     }

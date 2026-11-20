@@ -5387,6 +5387,46 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn macro_keeps_a_parameter_that_does_not_fit_a_line() {
+        let parameter = |name: &str, value: &str| {
+            format!(r#"<ac:parameter ac:name="{name}">{value}</ac:parameter>"#)
+        };
+        let body = "<ac:rich-text-body><p>b</p></ac:rich-text-body>";
+        for (name, parameters, body) in [
+            ("jira", parameter("jql", "a\nb"), ""),
+            ("jira", parameter("jql", " a"), ""),
+            ("jira", parameter("jql", "a "), ""),
+            ("jira", parameter("a:b", "v"), ""),
+            (
+                "jira",
+                format!("{}{}", parameter("a", "1"), parameter("a", "2")),
+                "",
+            ),
+            ("toc", parameter("include", "a\nb"), ""),
+            ("expand", parameter("title", " T "), body),
+            ("expand", parameter("title", "T\nU"), body),
+            ("info", parameter("title", "T\nU"), body),
+            (
+                "code",
+                parameter("title", "T\nU"),
+                "<ac:plain-text-body><![CDATA[x]]></ac:plain-text-body>",
+            ),
+        ] {
+            assert_keeps(&format!(
+                r#"<ac:structured-macro ac:name="{name}">{parameters}{body}</ac:structured-macro><p>after</p>"#
+            ));
+        }
+        // A parameter that fits a line is still written as one.
+        assert_eq!(
+            storage_to_markdown(&format!(
+                r#"<ac:structured-macro ac:name="jira">{}</ac:structured-macro>"#,
+                parameter("jql", "a = b: c")
+            )),
+            ":::confluence-macro jira\njql: a = b: c\n:::"
+        );
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");
