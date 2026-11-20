@@ -2658,7 +2658,8 @@ fn rewrite_generic_macro_page_placeholder_line(
 
 /// Writes the placeholder links of rendered storage, which stand for a page,
 /// a user or a status in Markdown, as the Confluence elements they stand for.
-/// CDATA sections hold literal text and pass through untouched.
+/// CDATA sections hold literal text and pass through untouched, and so does
+/// a link that is written inside a comment.
 pub fn resolve_placeholder_links(storage: &str) -> String {
     rewrite_outside_cdata(storage, rewrite_placeholder_links_to_storage)
 }
@@ -2670,12 +2671,43 @@ fn rewrite_placeholder_links_to_storage(storage: &str) -> String {
         )
         .expect("valid placeholder link regex")
     });
-    LINK.replace_all(storage, |captures: &regex::Captures<'_>| {
+    // A link that opens inside a comment is text of that comment. A comment
+    // inside a link is part of the link's text, so the search goes on from
+    // the end of a comment only when a link would open within it.
+    let mut comments: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut at = 0;
+    while let Some(open) = storage[at..].find("<!--").map(|open| at + open) {
+        let Some(close) = storage[open..].find("-->").map(|close| open + close + 3) else {
+            break;
+        };
+        comments.push(open..close);
+        at = close;
+    }
+    let comment_around = |at: usize| {
+        let comment = comments.get(comments.partition_point(|comment| comment.end <= at))?;
+        comment.contains(&at).then_some(comment.end)
+    };
+    let mut rewritten = String::with_capacity(storage.len());
+    let mut copied = 0;
+    let mut search_from = 0;
+    while let Some(captures) = LINK.captures_at(storage, search_from) {
+        let link = captures.get(0).expect("the whole match");
+        if let Some(comment_end) = comment_around(link.start()) {
+            search_from = comment_end;
+            continue;
+        }
         let target = captures.get(2).map(|m| m.as_str()).unwrap_or_default();
         let body = captures.get(4).map(|m| m.as_str()).unwrap_or_default();
-        placeholder_to_storage_macro(target, body).unwrap_or_else(|| captures[0].to_string())
-    })
-    .to_string()
+        rewritten.push_str(&storage[copied..link.start()]);
+        match placeholder_to_storage_macro(target, body) {
+            Some(element) => rewritten.push_str(&element),
+            None => rewritten.push_str(link.as_str()),
+        }
+        copied = link.end();
+        search_from = link.end();
+    }
+    rewritten.push_str(&storage[copied..]);
+    rewritten
 }
 
 fn placeholder_to_storage_macro(target: &str, body_html: &str) -> Option<String> {
@@ -4051,6 +4083,29 @@ mod tests {
         assert!(
             storage
                 .contains("<ac:plain-text-link-body><![CDATA[@Ruben]]></ac:plain-text-link-body>")
+        );
+    }
+
+    #[test]
+    fn placeholder_link_written_inside_a_comment_stays_text() {
+        let storage = r#"<p>a</p><!-- <a href="confluence-user://user?userkey=foo"> --><p><a href="https://example.com">site</a> end</p>"#;
+
+        assert_eq!(resolve_placeholder_links(storage), storage);
+    }
+
+    #[test]
+    fn placeholder_link_after_a_comment_and_one_holding_a_comment_are_both_written() {
+        let storage = resolve_placeholder_links(
+            r#"<!-- <a href="confluence-user://user?userkey=foo"> --><p><a href="confluence-user://user?userkey=bar">one</a> <a href="confluence-page://page?content-id=7">two<!-- note --></a></p>"#,
+        );
+
+        assert!(
+            storage.starts_with(r#"<!-- <a href="confluence-user://user?userkey=foo"> --><p><ac:link><ri:user ri:userkey="bar" />"#),
+            "{storage}"
+        );
+        assert!(
+            storage.contains(r#"<ri:page ri:content-id="7" /><ac:link-body>two<!-- note --></ac:link-body></ac:link></p>"#),
+            "{storage}"
         );
     }
 
