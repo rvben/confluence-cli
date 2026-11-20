@@ -5222,6 +5222,29 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn macro_keeps_a_body_line_that_reads_as_the_end_of_its_parameters() {
+        let plain = |name: &str, parameters: &str, text: &str| {
+            format!(
+                r#"<ac:structured-macro ac:name="{name}">{parameters}<ac:plain-text-body><![CDATA[{text}]]></ac:plain-text-body></ac:structured-macro>"#
+            )
+        };
+        let title = r#"<ac:parameter ac:name="title">T</ac:parameter>"#;
+        for name in ["code", "noformat"] {
+            for text in ["a\n---\nb", "title: x\n---\nb", "\n---\nb", "---\n---\n---"] {
+                assert_keeps(&plain(name, "", text));
+                assert_keeps(&plain(name, title, text));
+            }
+        }
+        for name in ["excerpt", "toc-zone", "details"] {
+            for parameters in ["", r#"<ac:parameter ac:name="hidden">true</ac:parameter>"#] {
+                assert_keeps(&format!(
+                    r#"<ac:structured-macro ac:name="{name}">{parameters}<ac:rich-text-body><p>a</p><hr /><p>b</p></ac:rich-text-body></ac:structured-macro>"#
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");

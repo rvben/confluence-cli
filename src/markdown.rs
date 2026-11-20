@@ -2200,18 +2200,36 @@ fn collect_user_parameter_placeholders(parameter: Node<'_, '_>) -> Vec<String> {
         .collect()
 }
 
+/// The line that ends the parameter lines of a macro block.
+const MACRO_HEADER_END: &str = "---";
+
+/// The parameter lines that open the body of a macro block, with the line
+/// that ends them. A block without parameters has no such lines, unless its
+/// body holds a line that would be read as their end: an empty line and
+/// the ending line then say that there are none.
+fn macro_header(parameters: &BTreeMap<String, String>, body: &str) -> String {
+    let mut header = String::new();
+    for (name, value) in parameters {
+        header.push_str(&format!("{name}: {value}\n"));
+    }
+    if !parameters.is_empty() {
+        header.push_str(MACRO_HEADER_END);
+        header.push('\n');
+    } else if body.lines().skip(1).any(|line| line == MACRO_HEADER_END) {
+        header.push('\n');
+        header.push_str(MACRO_HEADER_END);
+        header.push('\n');
+    }
+    header
+}
+
 fn render_rich_text_macro_block(
     name: &str,
     parameters: &BTreeMap<String, String>,
     body_markdown: &str,
 ) -> String {
     let mut markdown = format!(":::confluence-{name}\n");
-    if !parameters.is_empty() {
-        for (parameter, value) in parameters {
-            markdown.push_str(&format!("{parameter}: {value}\n"));
-        }
-        markdown.push_str("---\n");
-    }
+    markdown.push_str(&macro_header(parameters, body_markdown.trim()));
     if !body_markdown.trim().is_empty() {
         markdown.push_str(body_markdown.trim());
         markdown.push('\n');
@@ -2232,12 +2250,7 @@ fn render_code_macro_block(node: Node<'_, '_>) -> Option<String> {
         Some(language) => format!("~~~confluence-code {language}\n"),
         None => "~~~confluence-code\n".to_string(),
     };
-    if !parameters.is_empty() {
-        for (name, value) in parameters {
-            markdown.push_str(&format!("{name}: {value}\n"));
-        }
-        markdown.push_str("---\n");
-    }
+    markdown.push_str(&macro_header(&parameters, code));
     markdown.push_str(code);
     if !code.is_empty() {
         markdown.push('\n');
@@ -2252,12 +2265,7 @@ fn render_noformat_macro_block(node: Node<'_, '_>) -> Option<String> {
     let parameters = collect_macro_parameters(node);
 
     let mut markdown = "~~~confluence-noformat\n".to_string();
-    if !parameters.is_empty() {
-        for (name, value) in parameters {
-            markdown.push_str(&format!("{name}: {value}\n"));
-        }
-        markdown.push_str("---\n");
-    }
+    markdown.push_str(&macro_header(&parameters, text));
     markdown.push_str(text);
     if !text.is_empty() {
         markdown.push('\n');
