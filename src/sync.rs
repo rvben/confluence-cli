@@ -2321,8 +2321,9 @@ fn unnamed_mention_user(target: &str) -> Option<UserReference> {
 /// a link counts: the same characters in code or in a raw block are text of
 /// the page. The cells of a layout section hold Markdown of their own.
 fn user_mention_links(markdown: &str) -> Vec<(std::ops::Range<usize>, &str)> {
+    let blocks = crate::markdown::block_markdown(markdown);
     let mut raw = raw_markup_ranges(markdown);
-    raw.extend(macro_parameter_ranges(markdown));
+    raw.extend(blocks.iter().map(|block| block.range.clone()));
     let mut links = Vec::new();
     for (event, range) in
         pulldown_cmark::Parser::new_ext(markdown, crate::markdown::markdown_options())
@@ -2346,82 +2347,18 @@ fn user_mention_links(markdown: &str) -> Vec<(std::ops::Range<usize>, &str)> {
                     &markdown[range.start + target.start()..range.start + target.end()],
                 ));
             }
-            pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(
-                pulldown_cmark::CodeBlockKind::Fenced(info),
-            )) if info.starts_with("confluence-layout-section") => {
-                for cell in layout_cell_ranges(markdown, range) {
-                    links.extend(user_mention_links(&markdown[cell.clone()]).into_iter().map(
-                        |(link, target)| (cell.start + link.start..cell.start + link.end, target),
-                    ));
-                }
-            }
             _ => {}
         }
     }
+    for body in blocks.iter().flat_map(|block| &block.bodies) {
+        links.extend(
+            user_mention_links(&markdown[body.clone()])
+                .into_iter()
+                .map(|(link, target)| (body.start + link.start..body.start + link.end, target)),
+        );
+    }
+    links.sort_by_key(|(link, _)| link.start);
     links
-}
-
-/// The ranges of the parameter lines of the macro blocks in pulled Markdown:
-/// from the line that opens a block to the line that starts its body or
-/// closes it. A parameter value is text of the macro, whatever it reads as.
-fn macro_parameter_ranges(markdown: &str) -> Vec<std::ops::Range<usize>> {
-    const OPENER: &str = ":::confluence-macro ";
-    if !markdown.contains(OPENER) {
-        return Vec::new();
-    }
-    // A line of a code block is code, whatever it reads as.
-    let code_blocks: Vec<_> =
-        pulldown_cmark::Parser::new_ext(markdown, crate::markdown::markdown_options())
-            .into_offset_iter()
-            .filter(|(event, _)| {
-                matches!(
-                    event,
-                    pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))
-                )
-            })
-            .map(|(_, range)| range)
-            .collect();
-    let mut ranges = Vec::new();
-    let mut parameters_start = None;
-    let mut offset = 0;
-    for line in markdown.split_inclusive('\n') {
-        match parameters_start {
-            Some(start) if matches!(line.trim(), "---" | ":::") => {
-                ranges.push(start..offset);
-                parameters_start = None;
-            }
-            None if line.trim_start().starts_with(OPENER)
-                && !code_blocks.iter().any(|block| block.contains(&offset)) =>
-            {
-                parameters_start = Some(offset + line.len());
-            }
-            _ => {}
-        }
-        offset += line.len();
-    }
-    ranges.extend(parameters_start.map(|start| start..markdown.len()));
-    ranges
-}
-
-/// The ranges of the cell bodies of the layout section written at `section`.
-fn layout_cell_ranges(
-    markdown: &str,
-    section: std::ops::Range<usize>,
-) -> Vec<std::ops::Range<usize>> {
-    let mut cells = Vec::new();
-    let mut cell_start = None;
-    let mut offset = section.start;
-    for line in markdown[section].split_inclusive('\n') {
-        let ends_cell = matches!(line.trim_end(), "--- cell ---" | "~~~~");
-        if ends_cell && let Some(start) = cell_start.take() {
-            cells.push(start..offset);
-        }
-        offset += line.len();
-        if line.trim_end() == "--- cell ---" {
-            cell_start = Some(offset);
-        }
-    }
-    cells
 }
 
 /// The users mentioned in pulled Markdown whose mention shows an identifier.
@@ -4866,6 +4803,69 @@ mod round_trip_tests {
         assert!(named.contains(&format!("title: {mention}\n")), "{named}");
         assert!(named.contains(&format!("note: {mention}\n")), "{named}");
         assert_eq!(named.matches("[@Jane Doe](").count(), 2, "{named}");
+    }
+
+    #[test]
+    fn mention_is_given_a_name_only_where_a_block_holds_markdown() {
+        let user = UserReference::AccountId("abc".to_string());
+        let mention = "[abc](confluence-user://user?account-id=abc&label=generated)";
+        for (markdown, in_markdown) in [
+            (
+                format!(":::confluence-expand {mention}\nask {mention}\n:::\n"),
+                1,
+            ),
+            (
+                format!(":::confluence-toc\ninclude: {mention}\n:::\n\nask {mention}\n"),
+                1,
+            ),
+            (format!(":::confluence-excerpt\nask {mention}\n:::\n"), 1),
+            (
+                format!(":::confluence-excerpt\nname: {mention}\n---\nask {mention}\n:::\n"),
+                1,
+            ),
+            (format!(":::confluence-search\nquery: {mention}\n:::\n"), 0),
+            (
+                format!(":::confluence-macro custom\n---\nask {mention}\n:::\n"),
+                1,
+            ),
+            (
+                format!(
+                    ":::confluence-info\n:::confluence-macro custom\ntitle: {mention}\n---\nask {mention}\n:::\n:::\n"
+                ),
+                1,
+            ),
+            (
+                format!(
+                    "~~~~~confluence-layout-section single\n--- cell ---\nfirst {mention}\n\n~~~~\ncode\n~~~~\n\nlast {mention}\n~~~~~\n"
+                ),
+                2,
+            ),
+            (
+                format!(
+                    "~~~~confluence-layout-section single\n--- cell ---\n```\n--- cell ---\n{mention}\n```\n\nask {mention}\n~~~~\n"
+                ),
+                1,
+            ),
+            (
+                format!("~~~confluence-code\ntitle: {mention}\n---\n{mention}\n~~~\n"),
+                0,
+            ),
+        ] {
+            apply_storage(&markdown).unwrap_or_else(|error| panic!("{error:#}\n{markdown}"));
+            let named = name_user_mentions(&markdown, &named(user.clone(), "Jane Doe"));
+            assert_eq!(
+                named.matches("[@Jane Doe](").count(),
+                in_markdown,
+                "{named}"
+            );
+            assert_eq!(
+                named.matches("ask [@Jane Doe](").count()
+                    + named.matches("first [@Jane Doe](").count()
+                    + named.matches("last [@Jane Doe](").count(),
+                in_markdown,
+                "{named}"
+            );
+        }
     }
 
     #[test]

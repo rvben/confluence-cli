@@ -4179,6 +4179,67 @@ fn confluence_blocks(markdown: &str) -> Result<Vec<ConfluenceBlock<'_>>> {
     Ok(blocks)
 }
 
+/// A Confluence block of a Markdown document and the parts of it that hold
+/// Markdown of their own: the body of a macro with a rich text body and the
+/// cells of a layout section. The rest of a block is text of the macro,
+/// whatever it reads as.
+pub(crate) struct BlockMarkdown {
+    /// The lines of the block.
+    pub(crate) range: Range<usize>,
+    pub(crate) bodies: Vec<Range<usize>>,
+}
+
+/// The outermost Confluence blocks of a Markdown document, as apply reads
+/// them. A document with a block that is not closed has none: apply refuses
+/// it.
+pub(crate) fn block_markdown(markdown: &str) -> Vec<BlockMarkdown> {
+    let Ok(blocks) = confluence_blocks(markdown) else {
+        return Vec::new();
+    };
+    let range_of = |part: &str| {
+        let start = part.as_ptr() as usize - markdown.as_ptr() as usize;
+        start..start + part.len()
+    };
+    blocks
+        .iter()
+        .map(|block| {
+            let body = block.body(markdown);
+            let bodies = match block.kind {
+                BlockKind::Colon(colon) => colon_macro_markdown(colon, body).into_iter().collect(),
+                BlockKind::LayoutSection(_) => layout_section_parts(body).1,
+                BlockKind::Code(_) | BlockKind::Noformat => Vec::new(),
+            };
+            BlockMarkdown {
+                range: block.range.clone(),
+                bodies: bodies.into_iter().map(range_of).collect(),
+            }
+        })
+        .collect()
+}
+
+/// The built-in macros whose block is parameter lines, a `---` line and a
+/// Markdown body, or a Markdown body alone.
+const RICH_TEXT_BUILT_INS: &[&str] = &["excerpt", "content-properties", "toc-zone"];
+
+/// The built-in macros whose block is read like that of any other macro:
+/// parameter lines, with a Markdown body only after a `---` line.
+const GENERIC_BUILT_INS: &[&str] = &["search", "navmap"];
+
+/// The Markdown body of a `:::` block, when it has one.
+fn colon_macro_markdown<'m>(colon: ColonMacro<'_>, body: &'m str) -> Option<&'m str> {
+    match colon {
+        ColonMacro::Panel(_) | ColonMacro::Expand(_) => Some(body),
+        ColonMacro::BuiltIn(name) if RICH_TEXT_BUILT_INS.contains(&name) => {
+            Some(split_rich_text_macro_block(body).1)
+        }
+        ColonMacro::BuiltIn(name) if GENERIC_BUILT_INS.contains(&name) => {
+            split_generic_macro_block(body).1
+        }
+        ColonMacro::BuiltIn(_) => None,
+        ColonMacro::Generic(_) => split_generic_macro_block(body).1,
+    }
+}
+
 /// Takes the Confluence blocks out of a Markdown document, each replaced by
 /// a line holding the placeholder of its storage.
 fn replace_confluence_blocks(
@@ -4489,16 +4550,35 @@ fn parse_rich_text_macro_block(
     block_body: &str,
     allow_lossy: bool,
 ) -> Result<(BTreeMap<String, String>, String)> {
+    let (header, body_markdown) = split_rich_text_macro_block(block_body);
+    let parameters = match header {
+        Some(header) => parse_macro_parameter_lines(header, context)?,
+        None => BTreeMap::new(),
+    };
+    let body_storage = render_markdown_storage(body_markdown, allow_lossy)?.storage;
+    Ok((parameters, body_storage))
+}
+
+/// The parameter lines and the Markdown body of a block that always has a
+/// body. Without a `---` line the whole block is the body.
+fn split_rich_text_macro_block(block_body: &str) -> (Option<&str>, &str) {
     let trimmed_body = block_body.trim_end_matches('\n');
-    if let Some((header, body_markdown)) = trimmed_body.split_once("\n---\n") {
-        let parameters = parse_macro_parameter_lines(header, context)?;
-        let body_storage = render_markdown_storage(body_markdown, allow_lossy)?.storage;
-        Ok((parameters, body_storage))
-    } else {
-        Ok((
-            BTreeMap::new(),
-            render_markdown_storage(trimmed_body, allow_lossy)?.storage,
-        ))
+    match trimmed_body.split_once("\n---\n") {
+        Some((header, body_markdown)) => (Some(header), body_markdown),
+        None => (None, trimmed_body),
+    }
+}
+
+/// The parameter lines and the Markdown body of a block that has a body
+/// only after a `---` line.
+fn split_generic_macro_block(block_body: &str) -> (&str, Option<&str>) {
+    let trimmed_body = block_body.trim_end_matches('\n');
+    if let Some(body_markdown) = trimmed_body.strip_prefix("---\n") {
+        return ("", Some(body_markdown));
+    }
+    match trimmed_body.split_once("\n---\n") {
+        Some((header, body_markdown)) => (header, Some(body_markdown)),
+        None => (trimmed_body, None),
     }
 }
 
@@ -4507,19 +4587,13 @@ fn parse_generic_macro_block(
     block_body: &str,
     allow_lossy: bool,
 ) -> Result<(BTreeMap<String, String>, Option<String>)> {
-    let trimmed_body = block_body.trim_end_matches('\n');
-    if let Some(body_markdown) = trimmed_body.strip_prefix("---\n") {
-        let body_storage = render_markdown_storage(body_markdown, allow_lossy)?.storage;
-        return Ok((BTreeMap::new(), Some(body_storage)));
-    }
-    if let Some((header, body_markdown)) = trimmed_body.split_once("\n---\n") {
-        let parameters = parse_macro_parameter_lines(header, context)?;
-        let body_storage = render_markdown_storage(body_markdown, allow_lossy)?.storage;
-        return Ok((parameters, Some(body_storage)));
-    }
-
-    let parameters = parse_macro_parameter_lines(trimmed_body, context)?;
-    Ok((parameters, None))
+    let (header, body_markdown) = split_generic_macro_block(block_body);
+    let parameters = parse_macro_parameter_lines(header, context)?;
+    let body_storage = body_markdown
+        .map(|body_markdown| render_markdown_storage(body_markdown, allow_lossy))
+        .transpose()?
+        .map(|rendered| rendered.storage);
+    Ok((parameters, body_storage))
 }
 
 fn parse_macro_parameter_lines(body: &str, context: &str) -> Result<BTreeMap<String, String>> {
@@ -4572,18 +4646,19 @@ fn layout_section_storage(section_type: &str, body: &str, allow_lossy: bool) -> 
 /// The line that starts a cell of a layout section.
 const LAYOUT_CELL_LINE: &str = "--- cell ---";
 
-fn parse_layout_section_body(body: &str) -> Result<(BTreeMap<String, String>, Vec<String>)> {
-    let lines: Vec<&str> = body.lines().collect();
-    let mut metadata = BTreeMap::new();
+/// The metadata lines of a layout section body and the Markdown of each of
+/// its cells: the lines before the first cell line, and the lines after
+/// each cell line.
+fn layout_section_parts(body: &str) -> (Vec<&str>, Vec<&str>) {
+    let lines: Vec<&str> = body.split_inclusive('\n').collect();
+    let mut metadata = Vec::new();
     let mut cells = Vec::new();
-    let mut current_cell = Vec::new();
-    let mut saw_cell = false;
-    let whole_lines: Vec<&str> = body.split_inclusive('\n').collect();
-    let literal = lines_as_written(body, &line_starts(&whole_lines)).literal;
+    let mut cell_start = None;
+    let literal = lines_as_written(body, &line_starts(&lines)).literal;
     // The line after the code block or raw markup being read, whose lines
     // belong to the cell, whatever they read as.
     let mut literal_until = 0;
-
+    let mut offset = 0;
     for (index, line) in lines.iter().enumerate() {
         if index >= literal_until
             && let Some(end) = literal[index]
@@ -4591,39 +4666,48 @@ fn parse_layout_section_body(body: &str) -> Result<(BTreeMap<String, String>, Ve
             literal_until = end;
         }
         if index >= literal_until && line.trim_end() == LAYOUT_CELL_LINE {
-            if saw_cell {
-                cells.push(current_cell.join("\n").trim_end().to_string());
-                current_cell.clear();
-            } else {
-                saw_cell = true;
+            if let Some(start) = cell_start {
+                cells.push(&body[start..offset]);
             }
-            continue;
+            cell_start = Some(offset + line.len());
+        } else if cell_start.is_none() {
+            metadata.push(*line);
         }
-
-        if !saw_cell {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let Some((name, value)) = trimmed.split_once(':') else {
-                bail!("invalid confluence layout metadata line: {trimmed}");
-            };
-            let name = name.trim();
-            if name != "breakout-mode" {
-                bail!("unsupported confluence layout metadata key: {name}");
-            }
-            metadata.insert(name.to_string(), value.trim().to_string());
-            continue;
-        }
-
-        current_cell.push(*line);
+        offset += line.len();
     }
+    if let Some(start) = cell_start {
+        cells.push(&body[start..]);
+    }
+    (metadata, cells)
+}
 
-    if !saw_cell {
+fn parse_layout_section_body(body: &str) -> Result<(BTreeMap<String, String>, Vec<String>)> {
+    let (metadata_lines, cells) = layout_section_parts(body);
+    let mut metadata = BTreeMap::new();
+    for line in metadata_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = trimmed.split_once(':') else {
+            bail!("invalid confluence layout metadata line: {trimmed}");
+        };
+        let name = name.trim();
+        if name != "breakout-mode" {
+            bail!("unsupported confluence layout metadata key: {name}");
+        }
+        metadata.insert(name.to_string(), value.trim().to_string());
+    }
+    if cells.is_empty() {
         bail!("confluence layout section is missing `--- cell ---` delimiters");
     }
-
-    cells.push(current_cell.join("\n").trim_end().to_string());
+    let cells = cells
+        .into_iter()
+        .map(|cell| {
+            let lines: Vec<&str> = cell.lines().collect();
+            lines.join("\n").trim_end().to_string()
+        })
+        .collect();
     Ok((metadata, cells))
 }
 
@@ -5500,6 +5584,22 @@ mod tests {
             .expect_err("Markdown that does not convert")
             .downcast::<crate::output::CliError>()
             .expect("conversion error")
+    }
+
+    #[test]
+    fn built_in_macro_has_a_markdown_body_exactly_where_apply_reads_one() {
+        for name in BUILT_IN_COLON_MACROS {
+            let block = format!(":::confluence-{name}\nname: x\n---\n**body**\n:::\n");
+            let reads_markdown = render_markdown_storage(&block, false)
+                .is_ok_and(|rendered| rendered.storage.contains("<strong>body</strong>"));
+            let bodies: Vec<_> = block_markdown(&block)
+                .into_iter()
+                .flat_map(|found| found.bodies)
+                .map(|body| &block[body])
+                .collect();
+            let expected: &[&str] = if reads_markdown { &["**body**"] } else { &[] };
+            assert_eq!(bodies, expected, "{name}");
+        }
     }
 
     #[test]
