@@ -1759,7 +1759,11 @@ fn render_supported_macro_block(node: Node<'_, '_>, source: &str) -> Option<Stri
     if name == "status" {
         return render_status_macro(node);
     }
-    if matches!(name, "info" | "note" | "tip" | "warning") {
+    // The short form of a panel has no place for a title or an icon
+    // setting, so a panel with parameters is written in the general form.
+    if matches!(name, "info" | "note" | "tip" | "warning")
+        && collect_macro_parameters(node).is_empty()
+    {
         let body = namespaced_child(node, AC_NS, "rich-text-body")?;
         let body_markdown = storage_to_markdown(&inner_xml_fragment(body, source));
         if body_markdown.trim().is_empty() {

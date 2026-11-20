@@ -5201,6 +5201,27 @@ mod round_trip_tests {
     }
 
     #[test]
+    fn panel_keeps_its_title_and_icon_setting() {
+        for parameters in [
+            r#"<ac:parameter ac:name="title">Heads up</ac:parameter>"#,
+            r#"<ac:parameter ac:name="icon">false</ac:parameter>"#,
+            r#"<ac:parameter ac:name="icon">false</ac:parameter><ac:parameter ac:name="title">Heads up</ac:parameter>"#,
+        ] {
+            for name in ["info", "note", "tip", "warning"] {
+                assert_keeps(&format!(
+                    r#"<ac:structured-macro ac:name="{name}">{parameters}<ac:rich-text-body><p>b</p></ac:rich-text-body></ac:structured-macro><p>after</p>"#
+                ));
+            }
+        }
+        assert_eq!(
+            storage_to_markdown(
+                r#"<ac:structured-macro ac:name="info"><ac:parameter ac:name="title">Heads up</ac:parameter><ac:rich-text-body><p>b</p></ac:rich-text-body></ac:structured-macro>"#
+            ),
+            ":::confluence-macro info\ntitle: Heads up\n---\nb\n:::"
+        );
+    }
+
+    #[test]
     fn emphasis_keeps_white_space_at_its_edges() {
         assert_round_trips("<p>a <em>lead </em>b</p>");
         assert_round_trips("<p>a<strong> trail</strong> b</p>");
