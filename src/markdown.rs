@@ -636,7 +636,9 @@ fn hold_empty_task_bodies(markdown: &str, fragments: &mut StorageFragments) -> S
 }
 
 /// Parses Markdown and swaps every `confluence-storage` code block for a
-/// placeholder, adding the storage it holds to `fragments`.
+/// placeholder, adding the storage it holds to `fragments`. A numbered
+/// list holds no tasks, so the checkbox of one of its items is the text of
+/// that item, as written.
 ///
 /// The parser decides what a fenced block is, so a fence inside a block quote
 /// or a list item comes without its container's markers, and one shown inside
@@ -648,6 +650,8 @@ fn parse_with_storage_fences<'a>(
     let mut events = Vec::new();
     // The events and source of the storage block being read.
     let mut open: Option<(Vec<Event<'a>>, &'a str)> = None;
+    // Whether each of the lists being read is a numbered one.
+    let mut lists = Vec::new();
     for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
         match (event, &mut open) {
             (Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))), None)
@@ -676,7 +680,19 @@ fn parse_with_storage_fences<'a>(
                 open = None;
             }
             (event, Some((block, _))) => block.push(event),
-            (event, None) => events.push(event),
+            (Event::TaskListMarker(_), None) if lists.last() == Some(&true) => {
+                events.push(Event::Text(format!("{} ", &markdown[range]).into()));
+            }
+            (event, None) => {
+                match &event {
+                    Event::Start(Tag::List(first_number)) => lists.push(first_number.is_some()),
+                    Event::End(TagEnd::List(_)) => {
+                        lists.pop();
+                    }
+                    _ => {}
+                }
+                events.push(event);
+            }
         }
     }
     events
@@ -5472,7 +5488,7 @@ fn wrap_cdata(value: &str) -> String {
 /// The events of Markdown with the tasks of its bulleted lists written as
 /// Confluence task lists. A task list holds tasks only, so a list that
 /// also holds plain items becomes task lists and lists, each item where it
-/// stands.
+/// stands. A task list has no numbers, so a numbered list stays one.
 fn with_task_lists<'a>(events: &[Event<'a>], task_body: &TaskBody) -> Vec<Event<'a>> {
     let mut output = Vec::with_capacity(events.len());
     let mut at = 0;
@@ -8455,6 +8471,29 @@ SELECT ']]>' AS sentinel;
         assert_eq!(
             storage_of("- [x] done\n\n- [ ] open\n"),
             format!("<ac:task-list>{done}{open}</ac:task-list>")
+        );
+    }
+
+    #[test]
+    fn checkbox_in_a_numbered_list_keeps_the_letter_it_is_written_with() {
+        assert_eq!(
+            storage_of("1. [X] done\n2. [x] low\n3. [ ] open\n"),
+            "<ol>\n<li>[X] done</li>\n<li>[x] low</li>\n<li>[ ] open</li>\n</ol>"
+        );
+    }
+
+    #[test]
+    fn checkbox_in_a_numbered_list_is_the_text_of_its_item() {
+        // A task list has no numbers, and a page holds no checkbox inputs.
+        assert_eq!(
+            storage_of("1. [x] done\n2. [ ] open\n3. plain\n"),
+            "<ol>\n<li>[x] done</li>\n<li>[ ] open</li>\n<li>plain</li>\n</ol>"
+        );
+        let pulled = storage_to_markdown("<ol><li>[x] done</li><li>[ ] open</li></ol>");
+        assert_eq!(
+            storage_of(&pulled),
+            "<ol>\n<li>[x] done</li>\n<li>[ ] open</li>\n</ol>",
+            "pulled as {pulled:?}"
         );
     }
 
