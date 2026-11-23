@@ -656,6 +656,82 @@ async fn pull_marks_a_page_that_markdown_does_not_carry_until_an_update_rewrites
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_checkout_with_old_sidecar_cannot_publish_twice() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let cfg = simulated_data_center_config(&simulator, &config_home);
+    let page_id = simulator.add_page("CI guide", None, "<p>Initial body</p>");
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().expect("clean checkouts");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        cfg.run_json(&["pull", "page", &page_id, first.to_str().unwrap()]);
+        let first_index = find_index_md(&first);
+        let original = fs::read_to_string(&first_index).unwrap();
+        let second_page = second.join(first_index.parent().unwrap().file_name().unwrap());
+        fs::create_dir_all(&second_page).unwrap();
+        fs::copy(
+            first_index.with_file_name(".confluence.json"),
+            second_page.join(".confluence.json"),
+        )
+        .unwrap();
+        fs::write(
+            &first_index,
+            original.replace("Initial body", "First publish"),
+        )
+        .unwrap();
+        fs::write(
+            second_page.join("index.md"),
+            original.replace("Initial body", "Second publish"),
+        )
+        .unwrap();
+
+        cfg.run(&["label", "add", &page_id, "changed-in-confluence"]);
+        let preview = cfg
+            .command()
+            .args([
+                "plan",
+                first.to_str().unwrap(),
+                "--check-remote",
+                "-o",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(preview.status.code(), Some(7), "{preview:?}");
+        assert!(
+            String::from_utf8_lossy(&preview.stderr).contains("remote metadata drift"),
+            "{preview:?}"
+        );
+        cfg.run(&[
+            "--yes",
+            "label",
+            "remove",
+            &page_id,
+            "changed-in-confluence",
+        ]);
+        cfg.run_json(&["plan", first.to_str().unwrap(), "--check-remote"]);
+
+        cfg.run_json(&["apply", first.to_str().unwrap()]);
+        let output = cfg
+            .command()
+            .args(["apply", second.to_str().unwrap(), "-o", "json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7), "{output:?}");
+        let remote = cfg.run_json(&["page", "get", &page_id, "--show-body"]);
+        assert_eq!(
+            first_item(&remote, "page get")["body_storage"],
+            "<p>First publish</p>"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plan_and_apply_resolve_pulled_links_for_equivalent_paths() {
     let simulator = ConfluenceSimulator::start().await;
     let config_home = TempDir::new().expect("simulator config home");
@@ -1048,6 +1124,319 @@ async fn pull_writes_the_rest_of_a_tree_when_a_page_does_not_convert() {
     .expect("simulated pull task");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_ci_state_publishes_from_clean_checkouts_and_preserves_remote_edits() {
+    test_ci_state(simulated_cloud_config).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_center_ci_state_publishes_from_clean_checkouts_and_preserves_remote_edits() {
+    test_ci_state(simulated_data_center_config).await;
+}
+
+async fn test_ci_state(config: fn(&ConfluenceSimulator, &TempDir) -> E2eConfig) {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let cfg = config(&simulator, &config_home);
+    let page_id = simulator.add_page("CI guide", None, "<p>Initial body</p>");
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().unwrap();
+        let seed = temp.path().join("seed");
+        let state = temp.path().join("production.json");
+        let state_arg = state.to_str().unwrap();
+        cfg.run_json(&["pull", "page", &page_id, seed.to_str().unwrap()]);
+        let seed_index = find_index_md(&seed);
+        let page_dir = seed_index.parent().unwrap().file_name().unwrap();
+        let original = fs::read_to_string(&seed_index).unwrap();
+        let original_sidecar = fs::read(seed_index.with_file_name(".confluence.json")).unwrap();
+        let checkout = |name: &str, body: &str| {
+            let root = temp.path().join(name);
+            let doc = root.join(page_dir);
+            fs::create_dir_all(&doc).unwrap();
+            fs::write(doc.join(".confluence.json"), &original_sidecar).unwrap();
+            fs::write(doc.join("index.md"), original.replace("Initial body", body)).unwrap();
+            let new_page = doc.join("faq");
+            fs::create_dir(&new_page).unwrap();
+            fs::write(
+                new_page.join("index.md"),
+                "---\ntitle: FAQ\ntype: page\nproperties:\n  space_key: TEST\n---\n\nFAQ body\n",
+            )
+            .unwrap();
+            root
+        };
+        let first = checkout("first", "First publish");
+        let first_arg = first.to_str().unwrap();
+        let second = checkout("second", "Second publish");
+        let second_arg = second.to_str().unwrap();
+        let third = checkout("third", "Third publish");
+        let third_arg = third.to_str().unwrap();
+
+        let run = |args: &[&str]| cfg.command().args(args).output().unwrap();
+        let remote = || cfg.run_json(&["page", "get", &page_id, "--show-body"]);
+        let missing = run(&["apply", first_arg, "--state-file", state_arg]);
+        assert!(!missing.status.success(), "{missing:?}");
+        assert_eq!(first_item(&remote(), "page")["version"], 1);
+        let first_apply = cfg.run_json(&[
+            "apply",
+            first_arg,
+            "--state-file",
+            state_arg,
+            "--init-state",
+        ]);
+        let created = list_items(&first_apply, "apply")
+            .iter()
+            .find(|item| item["action"] == "create_content")
+            .expect("new CI page");
+        let faq_id = string_field(created, "content_id");
+        let before_preview = fs::read(&state).unwrap();
+        let lock_path = temp.path().join("production.json.lock");
+        let reserved = run(&[
+            "apply",
+            first_arg,
+            "--state-file",
+            lock_path.to_str().unwrap(),
+            "--init-state",
+        ]);
+        assert!(!reserved.status.success(), "{reserved:?}");
+        assert!(
+            String::from_utf8_lossy(&reserved.stderr).contains("reserved for publish state locks")
+        );
+
+        let preview = cfg
+            .command()
+            .current_dir(temp.path())
+            .env("CONFLUENCE_READ_ONLY", "true")
+            .args([
+                "plan",
+                "./second",
+                "--check-remote",
+                "--diff",
+                "--state-file",
+                state_arg,
+                "-o",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert!(preview.status.success(), "{preview:?}");
+        let plan: Value = serde_json::from_slice(&preview.stdout).unwrap();
+        let items = list_items(&plan, "plan");
+        assert_eq!(items.len(), 1, "{plan}");
+        assert_eq!(items[0]["action"], "update_content");
+        let diff = string_field(&items[0], "diff");
+        assert!(
+            diff.contains("-First publish") && diff.contains("+Second publish"),
+            "{diff}"
+        );
+        assert_eq!(fs::read(&state).unwrap(), before_preview);
+        assert_eq!(
+            fs::read(second.join(page_dir).join(".confluence.json")).unwrap(),
+            original_sidecar
+        );
+        assert!(!second.join(page_dir).join("faq/.confluence.json").exists());
+        assert_eq!(first_item(&remote(), "page")["version"], 2);
+
+        let lock = fs::OpenOptions::new().write(true).open(lock_path).unwrap();
+        lock.try_lock().unwrap();
+        let concurrent = run(&["apply", second_arg, "--state-file", state_arg, "-o", "json"]);
+        assert!(!concurrent.status.success(), "{concurrent:?}");
+        assert!(String::from_utf8_lossy(&concurrent.stderr).contains("cannot lock publish state"));
+        assert_eq!(first_item(&remote(), "page")["version"], 2);
+        drop(lock);
+
+        let second_apply = cfg.run_json(&["apply", second_arg, "--state-file", state_arg]);
+        let items = list_items(&second_apply, "apply");
+        assert_eq!(items.len(), 1, "{second_apply}");
+        assert_eq!(items[0]["content_id"], page_id);
+        assert_eq!(
+            first_item(&remote(), "page")["body_storage"],
+            "<p>Second publish</p>"
+        );
+        assert_eq!(first_item(&remote(), "page")["version"], 3);
+        let faq = cfg.run_json(&["page", "get", faq_id, "--show-body"]);
+        assert_eq!(first_item(&faq, "page")["parent_id"], page_id);
+        assert_eq!(first_item(&faq, "page")["version"], 1);
+        let deployed_state = fs::read(&state).unwrap();
+
+        let sidecar = third.join(page_dir).join(".confluence.json");
+        let mut foreign: Value = serde_json::from_slice(&original_sidecar).unwrap();
+        foreign["site_fingerprint"] = serde_json::json!("different-site");
+        fs::write(&sidecar, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        let wrong_site = run(&["plan", third_arg, "--state-file", state_arg, "-o", "json"]);
+        assert!(!wrong_site.status.success(), "{wrong_site:?}");
+        assert!(String::from_utf8_lossy(&wrong_site.stderr).contains("different Confluence site"));
+        fs::write(&sidecar, &original_sidecar).unwrap();
+
+        cfg.run_json(&[
+            "page",
+            "update",
+            &page_id,
+            "--format",
+            "storage",
+            "--body",
+            "<p>Independent edit</p>",
+        ]);
+        let offline = cfg.run_json(&["plan", third_arg, "--state-file", state_arg]);
+        assert_eq!(list_items(&offline, "plan")[0]["action"], "update_content");
+        for args in [
+            vec![
+                "plan",
+                third_arg,
+                "--check-remote",
+                "--state-file",
+                state_arg,
+                "-o",
+                "json",
+            ],
+            vec!["apply", third_arg, "--state-file", state_arg, "-o", "json"],
+        ] {
+            let rejected = run(&args);
+            assert_eq!(rejected.status.code(), Some(7), "{args:?}: {rejected:?}");
+            let error: Value = serde_json::from_slice(&rejected.stderr).unwrap();
+            assert_eq!(error["error"]["kind"], "conflict");
+            assert!(string_field(&error["error"], "message").contains("remote version drift"));
+        }
+        assert_eq!(fs::read(&state).unwrap(), deployed_state);
+        assert_eq!(
+            first_item(&remote(), "page")["body_storage"],
+            "<p>Independent edit</p>"
+        );
+        assert_eq!(first_item(&remote(), "page")["version"], 4);
+
+        let reconciled = temp.path().join("reconciled");
+        let reconciled_arg = reconciled.to_str().unwrap();
+        let replacement = temp.path().join("replacement.json");
+        let replacement_arg = replacement.to_str().unwrap();
+        cfg.run_json(&["pull", "tree", &page_id, reconciled_arg]);
+        let recovered_faq = find_index_md_by_title(&reconciled, "FAQ");
+        let root_index = find_index_md_by_title(&reconciled, "CI guide");
+        fs::rename(
+            recovered_faq.parent().unwrap(),
+            root_index.with_file_name("faq"),
+        )
+        .unwrap();
+        let markdown = fs::read_to_string(&root_index).unwrap();
+        assert!(markdown.contains("Independent edit"), "{markdown}");
+        fs::write(
+            &root_index,
+            markdown.replace(
+                "Independent edit",
+                "Independent edit and reconciled changes",
+            ),
+        )
+        .unwrap();
+        cfg.run_json(&["plan", reconciled_arg, "--check-remote"]);
+        let applied = cfg.run_json(&[
+            "apply",
+            reconciled_arg,
+            "--state-file",
+            replacement_arg,
+            "--init-state",
+        ]);
+        let items = list_items(&applied, "apply");
+        assert_eq!(items.len(), 1, "{applied}");
+        assert_eq!(items[0]["content_id"], page_id);
+        assert_eq!(
+            first_item(&remote(), "page")["body_storage"],
+            "<p>Independent edit and reconciled changes</p>"
+        );
+        assert_eq!(fs::read(&state).unwrap(), deployed_state);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_pulls_produce_stable_sidecars_and_read_legacy_timestamps() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().unwrap();
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    let page_id = simulator.add_page("Stable snapshot", None, "<p>Original body</p>");
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().unwrap();
+        let tree = temp.path().join("tree");
+        let path = tree.to_str().unwrap();
+        cfg.run_json(&["pull", "page", &page_id, path]);
+        let sidecar = find_index_md(&tree).with_file_name(".confluence.json");
+        let first = fs::read(&sidecar).unwrap();
+        let mut legacy: Value = serde_json::from_slice(&first).unwrap();
+        assert!(legacy.get("last_sync_at").is_none());
+        legacy["last_sync_at"] = serde_json::json!("2025-01-01T00:00:00Z");
+        fs::write(&sidecar, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let preview = cfg.run_json(&["plan", path]);
+        assert_eq!(list_items(&preview, "plan")[0]["action"], "noop");
+        cfg.run_json(&["pull", "page", &page_id, path, "--force"]);
+        assert_eq!(fs::read(sidecar).unwrap(), first);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ci_state_blocks_retry_when_create_succeeds_but_response_fails() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().unwrap();
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    simulator.fail_cloud_create_response_after(1);
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().unwrap();
+        let tree = temp.path().join("tree");
+        let state = temp.path().join("deploy.json");
+        let path = tree.to_str().unwrap();
+        let state_arg = state.to_str().unwrap();
+        let child = tree.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(
+            tree.join("index.md"),
+            "---\ntitle: Confirmed create\ntype: page\nproperties:\n  space_key: TEST\n---\n\nBody\n",
+        ).unwrap();
+        fs::write(
+            child.join("index.md"),
+            "---\ntitle: Uncertain create\ntype: page\nproperties:\n  space_key: TEST\n---\n\nBody\n",
+        ).unwrap();
+        let publish = cfg.command()
+            .args(["apply", path, "--state-file", state_arg, "--init-state", "-o", "json"])
+            .output().unwrap();
+        assert!(!publish.status.success(), "{publish:?}");
+        assert!(!child.join(".confluence.json").exists());
+        let baseline = fs::read(&state).unwrap();
+        let pending: Value = serde_json::from_slice(&baseline).unwrap();
+        let confirmed = cfg.run_json(&["search", "Confirmed create"]);
+        let confirmed = list_items(&confirmed, "search").iter()
+            .find(|item| item["title"] == "Confirmed create").unwrap();
+        assert_eq!(pending["pages"]["index.md"]["sidecar"]["content_id"], confirmed["id"]);
+        let child_key = Path::new("child").join("index.md");
+        let uncertain = pending["pages"].get(child_key.to_str().unwrap()).expect("pending child");
+        assert_eq!(uncertain["sidecar"].get("content_id"), Some(&Value::Null));
+        let remote = cfg.run_json(&["search", "Uncertain create"]);
+        let count = list_items(&remote, "search").iter()
+            .filter(|page| page["title"] == "Uncertain create").count();
+        assert_eq!(count, 1, "{remote}");
+        let preview = || cfg.command().args(["plan", path, "--state-file", state_arg, "-o", "json"])
+            .output().unwrap();
+        let lock = fs::OpenOptions::new().write(true).open(temp.path().join("deploy.json.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let active = preview();
+        assert_eq!(active.status.code(), Some(7), "{active:?}");
+        assert!(String::from_utf8_lossy(&active.stderr).contains("publish is in progress"));
+        drop(lock);
+        let unfinished = preview();
+        assert_eq!(unfinished.status.code(), Some(7), "{unfinished:?}");
+        assert!(String::from_utf8_lossy(&unfinished.stderr).contains("unfinished apply"));
+        let retry = cfg.command().args(["apply", path, "--state-file", state_arg, "-o", "json"])
+            .output().unwrap();
+        assert_eq!(retry.status.code(), Some(7), "{retry:?}");
+        assert!(String::from_utf8_lossy(&retry.stderr).contains("unfinished apply"), "{retry:?}");
+        assert_eq!(fs::read(&state).unwrap(), baseline);
+        assert_eq!(cfg.run_json(&["search", "Uncertain create"]), remote);
+    }).await.unwrap();
+}
+
 fn simulated_cloud_config(simulator: &ConfluenceSimulator, config_home: &TempDir) -> E2eConfig {
     let config_home_path = config_home.path().to_string_lossy().into_owned();
     E2eConfig {
@@ -1166,8 +1555,22 @@ async fn simulated_cloud_rejects_invalid_credentials_through_the_cli() {
 async fn simulated_data_center_supports_the_complete_cli_lifecycle() {
     let simulator = ConfluenceSimulator::start().await;
     let config_home = TempDir::new().expect("simulator config home");
+    let cfg = simulated_data_center_config(&simulator, &config_home);
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        run_cli_lifecycle(cfg);
+    })
+    .await
+    .expect("complete simulated lifecycle task");
+}
+
+fn simulated_data_center_config(
+    simulator: &ConfluenceSimulator,
+    config_home: &TempDir,
+) -> E2eConfig {
     let config_home_path = config_home.path().to_string_lossy().into_owned();
-    let cfg = E2eConfig {
+    E2eConfig {
         bin: find_binary_path(),
         profile: None,
         envs: vec![
@@ -1183,14 +1586,7 @@ async fn simulated_data_center_supports_the_complete_cli_lifecycle() {
             ("XDG_CONFIG_HOME".to_string(), config_home_path),
         ],
         space: "TEST".to_string(),
-    };
-
-    tokio::task::spawn_blocking(move || {
-        let _config_home = config_home;
-        run_cli_lifecycle(cfg);
-    })
-    .await
-    .expect("complete simulated Data Center lifecycle task");
+    }
 }
 
 fn first_item<'a>(value: &'a Value, context: &str) -> &'a Value {

@@ -62,6 +62,13 @@ impl ConfluenceSimulator {
     pub async fn request_count(&self) -> usize {
         self.server.received_requests().await.unwrap().len()
     }
+
+    pub fn fail_cloud_create_response_after(&self, successful_creates: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .cloud_creates_before_failed_response = Some(successful_creates);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -71,6 +78,7 @@ struct SimulatorResponder {
 
 struct SimulatorState {
     next_id: u64,
+    cloud_creates_before_failed_response: Option<usize>,
     content: BTreeMap<String, SimulatedContent>,
     comments: BTreeMap<String, SimulatedComment>,
     attachments: BTreeMap<String, SimulatedAttachment>,
@@ -91,6 +99,7 @@ impl Default for SimulatorState {
         };
         Self {
             next_id: 0,
+            cloud_creates_before_failed_response: None,
             content: BTreeMap::from([(homepage.id.clone(), homepage)]),
             comments: BTreeMap::new(),
             attachments: BTreeMap::new(),
@@ -213,7 +222,18 @@ impl Respond for SimulatorResponder {
                 };
                 update_v1_content(&mut state, id, request)
             }
-            ("POST", "v2", "/pages") => create_page(&mut state, request),
+            ("POST", "v2", "/pages") => {
+                let response = create_page(&mut state, request);
+                match &mut state.cloud_creates_before_failed_response {
+                    Some(0) => {
+                        state.cloud_creates_before_failed_response = None;
+                        return ResponseTemplate::new(500);
+                    }
+                    Some(remaining) => *remaining -= 1,
+                    None => {}
+                }
+                response
+            }
             ("GET", "v2", resource) if resource.starts_with("/pages/") => {
                 content_id(resource, "/pages/")
                     .and_then(|id| state.content.get(id))

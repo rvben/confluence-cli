@@ -7,7 +7,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
 use pulldown_cmark::{CodeBlockKind, Event, MetadataBlockKind, Options, Parser, Tag, TagEnd, html};
 use regex::Regex;
 use roxmltree::{Document, Node, NodeType};
@@ -59,7 +58,6 @@ pub struct Sidecar {
     pub remote_storage_hash: Option<String>,
     #[serde(default)]
     pub attachment_map: BTreeMap<String, AttachmentState>,
-    pub last_sync_at: Option<DateTime<Utc>>,
     /// Title as of the last pull/apply, used by plan to detect title changes.
     #[serde(default)]
     pub last_pulled_title: Option<String>,

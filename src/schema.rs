@@ -590,10 +590,14 @@ fn enrich_v03(document: &mut Value) {
         }
         if name == "apply" {
             object.insert("destructive_when".into(), json!(["--delete-remote"]));
+            object.insert("partial_success_possible".into(), json!(true));
             object.insert(
                 "requires_confirmation_when".into(),
                 json!(["--delete-remote"]),
             );
+        }
+        if name == "plan" {
+            object.insert("network_when".into(), json!(["--check-remote"]));
         }
         if name == "attachment upload" {
             object.insert("destructive_when".into(), json!(["--replace"]));

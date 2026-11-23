@@ -1,3 +1,5 @@
+mod publish_state;
+
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -6,12 +8,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result, anyhow};
-use chrono::Utc;
 use pathdiff::diff_paths;
 use regex::Regex;
 use similar::{ChangeTag, TextDiff};
 use tempfile::Builder;
 use walkdir::WalkDir;
+
+use self::publish_state::{PublishState, lock_state, state_path};
 
 use crate::markdown::{
     Frontmatter, LocalDocument, PULL_FAILURES_DIR, PULL_FAILURES_MANIFEST, PageLinkPlaceholder,
@@ -150,20 +153,24 @@ pub fn plan_path(
     show_diff: bool,
 ) -> Result<SyncPlan> {
     let docs = load_required_local_documents(root)?;
-    let indexes = scan_local_documents(root)?;
-    let mut parent_ids = BTreeMap::new();
-    for doc in &indexes {
-        if let Some(content_id) = &doc.content_id {
-            parent_ids.insert(doc.directory.clone(), content_id.clone());
-        }
-    }
-    let link_index = LinkIndex::for_sync(&docs, None);
+    plan_documents(root, &docs, allow_lossy, delete_remote, show_diff)
+}
+
+fn plan_documents(
+    root: &Path,
+    docs: &[LocalDocument],
+    allow_lossy: bool,
+    delete_remote: bool,
+    show_diff: bool,
+) -> Result<SyncPlan> {
+    let parent_ids = document_ids(docs);
+    let link_index = LinkIndex::for_sync(docs, None);
 
     let mut plan = SyncPlan::default();
     for doc in docs {
-        validate_informational_parent(&doc)?;
+        validate_informational_parent(doc)?;
         let web_path_prefix = effective_web_path_prefix(&doc.sidecar, None);
-        let storage = render_body_storage(&doc, &link_index, allow_lossy, &web_path_prefix)?;
+        let storage = render_body_storage(doc, &link_index, allow_lossy, &web_path_prefix)?;
         let storage_hash = sha256_hex(storage.as_bytes());
         let current_hash = markdown_body_hash(&doc.body_markdown);
         let derived_parent_id =
@@ -224,7 +231,7 @@ pub fn plan_path(
                 }
             }
             if let Some(last_status) = &doc.sidecar.last_pulled_status
-                && last_status != &doc.frontmatter.status
+                && desired_status(last_status) != desired_status(&doc.frontmatter.status)
             {
                 changes.push("status");
             }
@@ -417,32 +424,64 @@ fn compute_body_diff(sidecar: &Sidecar, current_body: &str) -> String {
     output
 }
 
-pub async fn apply_path(
-    provider: &dyn ConfluenceProvider,
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PublishOptions {
+    pub allow_lossy: bool,
+    pub delete_remote: bool,
+    pub force: bool,
+}
+
+pub(crate) async fn preview_path(
+    provider: Option<&dyn ConfluenceProvider>,
     root: &Path,
-    allow_lossy: bool,
-    delete_remote: bool,
-    force: bool,
+    options: PublishOptions,
+    show_diff: bool,
+    state_file: Option<&Path>,
 ) -> Result<SyncPlan> {
     let mut docs = load_required_local_documents(root)?;
-    docs.sort_by_key(|doc| doc.directory.components().count());
-    let mut link_index = LinkIndex::for_sync(&docs, Some(provider_site_fingerprint(provider)));
-    let web_path_prefix = provider.web_path_prefix();
+    if let Some(path) = state_file {
+        let state = PublishState::read_for_preview(&state_path(root, path)?)?;
+        state.restore(root, &mut docs, provider)?;
+    }
+    let plan = plan_documents(
+        root,
+        &docs,
+        options.allow_lossy,
+        options.delete_remote,
+        show_diff,
+    )?;
+    if let Some(provider) = provider {
+        docs.sort_by_key(|doc| doc.directory.components().count());
+        let links = LinkIndex::for_sync(&docs, Some(provider_site_fingerprint(provider)));
+        preflight(provider, &docs, &links, options).await?;
+    }
+    Ok(plan)
+}
 
-    // Validate the complete collection and every expected remote version before
-    // making the first remote mutation. Versioned update calls still protect
-    // against drift that happens after this preflight.
+async fn preflight(
+    provider: &dyn ConfluenceProvider,
+    docs: &[LocalDocument],
+    link_index: &LinkIndex,
+    options: PublishOptions,
+) -> Result<BTreeMap<String, ContentItem>> {
+    let web_path_prefix = provider.web_path_prefix();
+    let parent_ids = document_ids(docs);
     let mut preflight_remotes = BTreeMap::new();
-    for doc in &docs {
+    for doc in docs {
         validate_informational_parent(doc)?;
-        render_body_storage(doc, &link_index, allow_lossy, web_path_prefix.as_str())?;
-        derive_parent_id_from_fs(&doc.directory, &doc.sidecar)?;
+        render_body_storage(
+            doc,
+            link_index,
+            options.allow_lossy,
+            web_path_prefix.as_str(),
+        )?;
+        publish_parent_id(doc, &parent_ids)?;
         local_attachment_hashes(&doc.directory)?;
         if let Some(content_id) = &doc.sidecar.content_id {
             let remote = provider
                 .get_content(doc.frontmatter.content_kind(), content_id, false)
                 .await?;
-            if !force {
+            if !options.force {
                 if doc.sidecar.remote_version != remote.version {
                     return Err(remote_drift_error(doc, content_id, remote.version));
                 }
@@ -454,7 +493,8 @@ pub async fn apply_path(
                         &metadata_drift,
                     ));
                 }
-                validate_remote_attachment_drift(provider, doc, content_id, delete_remote).await?;
+                validate_remote_attachment_drift(provider, doc, content_id, options.delete_remote)
+                    .await?;
             }
             preflight_remotes.insert(content_id.clone(), remote);
         } else {
@@ -477,7 +517,46 @@ pub async fn apply_path(
             }
         }
     }
+    Ok(preflight_remotes)
+}
 
+pub(crate) async fn apply_path(
+    provider: &dyn ConfluenceProvider,
+    root: &Path,
+    options: PublishOptions,
+    state_file: Option<&Path>,
+    init_state: bool,
+) -> Result<SyncPlan> {
+    let state_file = state_file.map(|path| state_path(root, path)).transpose()?;
+    let _state_lock = state_file.as_deref().map(lock_state).transpose()?;
+    let mut docs = load_required_local_documents(root)?;
+    let site = provider_site_fingerprint(provider);
+    let mut state = match state_file.as_deref() {
+        Some(path) if init_state => Some(PublishState::initialize(path, site.clone(), &docs)?),
+        Some(path) => {
+            let state = PublishState::read_for_apply(path)?;
+            state.restore(root, &mut docs, Some(provider))?;
+            Some(state)
+        }
+        None => None,
+    };
+    docs.sort_by_key(|doc| doc.directory.components().count());
+    let mut link_index = LinkIndex::for_sync(&docs, Some(site));
+    let web_path_prefix = provider.web_path_prefix();
+    let PublishOptions {
+        allow_lossy,
+        delete_remote,
+        force,
+    } = options;
+    let mut preflight_remotes = preflight(provider, &docs, &link_index, options).await?;
+
+    if let (Some(path), Some(state)) = (&state_file, &mut state) {
+        state.capture(root, &docs);
+        state.pending = true;
+        state.write(path)?;
+    }
+
+    let mut parent_ids = document_ids(&docs);
     let mut applied = SyncPlan::default();
     for doc in &mut docs {
         let space_key = doc.sidecar.space_key.clone().or_else(|| {
@@ -487,7 +566,7 @@ pub async fn apply_path(
                 .and_then(|value| value.as_str())
                 .map(ToOwned::to_owned)
         });
-        let derived_parent_id = derive_parent_id_from_fs(&doc.directory, &doc.sidecar)?;
+        let derived_parent_id = publish_parent_id(doc, &parent_ids)?;
 
         let body_storage =
             render_body_storage(doc, &link_index, allow_lossy, web_path_prefix.as_str())?;
@@ -578,10 +657,16 @@ pub async fn apply_path(
                 details: "remote content created".to_string(),
                 diff: None,
             });
+            if let (Some(path), Some(state)) = (&state_file, &mut state) {
+                state
+                    .record_creation(root, path, doc, &created)
+                    .map_err(|error| partial_apply_error(error, &applied))?;
+            }
             created
         };
 
         doc.sidecar.content_id = Some(content.id.clone());
+        parent_ids.insert(doc.directory.clone(), content.id.clone());
         link_index.set_content_id(&doc.directory, &content.id);
         sync_attachments(provider, doc, &content.id, delete_remote, &mut applied)
             .await
@@ -600,7 +685,6 @@ pub async fn apply_path(
             doc.sidecar.storage_differs_from_remote = false;
         }
         doc.sidecar.storage_hash = Some(storage_hash);
-        doc.sidecar.last_sync_at = Some(Utc::now());
         // Track metadata so plan can detect future title/label/status/properties changes.
         doc.sidecar.last_pulled_title = Some(doc.frontmatter.title.clone());
         doc.sidecar.last_pulled_labels = doc.frontmatter.labels.clone();
@@ -623,6 +707,14 @@ pub async fn apply_path(
     )
     .await
     .map_err(|error| partial_apply_error(error, &applied))?;
+
+    if let (Some(path), Some(state)) = (&state_file, &mut state) {
+        state.capture(root, &docs);
+        state.pending = false;
+        state
+            .write(path)
+            .map_err(|error| partial_apply_error(error, &applied))?;
+    }
 
     if applied.items.is_empty() {
         applied.items.push(PlanItem {
@@ -831,7 +923,6 @@ async fn reconcile_local_link_updates(
         doc.sidecar.storage_differs_from_remote = false;
         doc.sidecar.last_pulled_hash = Some(markdown_body_hash(&doc.body_markdown));
         doc.sidecar.last_pulled_body_markdown = Some(doc.body_markdown.clone());
-        doc.sidecar.last_sync_at = Some(Utc::now());
         save_document(doc)?;
     }
 
@@ -1418,7 +1509,6 @@ impl PulledItem<'_> {
                 item.body_storage.as_deref().unwrap_or_default().as_bytes(),
             )),
             attachment_map: self.attachment_map.clone(),
-            last_sync_at: Some(Utc::now()),
             last_pulled_title: Some(item.title.clone()),
             last_pulled_labels: item.labels.clone(),
             last_pulled_status: Some(item.status.clone()),
@@ -1678,6 +1768,26 @@ fn load_required_local_documents(root: &Path) -> Result<Vec<LocalDocument>> {
         ));
     }
     Ok(docs)
+}
+
+fn document_ids(docs: &[LocalDocument]) -> BTreeMap<PathBuf, String> {
+    docs.iter()
+        .filter_map(|doc| Some((doc.directory.clone(), doc.sidecar.content_id.clone()?)))
+        .collect()
+}
+
+fn publish_parent_id(
+    doc: &LocalDocument,
+    parent_ids: &BTreeMap<PathBuf, String>,
+) -> Result<Option<String>> {
+    if let Some(id) = doc
+        .directory
+        .parent()
+        .and_then(|parent| parent_ids.get(parent))
+    {
+        return Ok(Some(id.clone()));
+    }
+    derive_parent_id_from_fs(&doc.directory, &doc.sidecar)
 }
 
 pub fn validate_sync_path(root: &Path) -> Result<()> {

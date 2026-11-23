@@ -133,9 +133,9 @@ enum Commands {
         /// Macro template to print
         kind: StorageTemplate,
     },
-    /// Preview local changes without contacting or modifying Confluence
+    /// Preview local changes, optionally checking remote drift without writing
     #[command(
-        after_help = "`plan` reads local Markdown and sidecar state only. Remote drift is checked by `apply`. A page whose pulled Markdown does not carry its remote markup exactly is named, because its first update also rewrites that markup.\n\nExample:\n  confluence plan ./docs --diff"
+        after_help = "By default, `plan` works offline. With --check-remote it runs the read-only apply preflight against Confluence, including page versions, metadata and attachment drift. A page whose pulled Markdown does not carry its remote markup exactly is named, because its first update also rewrites that markup.\n\nExamples:\n  confluence plan ./docs --diff\n  confluence plan ./docs --check-remote"
     )]
     Plan(PlanArgs),
     /// Browse Confluence and review a local Markdown sync plan interactively
@@ -434,6 +434,12 @@ struct PlanArgs {
     /// Include unified body diffs in text output
     #[arg(long)]
     diff: bool,
+    /// Run the apply preflight against Confluence without writing
+    #[arg(long)]
+    check_remote: bool,
+    /// Read the last published baseline from this file
+    #[arg(long, value_name = "FILE")]
+    state_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -465,6 +471,12 @@ struct ApplyArgs {
     /// Overwrite content despite remote-version drift
     #[arg(long)]
     force: bool,
+    /// Read and advance the last published baseline in this file
+    #[arg(long, value_name = "FILE")]
+    state_file: Option<PathBuf>,
+    /// Initialize a new state file from the checkout's sidecars
+    #[arg(long, requires = "state_file", conflicts_with = "force")]
+    init_state: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1086,10 +1098,23 @@ pub async fn run() -> Result<()> {
             Ok(())
         }
         Commands::Plan(args) => {
-            let show_diff = args.diff;
-            let plan =
-                sync::plan_path(&args.path, args.allow_lossy, args.delete_remote, show_diff)?;
-            render_plan(&plan, output, show_diff)
+            let provider = args
+                .check_remote
+                .then(|| provider_from_profile(cli.profile.as_deref()))
+                .transpose()?;
+            let plan = sync::preview_path(
+                provider.as_deref(),
+                &args.path,
+                sync::PublishOptions {
+                    allow_lossy: args.allow_lossy,
+                    delete_remote: args.delete_remote,
+                    ..Default::default()
+                },
+                args.diff,
+                args.state_file.as_deref(),
+            )
+            .await?;
+            render_plan(&plan, output, args.diff)
         }
         Commands::Tui(args) => {
             if explicit_json {
@@ -1130,13 +1155,21 @@ pub async fn run() -> Result<()> {
                     "Apply remote attachment deletions requested by --delete-remote?",
                 )?;
             }
-            let provider = provider_from_profile(cli.profile.as_deref())?;
+            let profile = resolved_profile(cli.profile.as_deref())?;
+            if args.state_file.is_some() {
+                crate::provider::ensure_writable(&profile)?;
+            }
+            let provider = build_provider(profile);
             let plan = sync::apply_path(
                 &*provider,
                 &args.path,
-                args.allow_lossy,
-                args.delete_remote,
-                args.force,
+                sync::PublishOptions {
+                    allow_lossy: args.allow_lossy,
+                    delete_remote: args.delete_remote,
+                    force: args.force,
+                },
+                args.state_file.as_deref(),
+                args.init_state,
             )
             .await?;
             render_plan(&plan, output, false)

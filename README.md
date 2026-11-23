@@ -228,7 +228,7 @@ The sidecar records remote IDs, versions, hashes, and attachment mappings. It is
 confluence plan ./docs/handbook --diff
 ```
 
-`plan` validates the documents under the selected directory and compares them with the state captured by `pull`. It never contacts Confluence and never writes remotely. A page whose pulled Markdown does not carry its remote markup exactly is listed even when it is unchanged, and an update of such a page says that it also rewrites that markup.
+`plan` validates the documents under the selected directory and compares them with the last pulled or published baseline. It runs offline by default. Add `--check-remote` to run the same read-only preflight as `apply`, including drift checks for page versions, metadata, and attachments. A conflict returns exit code 7. The check uses the selected profile and works with a read-only profile. A page whose pulled Markdown does not carry its remote markup exactly is listed even when it is unchanged, and an update of such a page says that it also rewrites that markup.
 
 When a selected page links to a pulled page outside the selection, `plan` and `apply` resolve the link from the target's sidecar if both pages belong to the same Confluence site. New pulls record site identity. Older pulls can resolve links when their recorded parent IDs lead to a shared local page. If the CLI cannot verify the relationship, pull the pages again or use the target's absolute Confluence URL.
 
@@ -249,6 +249,8 @@ confluence apply ./docs/handbook
 Before its first mutation, `apply` validates every local document and preflights every remote version. Versioned updates continue to reject drift that occurs during the apply. If an API failure leaves a partial remote mutation, the CLI reports the completed actions in structured error details so automation can reconcile safely.
 
 Remote attachment deletions are opt-in with `--delete-remote`. Conditional overwrites require an explicit `--force` or `--replace` where supported.
+
+For repeated publishes from fresh CI checkouts, [keep the last published baseline in a persistent state file](docs/ci-publishing.md).
 
 ## Authentication
 
