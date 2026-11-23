@@ -27,8 +27,6 @@ use crate::provider::ConfluenceProvider;
 
 #[derive(Clone, Debug)]
 struct LinkTarget {
-    markdown_path: PathBuf,
-    directory: PathBuf,
     content_id: Option<String>,
     title: String,
     space_key: Option<String>,
@@ -1681,7 +1679,8 @@ pub fn validate_sync_path(root: &Path) -> Result<()> {
 
 impl LinkIndex {
     fn set_content_id(&mut self, directory: &Path, content_id: &str) {
-        if let Some(target) = self.by_directory.get_mut(directory) {
+        let directory = normalize_path(directory);
+        if let Some(target) = self.by_directory.get_mut(&directory) {
             target.content_id = Some(content_id.to_string());
         }
         let markdown_path = directory.join("index.md");
@@ -1695,16 +1694,16 @@ fn build_link_index<'a>(docs: impl IntoIterator<Item = &'a LocalDocument>) -> Li
     let mut index = LinkIndex::default();
     for doc in docs {
         let target = LinkTarget {
-            markdown_path: doc.markdown_path.clone(),
-            directory: doc.directory.clone(),
             content_id: doc.sidecar.content_id.clone(),
             title: doc.frontmatter.title.clone(),
             space_key: doc.sidecar.space_key.clone(),
         };
         index
             .by_markdown_path
-            .insert(target.markdown_path.clone(), target.clone());
-        index.by_directory.insert(target.directory.clone(), target);
+            .insert(normalize_path(&doc.markdown_path), target.clone());
+        index
+            .by_directory
+            .insert(normalize_path(&doc.directory), target);
     }
     index
 }
@@ -1964,7 +1963,7 @@ fn local_target_to_page_placeholder(
     if path_part.is_empty() {
         return None;
     }
-    let resolved = normalize_path(current_dir.join(path_part));
+    let resolved = normalize_path(&current_dir.join(path_part));
     let markdown_target = if resolved.file_name().and_then(|name| name.to_str()) == Some("index.md")
     {
         resolved
@@ -2128,7 +2127,7 @@ fn rewrite_local_target_url(
     let path_part = urlencoding::decode(path_part).ok()?;
     let fragment = fragment.map(escape_xml_attr);
 
-    let resolved = normalize_path(current_dir.join(path_part.as_ref()));
+    let resolved = normalize_path(&current_dir.join(path_part.as_ref()));
     let markdown_target = if resolved.file_name().and_then(|name| name.to_str()) == Some("index.md")
     {
         resolved.clone()
@@ -2181,14 +2180,16 @@ fn rewrite_local_target_url(
     Some(url)
 }
 
-fn normalize_path(path: PathBuf) -> PathBuf {
+// Link index keys and link destinations use the same lexical path form.
+fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::ParentDir => {
+            Component::ParentDir if normalized.file_name().is_some() => {
                 normalized.pop();
             }
+            Component::ParentDir if normalized.has_root() => {}
             other => normalized.push(other.as_os_str()),
         }
     }

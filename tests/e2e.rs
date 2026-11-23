@@ -656,6 +656,85 @@ async fn pull_marks_a_page_that_markdown_does_not_carry_until_an_update_rewrites
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_and_apply_resolve_pulled_links_for_equivalent_paths() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    let root_id = simulator.add_page(
+        "Linked tree",
+        Some("100"),
+        r#"<p><ac:link><ri:page ri:content-title="Child" /><ac:plain-text-link-body><![CDATA[Read the child]]></ac:plain-text-link-body></ac:link></p>"#,
+    );
+    let child_id = simulator.add_page("Child", Some(&root_id), "<p>Child body</p>");
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().expect("pull destination");
+        let tree = temp.path().join("tree");
+        let work = temp.path().join("work");
+        fs::create_dir(&work).expect("working directory");
+        let absolute = tree.to_str().expect("UTF-8 path");
+        cfg.run_json(&["pull", "tree", &root_id, absolute]);
+        let index = find_index_md_by_title(&tree, "Linked tree");
+        let markdown = fs::read_to_string(&index).expect("pulled Markdown");
+        assert!(
+            markdown.contains(&format!("[Read the child](child--{child_id}/index.md)")),
+            "{markdown}"
+        );
+
+        let run_here = |cwd: &Path, args: &[&str]| {
+            let output = cfg
+                .command()
+                .current_dir(cwd)
+                .arg("--json")
+                .args(args)
+                .output()
+                .expect("CLI command");
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            serde_json::from_slice::<Value>(&output.stdout).expect("CLI JSON")
+        };
+        let plan_paths = [
+            (temp.path(), "tree"),
+            (temp.path(), "./tree"),
+            (temp.path(), absolute),
+            (work.as_path(), "../tree"),
+        ];
+        for (cwd, path) in plan_paths {
+            let plan = run_here(cwd, &["plan", path, "--diff"]);
+            let items = list_items(&plan, "plan");
+            assert_eq!(items.len(), 1, "{path}: {plan}");
+            assert_eq!(items[0]["action"], "noop", "{path}: {plan}");
+        }
+
+        let remote_page = || cfg.run_json(&["page", "get", &root_id, "--show-body"]);
+        let before = remote_page();
+        assert_eq!(first_item(&before, "page get")["version"], 1);
+        run_here(temp.path(), &["--yes", "apply", "./tree"]);
+        assert_eq!(remote_page(), before);
+
+        fs::write(&index, markdown.replace("Read the child", "Open the child")).expect("edit");
+        for (cwd, path) in plan_paths {
+            let plan = run_here(cwd, &["plan", path, "--diff"]);
+            let items = list_items(&plan, "plan");
+            assert_eq!(items.len(), 1, "{path}: {plan}");
+            let item = &items[0];
+            assert_eq!(item["content_id"], root_id.as_str(), "{path}: {plan}");
+            assert_eq!(item["action"], "update_content", "{path}: {plan}");
+        }
+        run_here(temp.path(), &["--yes", "apply", "./tree"]);
+        let after = remote_page();
+        let page = first_item(&after, "page get");
+        assert_eq!(page["version"], 2);
+        assert_eq!(
+            page["body_storage"],
+            format!(r#"<p><a href="/wiki/pages/viewpage.action?pageId={child_id}">Open the child</a></p>"#)
+        );
+    })
+    .await
+    .expect("linked tree task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pull_writes_the_rest_of_a_tree_when_a_page_does_not_convert() {
     let simulator = ConfluenceSimulator::start().await;
     let config_home = TempDir::new().expect("simulator config home");
