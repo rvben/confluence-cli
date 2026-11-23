@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.42](https://github.com/rvben/confluence-cli/compare/v0.1.41...v0.1.42) - 2026-11-23
+
+### Fixed
+
+- **sync**: resolve published links outside the selected tree ([046cc46](https://github.com/rvben/confluence-cli/commit/046cc4674fd8bc04aec542d004aebbf87f3aada2))
+- **sync**: resolve links consistently across equivalent paths ([45b4e56](https://github.com/rvben/confluence-cli/commit/45b4e561b17c067de14a50069118bd51af162969))
+- **pull**: fence an element that Markdown reads as text of a paragraph ([ff1a698](https://github.com/rvben/confluence-cli/commit/ff1a6985f840a5da4d0ec9b9ae598e1fe658c70b))
+- **apply**: read blocks, storage fences and code from one reading of the text ([ffdbd6b](https://github.com/rvben/confluence-cli/commit/ffdbd6b5683a113556381e6c050982e3a53f036f))
+- **apply**: write a checkbox in a numbered list as the text of its item ([cf73d3a](https://github.com/rvben/confluence-cli/commit/cf73d3a3473c81aabb0a0d3600b9762978bef830))
+- **apply**: keep the plain items of a list that also holds tasks ([1f2ebc0](https://github.com/rvben/confluence-cli/commit/1f2ebc05862fb84f2d24a5b428d3bf9719ba57c9))
+- read a front matter value that ends in three dashes ([c3ee0a0](https://github.com/rvben/confluence-cli/commit/c3ee0a05ad3fba28db6d2eadfc9b49f29431f41f))
+- **apply**: keep the parameters of a macro whose body is empty ([0b7d42f](https://github.com/rvben/confluence-cli/commit/0b7d42fb65ccfb9e23d45776caa212464e6af591))
+- **pull**: keep a processing instruction that stands between blocks ([f7c6816](https://github.com/rvben/confluence-cli/commit/f7c68168ea16af4ae6739759e3bb854748109b3d))
+- read a file written with CRLF line endings ([08379a9](https://github.com/rvben/confluence-cli/commit/08379a9f218f866ae21315a78bde31ae2f7d03cb))
+- **apply**: keep text between two rules in the body of a page ([d55fefd](https://github.com/rvben/confluence-cli/commit/d55fefd431b9517f191d02c07b2c316b15ba3f9e))
+- **sync**: read the parameters of a macro only where the block holds them ([943862d](https://github.com/rvben/confluence-cli/commit/943862ddd65b2fb46f769e7694e974306a47acb2))
+- **apply**: keep the recorded hash of the remote body when none is published ([59b7163](https://github.com/rvben/confluence-cli/commit/59b7163897db3c1753e2c25e4bdb25217a36a471))
+- **pull**: read the address of an attachment whole ([e612dbb](https://github.com/rvben/confluence-cli/commit/e612dbb4c047fc25719d4a24beb6167f03756872))
+- **pull**: leave a link to a page of another site as it is ([65f8aa6](https://github.com/rvben/confluence-cli/commit/65f8aa6c252a7990afbd8647c4c0903bdbe990b7))
+- **pull**: read the address of a page whole ([5d3bc77](https://github.com/rvben/confluence-cli/commit/5d3bc777ab2f86eca1fca6a5c4309abff82c10a6))
+- **pull**: rewrite a page address only where Markdown reads a link ([33e21ba](https://github.com/rvben/confluence-cli/commit/33e21ba5d32fe38425c475051dc43025bea8893c))
+- **convert**: name the macro block that holds markup that does not convert ([743a3a8](https://github.com/rvben/confluence-cli/commit/743a3a828cbe9802df59b52e2b735ff10e9dc187))
+- **pull**: name a mention only where a block holds Markdown ([34239cc](https://github.com/rvben/confluence-cli/commit/34239cc8e645a2bf7023935581d2bf54a6b71061))
+- **apply**: read a placeholder address only from the href of a link ([1b1f197](https://github.com/rvben/confluence-cli/commit/1b1f197a00a43c969b90b94d4d0fe51482d934dd))
+- **pull**: read the line endings in a comment as a parser does ([e0958be](https://github.com/rvben/confluence-cli/commit/e0958be39e8e852d50934d365b9a82de906343d4))
+- **pull**: keep a block that only wraps other blocks ([ca626f7](https://github.com/rvben/confluence-cli/commit/ca626f71d4cbc18bd025ebfd06cb0a073d2a3ee7))
+- **pull**: keep what a macro block has no place for ([4e156f9](https://github.com/rvben/confluence-cli/commit/4e156f95902279819b68feb5c8d465ab73129786))
+- **pull**: keep a processing instruction inside a block ([dd14d6e](https://github.com/rvben/confluence-cli/commit/dd14d6e63d7c1d3785dcfd3207e9936668b9887f))
+- **pull**: keep a paragraph whose second line reads as the row under a table header ([45380df](https://github.com/rvben/confluence-cli/commit/45380df38fcbca87297fecf5735ae5ce4db05222))
+- **pull**: keep a macro, a layout or an empty task that a quote holds ([db6d26d](https://github.com/rvben/confluence-cli/commit/db6d26d7971ec28419bda52cf21a594a7ff92a6e))
+- **pull**: keep the empty lines at the end of a code or noformat macro ([b5ffdcd](https://github.com/rvben/confluence-cli/commit/b5ffdcd3b3b08cd2b5a1f54a48fc4f2e051c67b2))
+- **pull**: keep a macro parameter that does not fit a line ([cb5a14f](https://github.com/rvben/confluence-cli/commit/cb5a14f0bb985134c88ba11bd44ca77676923c6f))
+- **pull**: keep two layouts that follow each other apart ([7a4425a](https://github.com/rvben/confluence-cli/commit/7a4425a282dcdefd30b4d828db592248a46eab33))
+- **apply**: keep a task without a body a task ([98dea37](https://github.com/rvben/confluence-cli/commit/98dea37b8bafd243df5459cae765f80ada6e0e10))
+- **pull**: keep preformatted text whose lines read as block syntax ([7418198](https://github.com/rvben/confluence-cli/commit/7418198b78752b6f54058a6606fe9872c0a5e037))
+- **pull**: keep text in a layout cell that reads as the start of a cell ([844b90a](https://github.com/rvben/confluence-cli/commit/844b90aa769d06904992b54c9131781c37fb37c0))
+- **pull**: fence a code macro or layout with more tildes than its body holds ([970303f](https://github.com/rvben/confluence-cli/commit/970303f34d0aa7cdcc19b79323cae863dcff8da0))
+- **pull**: keep a `---` line in the body of a macro without parameters ([ea56268](https://github.com/rvben/confluence-cli/commit/ea56268caaa88ee62be7cba6ab08c7b011ed6860))
+- **pull**: keep the title and icon setting of a panel ([5c4c600](https://github.com/rvben/confluence-cli/commit/5c4c600e6ed556a1ed8bfc97835077c8037a7e75))
+- **apply**: read macro and layout blocks by their nesting and leave code alone ([febe83c](https://github.com/rvben/confluence-cli/commit/febe83c6e7f025690d8d553e1f3b77a3d5972f8a))
+- **apply**: keep the paragraph after a panel, expand or code block apart from it ([9b4340b](https://github.com/rvben/confluence-cli/commit/9b4340b76bd0b03542a1064b834f293a36f5f487))
+
 ## [0.1.41](https://github.com/rvben/confluence-cli/compare/v0.1.40...v0.1.41) - 2026-11-20
 
 ### Added
