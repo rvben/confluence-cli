@@ -228,7 +228,11 @@ The sidecar records remote IDs, versions, hashes, and attachment mappings. It is
 confluence plan ./docs/handbook --diff
 ```
 
-`plan` validates the complete tree and compares it with the state captured by `pull`. It never contacts Confluence and never writes remotely. A page whose pulled Markdown does not carry its remote markup exactly is listed even when it is unchanged, and an update of such a page says that it also rewrites that markup.
+`plan` validates the documents under the selected directory and compares them with the state captured by `pull`. It never contacts Confluence and never writes remotely. A page whose pulled Markdown does not carry its remote markup exactly is listed even when it is unchanged, and an update of such a page says that it also rewrites that markup.
+
+When a selected page links to a pulled page outside the selection, `plan` and `apply` resolve the link from the target's sidecar if both pages belong to the same Confluence site. New pulls record site identity. Older pulls can resolve links when their recorded parent IDs lead to a shared local page. If the CLI cannot verify the relationship, pull the pages again or use the target's absolute Confluence URL.
+
+To link to a local attachment on a page outside the selection, publish it on that page first. The attachment must appear in that page's sidecar. Page references in macros use the target's recorded remote title. A referenced page enters the apply scope only when its directory is included in the selection.
 
 For an interactive review, open the same directory in the Proof Desk:
 

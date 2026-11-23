@@ -186,6 +186,10 @@ impl ConfluenceProvider for CloudProvider {
         self.http.profile.web_path_prefix()
     }
 
+    fn site_url(&self) -> &str {
+        &self.http.profile.base_url
+    }
+
     async fn ping(&self) -> Result<()> {
         let _: Results<V1SpaceRef> = self
             .http

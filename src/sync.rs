@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -28,14 +30,15 @@ use crate::provider::ConfluenceProvider;
 #[derive(Clone, Debug)]
 struct LinkTarget {
     content_id: Option<String>,
-    title: String,
+    title: Option<String>,
     space_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct LinkIndex {
     by_markdown_path: BTreeMap<PathBuf, LinkTarget>,
-    by_directory: BTreeMap<PathBuf, LinkTarget>,
+    read_unselected_targets: bool,
+    active_site: Option<String>,
 }
 
 /// What `plan` says of a page whose pulled Markdown converts to storage that
@@ -154,7 +157,7 @@ pub fn plan_path(
             parent_ids.insert(doc.directory.clone(), content_id.clone());
         }
     }
-    let link_index = build_link_index(&docs);
+    let link_index = LinkIndex::for_sync(&docs, None);
 
     let mut plan = SyncPlan::default();
     for doc in docs {
@@ -423,7 +426,7 @@ pub async fn apply_path(
 ) -> Result<SyncPlan> {
     let mut docs = load_required_local_documents(root)?;
     docs.sort_by_key(|doc| doc.directory.components().count());
-    let mut link_index = build_link_index(&docs);
+    let mut link_index = LinkIndex::for_sync(&docs, Some(provider_site_fingerprint(provider)));
     let web_path_prefix = provider.web_path_prefix();
 
     // Validate the complete collection and every expected remote version before
@@ -1319,6 +1322,7 @@ async fn write_items(
 
     let provider_kind = provider.kind();
     let web_path_prefix = provider.web_path_prefix();
+    let site_fingerprint = provider_site_fingerprint(provider);
     let (documents, left_out) = convertible_pages(|left_out| {
         // A page that is left out has no local file, so a link to it stays
         // the remote address it was pulled as.
@@ -1342,6 +1346,7 @@ async fn write_items(
                     &item_map,
                     provider_kind,
                     web_path_prefix.clone(),
+                    &site_fingerprint,
                 )
             })
             .collect()
@@ -1382,6 +1387,7 @@ impl PulledItem<'_> {
         item_map: &BTreeMap<String, ContentItem>,
         provider_kind: crate::model::ProviderKind,
         web_path_prefix: String,
+        site_fingerprint: &str,
     ) -> FetchedPage {
         let item = self.item;
         let frontmatter = Frontmatter {
@@ -1403,6 +1409,7 @@ impl PulledItem<'_> {
             space_key: item.space_key.clone(),
             provider: Some(provider_kind),
             web_path_prefix: Some(web_path_prefix),
+            site_fingerprint: Some(site_fingerprint.to_string()),
             remote_version: item.version,
             remote_parent_id: item.parent_id.clone(),
             last_pulled_hash: Some(markdown_body_hash(&body_markdown)),
@@ -1678,11 +1685,16 @@ pub fn validate_sync_path(root: &Path) -> Result<()> {
 }
 
 impl LinkIndex {
+    fn for_sync(docs: &[LocalDocument], active_site: Option<String>) -> Self {
+        Self {
+            read_unselected_targets: true,
+            active_site,
+            ..build_link_index(docs)
+        }
+    }
+
     fn set_content_id(&mut self, directory: &Path, content_id: &str) {
         let directory = normalize_path(directory);
-        if let Some(target) = self.by_directory.get_mut(&directory) {
-            target.content_id = Some(content_id.to_string());
-        }
         let markdown_path = directory.join("index.md");
         if let Some(target) = self.by_markdown_path.get_mut(&markdown_path) {
             target.content_id = Some(content_id.to_string());
@@ -1690,20 +1702,245 @@ impl LinkIndex {
     }
 }
 
+fn provider_site_fingerprint(provider: &dyn ConfluenceProvider) -> String {
+    let site_url = provider.site_url();
+    let normalized = reqwest::Url::parse(site_url).ok().map(|mut url| {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        url
+    });
+    let site = normalized.as_ref().map_or(site_url, reqwest::Url::as_str);
+    sha256_hex(format!(
+        "{}\n{}\n{}",
+        provider.kind(),
+        site.trim_end_matches('/'),
+        provider.web_path_prefix().trim_end_matches('/'),
+    ))
+}
+
+struct LinkResolver<'a> {
+    index: &'a LinkIndex,
+    source: &'a LocalDocument,
+    // Rewriters return text. The caller checks the first error after each pass.
+    error: RefCell<Option<anyhow::Error>>,
+}
+
+impl<'a> LinkResolver<'a> {
+    fn new(index: &'a LinkIndex, source: &'a LocalDocument) -> Self {
+        Self {
+            index,
+            source,
+            error: RefCell::default(),
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        self.error.take().map_or(Ok(()), Err)
+    }
+
+    fn reject(&self, message: String, hint: &str) {
+        self.error.borrow_mut().get_or_insert_with(|| {
+            crate::output::typed_error_with_hint(
+                crate::output::ErrorKind::InvalidInput,
+                message,
+                hint,
+            )
+        });
+    }
+
+    fn target(
+        &self,
+        markdown_path: &Path,
+        attachment: Option<&str>,
+        needs_title: bool,
+    ) -> Option<Cow<'_, LinkTarget>> {
+        if let Some(target) = self.index.by_markdown_path.get(markdown_path) {
+            return Some(Cow::Borrowed(target));
+        }
+        if !self.index.read_unselected_targets
+            || self.error.borrow().is_some()
+            || markdown_path.file_name()? != "index.md"
+            || !regular_file(markdown_path)
+        {
+            return None;
+        }
+        let directory = markdown_path.parent()?;
+        if !fs::symlink_metadata(lookup_directory(directory))
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            return None;
+        }
+        let sidecar_path = directory.join(".confluence.json");
+        if !regular_file(&sidecar_path) {
+            return None;
+        }
+        let Some(sidecar) = read_link_sidecar(directory) else {
+            self.reject(
+                format!(
+                    "cannot read Confluence metadata for {}",
+                    markdown_path.display()
+                ),
+                "pull the target again to restore its metadata",
+            );
+            return None;
+        };
+        let source = &self.source.sidecar;
+        let source_site = source.site_fingerprint.as_deref();
+        let target_site = sidecar.site_fingerprint.as_deref();
+        let active_site = self.index.active_site.as_deref();
+        let different_site = |first: Option<&str>, second: Option<&str>| {
+            first
+                .zip(second)
+                .is_some_and(|(first, second)| first != second)
+        };
+        if different_site(source_site, target_site)
+            || different_site(active_site, source_site)
+            || different_site(active_site, target_site)
+            || source
+                .provider
+                .zip(sidecar.provider)
+                .is_some_and(|(a, b)| a != b)
+        {
+            self.reject(
+                format!(
+                    "link target {} belongs to a different Confluence site",
+                    markdown_path.display()
+                ),
+                "use the target's absolute Confluence URL for a cross-site link",
+            );
+            return None;
+        }
+        if (source_site.is_none() || target_site.is_none()) && {
+            let expected_site = active_site.or(source_site).or(target_site);
+            recorded_lineage(&self.source.directory, source, expected_site)
+                .is_disjoint(&recorded_lineage(directory, &sidecar, expected_site))
+        } {
+            self.reject(
+                format!(
+                    "cannot verify the Confluence site of link target {}",
+                    markdown_path.display()
+                ),
+                "pull both pages with the current CLI or use the target's absolute Confluence URL",
+            );
+            return None;
+        }
+        let Some(content_id) = sidecar.content_id.filter(|id| !id.is_empty()) else {
+            self.reject(
+                format!(
+                    "link target {} has no published Confluence page ID",
+                    markdown_path.display()
+                ),
+                "publish the target before applying this selection",
+            );
+            return None;
+        };
+        if needs_title && sidecar.last_pulled_title.is_none() {
+            self.reject(
+                format!(
+                    "link target {} has no recorded Confluence title",
+                    markdown_path.display()
+                ),
+                "pull the target again before referring to it in a macro",
+            );
+            return None;
+        }
+        if let Some(name) = attachment
+            && !sidecar
+                .attachment_map
+                .values()
+                .any(|entry| entry.file_name == name && !entry.id.is_empty())
+        {
+            self.reject(
+                format!(
+                    "attachment {name:?} on {} is not recorded as published",
+                    markdown_path.display()
+                ),
+                "publish the attachment or pull its page again before applying this selection",
+            );
+            return None;
+        }
+        Some(Cow::Owned(LinkTarget {
+            content_id: Some(content_id),
+            title: sidecar.last_pulled_title,
+            space_key: sidecar.space_key,
+        }))
+    }
+}
+
+fn regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+fn lookup_directory(directory: &Path) -> &Path {
+    if directory.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        directory
+    }
+}
+
+fn read_link_sidecar(directory: &Path) -> Option<Sidecar> {
+    let path = directory.join(".confluence.json");
+    if !regular_file(&path) {
+        return None;
+    }
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+/// Legacy pulls can establish a shared tree by following the recorded parent
+/// IDs through local page directories.
+fn recorded_lineage(
+    directory: &Path,
+    sidecar: &Sidecar,
+    expected_site: Option<&str>,
+) -> BTreeSet<PathBuf> {
+    let mut lineage = BTreeSet::new();
+    let Ok(mut directory) = fs::canonicalize(lookup_directory(directory)) else {
+        return lineage;
+    };
+    if sidecar.content_id.as_deref().is_none_or(str::is_empty) {
+        return lineage;
+    }
+    let mut expected = sidecar.remote_parent_id.clone();
+    lineage.insert(directory.clone());
+    while let Some(parent_id) = expected {
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        let Some(metadata) = read_link_sidecar(parent) else {
+            break;
+        };
+        if metadata.content_id.as_deref() != Some(parent_id.as_str())
+            || expected_site
+                .zip(metadata.site_fingerprint.as_deref())
+                .is_some_and(|(expected, recorded)| expected != recorded)
+            || sidecar
+                .provider
+                .zip(metadata.provider)
+                .is_some_and(|(source, parent)| source != parent)
+        {
+            break;
+        }
+        directory = parent.to_path_buf();
+        lineage.insert(directory.clone());
+        expected = metadata.remote_parent_id;
+    }
+    lineage
+}
+
 fn build_link_index<'a>(docs: impl IntoIterator<Item = &'a LocalDocument>) -> LinkIndex {
     let mut index = LinkIndex::default();
     for doc in docs {
         let target = LinkTarget {
             content_id: doc.sidecar.content_id.clone(),
-            title: doc.frontmatter.title.clone(),
+            title: Some(doc.frontmatter.title.clone()),
             space_key: doc.sidecar.space_key.clone(),
         };
         index
             .by_markdown_path
-            .insert(normalize_path(&doc.markdown_path), target.clone());
-        index
-            .by_directory
-            .insert(normalize_path(&doc.directory), target);
+            .insert(normalize_path(&doc.markdown_path), target);
     }
     index
 }
@@ -1747,8 +1984,10 @@ fn render_storage_of_body(
     web_path_prefix: impl AsRef<str>,
     lines_before: Option<usize>,
 ) -> Result<String> {
+    let resolver = LinkResolver::new(link_index, doc);
     let rewritten_markdown =
-        rewrite_macro_page_references(&doc.body_markdown, &doc.directory, link_index);
+        rewrite_macro_page_references(&doc.body_markdown, &doc.directory, &resolver);
+    resolver.check()?;
     let converted = crate::markdown::markdown_to_storage_in_file(
         &rewritten_markdown,
         allow_lossy,
@@ -1757,9 +1996,10 @@ fn render_storage_of_body(
     let storage = rewrite_local_links_to_remote(
         &converted.storage,
         &doc.directory,
-        link_index,
+        &resolver,
         web_path_prefix.as_ref(),
     );
+    resolver.check()?;
     crate::storage::validate_generated_storage(&storage)?;
     Ok(storage)
 }
@@ -1771,15 +2011,19 @@ fn unvalidated_storage_of_body(
     link_index: &LinkIndex,
     web_path_prefix: &str,
 ) -> Result<String> {
+    let resolver = LinkResolver::new(link_index, doc);
     let rewritten_markdown =
-        rewrite_macro_page_references(&doc.body_markdown, &doc.directory, link_index);
+        rewrite_macro_page_references(&doc.body_markdown, &doc.directory, &resolver);
+    resolver.check()?;
     let converted = crate::markdown::render_markdown_storage(&rewritten_markdown, false)?;
-    Ok(rewrite_local_links_to_remote(
+    let storage = rewrite_local_links_to_remote(
         &converted.storage,
         &doc.directory,
-        link_index,
+        &resolver,
         web_path_prefix,
-    ))
+    );
+    resolver.check()?;
+    Ok(storage)
 }
 
 /// The number of lines of `file` that precede the first line of `body`, when
@@ -1798,10 +2042,10 @@ fn lines_before_body(file: &str, body: &str) -> Option<usize> {
 fn rewrite_macro_page_references(
     markdown: &str,
     current_dir: &Path,
-    link_index: &LinkIndex,
+    resolver: &LinkResolver<'_>,
 ) -> String {
-    rewrite_macro_parameter_lines(markdown, &|line, mode| {
-        rewrite_page_reference_parameter_line(line, current_dir, link_index, mode)
+    rewrite_macro_parameter_lines(markdown, &|line, mode, attachment| {
+        rewrite_page_reference_parameter_line(line, current_dir, resolver, mode, attachment)
     })
 }
 
@@ -1811,7 +2055,7 @@ fn rewrite_macro_page_references(
 /// parameters of its own, and a block shown as code is code.
 fn rewrite_macro_parameter_lines(
     markdown: &str,
-    rewrite: &impl Fn(&str, MacroPageReferenceMode) -> String,
+    rewrite: &impl Fn(&str, MacroPageReferenceMode, Option<&str>) -> String,
 ) -> String {
     let mut rewritten = String::with_capacity(markdown.len());
     let mut rest = 0;
@@ -1829,12 +2073,15 @@ fn rewrite_macro_parameter_lines(
                 rewritten.push_str(lines);
                 return;
             };
+            let attachment = (mode == MacroPageReferenceMode::AttachmentPreview)
+                .then(|| preview_attachment_parameter(lines))
+                .flatten();
             for line in lines.split_inclusive('\n') {
                 let text = line.trim_end_matches(['\r', '\n']);
                 if text.trim() == ":::" {
                     rewritten.push_str(line);
                 } else {
-                    rewritten.push_str(&rewrite(text, mode));
+                    rewritten.push_str(&rewrite(text, mode, attachment.as_deref()));
                     rewritten.push_str(&line[text.len()..]);
                 }
             }
@@ -1853,6 +2100,16 @@ fn rewrite_macro_parameter_lines(
     }
     rewritten.push_str(&markdown[rest..]);
     rewritten
+}
+
+fn preview_attachment_parameter(lines: &str) -> Option<String> {
+    let body = lines.trim_end().strip_suffix(":::")?;
+    let parameters =
+        crate::markdown::parse_macro_parameter_lines(body, "attachment preview").ok()?;
+    let filename = parameters
+        .get("attachment")
+        .or_else(|| parameters.get("name"))?;
+    crate::markdown::attachment_preview_file_name(filename).ok()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1899,8 +2156,9 @@ impl MacroPageReferenceMode {
 fn rewrite_page_reference_parameter_line(
     line: &str,
     current_dir: &Path,
-    link_index: &LinkIndex,
+    resolver: &LinkResolver<'_>,
     mode: MacroPageReferenceMode,
+    attachment: Option<&str>,
 ) -> String {
     let Some((name, value)) = line.split_once(':') else {
         return line.to_string();
@@ -1910,14 +2168,14 @@ fn rewrite_page_reference_parameter_line(
             name,
             value,
             current_dir,
-            link_index,
+            resolver,
         );
     };
     if name.trim() != expected_parameter {
         return line.to_string();
     }
     let target = value.trim();
-    let rewritten = local_target_to_page_placeholder(current_dir, target, link_index, mode)
+    let rewritten = local_target_to_page_placeholder(current_dir, target, resolver, attachment)
         .unwrap_or_else(|| target.to_string());
     format!("{}: {}", name.trim_end(), rewritten)
 }
@@ -1926,7 +2184,7 @@ fn rewrite_generic_macro_page_reference_parameter_line(
     name: &str,
     value: &str,
     current_dir: &Path,
-    link_index: &LinkIndex,
+    resolver: &LinkResolver<'_>,
 ) -> String {
     let trimmed = value.trim();
     let (prefix, target) = if let Some(target) = trimmed.strip_prefix("!page-link ") {
@@ -1936,21 +2194,16 @@ fn rewrite_generic_macro_page_reference_parameter_line(
     } else {
         return format!("{}: {}", name.trim_end(), trimmed);
     };
-    let rewritten = local_target_to_page_placeholder(
-        current_dir,
-        target,
-        link_index,
-        MacroPageReferenceMode::Generic,
-    )
-    .unwrap_or_else(|| target.to_string());
+    let rewritten = local_target_to_page_placeholder(current_dir, target, resolver, None)
+        .unwrap_or_else(|| target.to_string());
     format!("{}: {} {}", name.trim_end(), prefix, rewritten)
 }
 
 fn local_target_to_page_placeholder(
     current_dir: &Path,
     target: &str,
-    link_index: &LinkIndex,
-    mode: MacroPageReferenceMode,
+    resolver: &LinkResolver<'_>,
+    attachment: Option<&str>,
 ) -> Option<String> {
     if parse_page_placeholder_url(target).is_some() {
         return Some(target.to_string());
@@ -1972,50 +2225,12 @@ fn local_target_to_page_placeholder(
     } else {
         resolved
     };
-    let link = link_index.by_markdown_path.get(&markdown_target)?;
-    let placeholder = match mode {
-        MacroPageReferenceMode::Generic => PageLinkPlaceholder {
-            content_id: None,
-            space_key: link.space_key.clone(),
-            content_title: Some(link.title.clone()),
-            anchor: None,
-        },
-        MacroPageReferenceMode::Children => PageLinkPlaceholder {
-            content_id: None,
-            space_key: link.space_key.clone(),
-            content_title: Some(link.title.clone()),
-            anchor: None,
-        },
-        MacroPageReferenceMode::ExcerptInclude => PageLinkPlaceholder {
-            content_id: None,
-            space_key: link.space_key.clone(),
-            content_title: Some(link.title.clone()),
-            anchor: None,
-        },
-        MacroPageReferenceMode::IncludePage => PageLinkPlaceholder {
-            content_id: None,
-            space_key: link.space_key.clone(),
-            content_title: Some(link.title.clone()),
-            anchor: None,
-        },
-        MacroPageReferenceMode::PageTree => PageLinkPlaceholder {
-            content_id: None,
-            space_key: link.space_key.clone(),
-            content_title: Some(link.title.clone()),
-            anchor: None,
-        },
-        MacroPageReferenceMode::PageTreeSearch => PageLinkPlaceholder {
-            content_id: None,
-            space_key: link.space_key.clone(),
-            content_title: Some(link.title.clone()),
-            anchor: None,
-        },
-        MacroPageReferenceMode::AttachmentPreview => PageLinkPlaceholder {
-            content_id: None,
-            space_key: link.space_key.clone(),
-            content_title: Some(link.title.clone()),
-            anchor: None,
-        },
+    let link = resolver.target(&markdown_target, attachment, true)?;
+    let placeholder = PageLinkPlaceholder {
+        content_id: None,
+        space_key: link.space_key.clone(),
+        content_title: link.title.clone(),
+        anchor: None,
     };
     Some(build_page_placeholder_url(&placeholder))
 }
@@ -2060,7 +2275,7 @@ fn default_web_path_prefix(provider: crate::model::ProviderKind) -> &'static str
 fn rewrite_local_links_to_remote(
     storage: &str,
     current_dir: &Path,
-    link_index: &LinkIndex,
+    resolver: &LinkResolver<'_>,
     web_path_prefix: &str,
 ) -> String {
     static ELEMENT: LazyLock<Regex> =
@@ -2086,7 +2301,7 @@ fn rewrite_local_links_to_remote(
                         let target = rewrite_local_target_url(
                             current_dir,
                             original,
-                            link_index,
+                            resolver,
                             web_path_prefix,
                         )
                         .unwrap_or_else(|| original.to_string());
@@ -2100,7 +2315,7 @@ fn rewrite_local_links_to_remote(
 fn rewrite_local_target_url(
     current_dir: &Path,
     target: &str,
-    link_index: &LinkIndex,
+    resolver: &LinkResolver<'_>,
     web_path_prefix: &str,
 ) -> Option<String> {
     if let Some(link) = parse_page_placeholder_url(target) {
@@ -2137,7 +2352,7 @@ fn rewrite_local_target_url(
         resolved.clone()
     };
 
-    if let Some(link) = link_index.by_markdown_path.get(&markdown_target)
+    if let Some(link) = resolver.target(&markdown_target, None, false)
         && let Some(content_id) = &link.content_id
     {
         let mut url = format!(
@@ -2161,7 +2376,7 @@ fn rewrite_local_target_url(
     }
     let owner_dir = attachments_dir.parent()?;
     let file_name = resolved.file_name()?.to_str()?;
-    let owner = link_index.by_directory.get(owner_dir)?;
+    let owner = resolver.target(&owner_dir.join("index.md"), Some(file_name), false)?;
     let content_id = owner.content_id.as_deref()?;
 
     let mut url = format!(
@@ -2850,7 +3065,7 @@ fn rewrite_macro_page_placeholders(
     paths: &BTreeMap<String, PathBuf>,
     items: &BTreeMap<String, ContentItem>,
 ) -> String {
-    rewrite_macro_parameter_lines(markdown, &|line, mode| {
+    rewrite_macro_parameter_lines(markdown, &|line, mode, _| {
         rewrite_macro_page_placeholder_line(line, mode, current_dir, paths, items)
     })
 }

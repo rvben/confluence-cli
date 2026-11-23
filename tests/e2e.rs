@@ -735,6 +735,204 @@ async fn plan_and_apply_resolve_pulled_links_for_equivalent_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_page_resolves_links_to_a_sibling_without_applying_it() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().expect("simulator config home");
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    let root_id = simulator.add_page("Linked tree", Some("100"), "<p>Root</p>");
+    let sibling_id = simulator.add_page("Sibling", Some(&root_id), "<p>Sibling body</p>");
+    let source_id = simulator.add_page(
+        "Source",
+        Some(&root_id),
+        concat!(
+            r#"<p><ac:link><ri:page ri:content-title="Sibling" /><ac:plain-text-link-body><![CDATA[Read the sibling]]></ac:plain-text-link-body></ac:link></p>"#,
+            r#"<ac:structured-macro ac:name="include"><ac:parameter ac:name=""><ac:link><ri:page ri:space-key="TEST" ri:content-title="Sibling" /></ac:link></ac:parameter></ac:structured-macro>"#,
+        ),
+    );
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().expect("pull destination");
+        let attachment = temp.path().join("report.pdf");
+        fs::write(&attachment, "attachment fixture").expect("write attachment");
+        cfg.run_json(&[
+            "attachment",
+            "upload",
+            &sibling_id,
+            "--file",
+            attachment.to_str().unwrap(),
+        ]);
+        let tree = temp.path().join("tree");
+        let tree_arg = tree.to_str().unwrap();
+        cfg.run_json(&["pull", "tree", &root_id, tree_arg]);
+        let source = find_index_md_by_title(&tree, "Source");
+        let sibling = find_index_md_by_title(&tree, "Sibling");
+        let selected = source.parent().unwrap().to_str().unwrap();
+        let sibling_link = format!("../sibling--{sibling_id}");
+        let markdown = fs::read_to_string(&source).expect("source Markdown");
+        assert!(
+            markdown.contains(&format!("[Read the sibling]({sibling_link}/index.md)")),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(&format!("page: {sibling_link}/index.md")),
+            "{markdown}"
+        );
+
+        for path in [tree_arg, selected] {
+            let plan = cfg.run_json(&["plan", path, "--diff"]);
+            let items = list_items(&plan, "plan");
+            assert!(
+                !items.is_empty() && items.iter().all(|item| item["action"] == "noop"),
+                "{path}: {plan}"
+            );
+        }
+        let remote_page = |id| cfg.run_json(&["page", "get", id, "--show-body"]);
+        let source_before = remote_page(&source_id);
+        let sibling_before = remote_page(&sibling_id);
+        cfg.run_json(&["--yes", "apply", selected]);
+        assert_eq!(remote_page(&source_id), source_before);
+
+        let sibling_markdown = fs::read_to_string(&sibling).expect("sibling Markdown");
+        let sibling_edit = sibling_markdown.replace("title: Sibling", "title: Pending rename");
+        assert_ne!(sibling_edit, sibling_markdown);
+        fs::write(&sibling, &sibling_edit).expect("edit sibling outside selection");
+        let sibling_sidecar_path = sibling.with_file_name(".confluence.json");
+        let sibling_sidecar = fs::read(&sibling_sidecar_path).expect("sibling sidecar");
+
+        let edited = format!("{markdown}\n\n[Download]({sibling_link}/attachments/report.pdf)\n");
+        fs::write(
+            &source,
+            edited.replace("Read the sibling", "Open the sibling"),
+        )
+        .expect("edit source");
+        let plan = cfg.run_json(&["plan", selected, "--diff"]);
+        let items = list_items(&plan, "plan");
+        assert_eq!(items.len(), 1, "{plan}");
+        assert_eq!(items[0]["content_id"], source_id.as_str());
+        assert_eq!(items[0]["action"], "update_content");
+
+        cfg.run_json(&["--yes", "apply", selected]);
+        let after = remote_page(&source_id);
+        let page = first_item(&after, "page get");
+        assert_eq!(page["version"], 2);
+        let storage = string_field(page, "body_storage");
+        assert!(
+            storage.contains(&format!(
+                r#"href="/wiki/pages/viewpage.action?pageId={sibling_id}">Open the sibling"#
+            )),
+            "{storage}"
+        );
+        assert!(
+            storage.contains(r#"ri:content-title="Sibling""#),
+            "{storage}"
+        );
+        assert!(
+            storage.contains(&format!(
+                r#"href="/wiki/download/attachments/{sibling_id}/report.pdf""#
+            )),
+            "{storage}"
+        );
+        assert_eq!(remote_page(&sibling_id), sibling_before);
+        assert_eq!(fs::read_to_string(&sibling).unwrap(), sibling_edit);
+        assert_eq!(fs::read(&sibling_sidecar_path).unwrap(), sibling_sidecar);
+    })
+    .await
+    .expect("selected page task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_sync_rejects_unpublished_attachments_and_foreign_sites() {
+    let local = ConfluenceSimulator::start().await;
+    let foreign = ConfluenceSimulator::start().await;
+    let config = TempDir::new().expect("simulator config home");
+    let local_cfg = simulated_cloud_config(&local, &config);
+    let foreign_cfg = simulated_cloud_config(&foreign, &config);
+    let root_id = local.add_page("Root", Some("100"), "<p>Root</p>");
+    let source_id = local.add_page("Source", Some(&root_id), "<p>Original</p>");
+    let sibling_id = local.add_page("Sibling", Some(&root_id), "<p>Sibling</p>");
+    let foreign_id = foreign.add_page("Foreign", Some("100"), "<p>Other site</p>");
+
+    tokio::task::spawn_blocking(move || {
+        let _config = config;
+        let temp = TempDir::new().expect("pull destination");
+        let tree = temp.path().join("tree");
+        local_cfg.run_json(&["pull", "tree", &root_id, tree.to_str().unwrap()]);
+        let elsewhere = temp.path().join("foreign");
+        foreign_cfg.run_json(&["pull", "page", &foreign_id, elsewhere.to_str().unwrap()]);
+        let source = find_index_md_by_title(&tree, "Source");
+        let selected = source.parent().unwrap().to_str().unwrap();
+        let sibling = find_index_md_by_title(&tree, "Sibling");
+        let local_file = sibling.parent().unwrap().join("attachments/local-only.pdf");
+        fs::create_dir_all(local_file.parent().unwrap()).expect("attachment directory");
+        fs::write(local_file, "unpublished file").expect("local attachment");
+        let original = fs::read_to_string(&source).expect("pulled source Markdown");
+        let page = || local_cfg.run_json(&["page", "get", &source_id, "--show-body"]);
+        let before = page();
+        let foreign_markdown = find_index_md_by_title(&elsewhere, "Foreign");
+        let foreign_target = pathdiff::diff_paths(foreign_markdown, source.parent().unwrap())
+            .expect("relative foreign target");
+        let cases = [
+            (format!("[Download](../sibling--{sibling_id}/attachments/local-only.pdf)"), "not recorded as published"),
+            (format!(":::confluence-view-file\npage: ../sibling--{sibling_id}/index.md\nattachment: local-only.pdf\n:::"), "not recorded as published"),
+            (format!("[Foreign]({})", foreign_target.display()), "different Confluence site"),
+        ];
+        for (link, expected_error) in cases {
+            fs::write(&source, format!("{original}\n\n{link}\n")).expect("edit source");
+            for args in [&["plan", selected][..], &["--yes", "apply", selected]] {
+                let result = local_cfg.command().arg("--json").args(args).output().expect("sync command");
+                assert_eq!(result.status.code(), Some(2), "{args:?}: {result:?}");
+                let error = String::from_utf8_lossy(&result.stderr);
+                assert!(error.contains(expected_error), "{args:?}: {error}");
+            }
+            assert_eq!(page(), before);
+        }
+
+        let same_site = temp.path().join("same-site");
+        local_cfg.run_json(&["pull", "page", &sibling_id, same_site.to_str().unwrap()]);
+        let same_site_page = find_index_md_by_title(&same_site, "Sibling");
+        let relative = pathdiff::diff_paths(&same_site_page, source.parent().unwrap()).unwrap();
+        fs::write(&source, format!("{original}\n\n[Read]({})\n", relative.display()))
+            .expect("link to an independently pulled page on the same site");
+        let plan = local_cfg.run_json(&["plan", selected]);
+        assert_eq!(list_items(&plan, "plan")[0]["action"], "update_content");
+
+        for index in [&source, &sibling, &same_site_page, &find_index_md_by_title(&tree, "Root")] {
+            let sidecar = index.with_file_name(".confluence.json");
+            let mut metadata: Value = serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+            assert!(metadata.as_object_mut().unwrap().remove("site_fingerprint").is_some());
+            fs::write(sidecar, serde_json::to_vec(&metadata).unwrap()).expect("legacy sidecar");
+        }
+        let result = local_cfg.command().arg("--json").args(["plan", selected]).output().unwrap();
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("cannot verify the Confluence site"),
+            "{result:?}"
+        );
+        fs::write(&source, format!("{original}\n\n[Read](../sibling--{sibling_id}/index.md)\n"))
+            .expect("link within a legacy tree");
+        let plan = local_cfg.run_json(&["plan", selected]);
+        assert_eq!(list_items(&plan, "plan")[0]["action"], "update_content");
+
+        fs::write(&source, format!("{original}\n\n[Parent](../index.md)\n"))
+            .expect("link to the legacy parent");
+        let selected_dir = source.parent().unwrap();
+        let result = local_cfg
+            .command()
+            .current_dir(selected_dir.parent().unwrap())
+            .arg("--json")
+            .args(["plan".as_ref(), selected_dir.file_name().unwrap()])
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        let plan: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(list_items(&plan, "plan")[0]["action"], "update_content");
+    })
+    .await
+    .expect("scoped link validation task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pull_writes_the_rest_of_a_tree_when_a_page_does_not_convert() {
     let simulator = ConfluenceSimulator::start().await;
     let config_home = TempDir::new().expect("simulator config home");

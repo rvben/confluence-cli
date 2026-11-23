@@ -45,6 +45,7 @@ pub struct ListWindow<T> {
 pub trait ConfluenceProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     fn web_path_prefix(&self) -> String;
+    fn site_url(&self) -> &str;
 
     async fn ping(&self) -> Result<()>;
     async fn current_user(&self) -> Result<CurrentUser>;

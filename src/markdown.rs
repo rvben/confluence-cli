@@ -50,6 +50,8 @@ pub struct Sidecar {
     pub space_key: Option<String>,
     pub provider: Option<ProviderKind>,
     pub web_path_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_fingerprint: Option<String>,
     pub remote_version: Option<u64>,
     pub remote_parent_id: Option<String>,
     pub last_pulled_hash: Option<String>,
@@ -5243,7 +5245,10 @@ fn parse_generic_macro_block(
     Ok((parameters, body_storage))
 }
 
-fn parse_macro_parameter_lines(body: &str, context: &str) -> Result<BTreeMap<String, String>> {
+pub(crate) fn parse_macro_parameter_lines(
+    body: &str,
+    context: &str,
+) -> Result<BTreeMap<String, String>> {
     let mut parameters = BTreeMap::new();
     for line in body.lines() {
         let trimmed = line.trim();
@@ -5570,7 +5575,7 @@ fn build_simple_macro_storage(name: &str) -> String {
     format!(r#"<ac:macro ac:name="{name}" />"#)
 }
 
-fn attachment_preview_file_name(value: &str) -> Result<String> {
+pub(crate) fn attachment_preview_file_name(value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         bail!("attachment parameter cannot be empty");
