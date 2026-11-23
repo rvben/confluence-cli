@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.43](https://github.com/rvben/confluence-cli/compare/v0.1.42...v0.1.43) - 2026-11-23
+
+### Added
+
+- **sync**: support safe publishing from fresh CI checkouts ([ef39b14](https://github.com/rvben/confluence-cli/commit/ef39b14e0efa498015cce205ae9e8b0b9cf94545))
+
 ## [0.1.42](https://github.com/rvben/confluence-cli/compare/v0.1.41...v0.1.42) - 2026-11-23
 
 ### Fixed
