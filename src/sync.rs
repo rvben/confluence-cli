@@ -16,8 +16,10 @@ use tempfile::Builder;
 use walkdir::WalkDir;
 
 use self::publish_state::{PublishState, lock_state, state_path};
-pub(crate) use self::tree_layout::TreeLayout;
-use self::tree_layout::{ExistingTree, TreePull};
+use self::tree_layout::{
+    ExistingTree, FAILED_PAGE_PLACEMENT_FILE, FailedPagePlacement, TreePathPlan, TreePull,
+};
+pub(crate) use self::tree_layout::{TreeLayout, TreeMove, TreePathChange};
 
 use crate::markdown::{
     Frontmatter, LocalDocument, PULL_FAILURES_DIR, PULL_FAILURES_MANIFEST, PageLinkPlaceholder,
@@ -92,7 +94,7 @@ pub async fn pull_page(
     let item = provider
         .get_content(ContentKind::Page, &root_id, true)
         .await?;
-    pull_items(provider, root, vec![item], None).await
+    pull_items(provider, root, vec![item]).await
 }
 
 pub(crate) async fn pull_tree(
@@ -101,7 +103,42 @@ pub(crate) async fn pull_tree(
     root: &Path,
     layout: TreeLayout,
     force: bool,
+    accepted_moves: &[TreeMove],
 ) -> Result<Vec<PulledPage>> {
+    let PreparedTreePull {
+        items,
+        existing,
+        plan,
+    } = prepare_tree_pull(provider, reference, root, layout, force).await?;
+    plan.check_acceptance(accepted_moves)?;
+    stage_pull(provider, root, &items, plan.paths, existing).await
+}
+
+pub(crate) async fn preview_tree_pull(
+    provider: &dyn ConfluenceProvider,
+    reference: &str,
+    root: &Path,
+    layout: TreeLayout,
+) -> Result<Vec<TreePathChange>> {
+    Ok(prepare_tree_pull(provider, reference, root, layout, false)
+        .await?
+        .plan
+        .changes)
+}
+
+struct PreparedTreePull {
+    items: BTreeMap<String, ContentItem>,
+    existing: Option<ExistingTree>,
+    plan: TreePathPlan,
+}
+
+async fn prepare_tree_pull(
+    provider: &dyn ConfluenceProvider,
+    reference: &str,
+    root: &Path,
+    layout: TreeLayout,
+    force: bool,
+) -> Result<PreparedTreePull> {
     let existing = {
         let docs = validate_pull_destination(root, force)?;
         if force {
@@ -116,12 +153,18 @@ pub(crate) async fn pull_tree(
         .await?;
     let mut items = provider.list_children(&root_id, true).await?;
     items.push(root_item);
+    let items = index_pull_items(items);
     let tree = TreePull {
         root_id,
         layout,
         existing,
     };
-    pull_items(provider, root, items, Some(tree)).await
+    let plan = tree.plan(&items)?;
+    Ok(PreparedTreePull {
+        items,
+        existing: tree.existing,
+        plan,
+    })
 }
 
 pub async fn pull_space(
@@ -139,7 +182,7 @@ pub async fn pull_space(
             .list_space_content(ContentKind::BlogPost, space)
             .await?,
     );
-    pull_items(provider, root, items, None).await
+    pull_items(provider, root, items).await
 }
 
 pub async fn pull_space_since(
@@ -169,7 +212,7 @@ pub async fn pull_space_since(
     for result in listed {
         items.push(provider.get_content(result.kind, &result.id, true).await?);
     }
-    pull_items(provider, root, items, None).await
+    pull_items(provider, root, items).await
 }
 
 pub fn plan_path(
@@ -466,7 +509,7 @@ pub(crate) async fn preview_path(
 ) -> Result<SyncPlan> {
     let mut docs = load_required_local_documents(root)?;
     if let Some(path) = state_file {
-        let state = PublishState::read_for_preview(&state_path(root, path)?)?;
+        let mut state = PublishState::read_for_preview(&state_path(root, path)?)?;
         state.restore(root, &mut docs, provider)?;
     }
     let plan = plan_documents(
@@ -560,7 +603,7 @@ pub(crate) async fn apply_path(
     let mut state = match state_file.as_deref() {
         Some(path) if init_state => Some(PublishState::initialize(path, site.clone(), &docs)?),
         Some(path) => {
-            let state = PublishState::read_for_apply(path)?;
+            let mut state = PublishState::read_for_apply(path)?;
             state.restore(root, &mut docs, Some(provider))?;
             Some(state)
         }
@@ -959,12 +1002,26 @@ async fn pull_items(
     provider: &dyn ConfluenceProvider,
     root: &Path,
     items: Vec<ContentItem>,
-    tree: Option<TreePull>,
 ) -> Result<Vec<PulledPage>> {
-    let items: BTreeMap<_, _> = items
+    let items = index_pull_items(items);
+    let paths = compute_paths(Path::new(""), &items);
+    stage_pull(provider, root, &items, paths, None).await
+}
+
+fn index_pull_items(items: Vec<ContentItem>) -> BTreeMap<String, ContentItem> {
+    items
         .into_iter()
         .map(|item| (item.id.clone(), item))
-        .collect();
+        .collect()
+}
+
+async fn stage_pull(
+    provider: &dyn ConfluenceProvider,
+    root: &Path,
+    items: &BTreeMap<String, ContentItem>,
+    paths: BTreeMap<String, PathBuf>,
+    existing: Option<ExistingTree>,
+) -> Result<Vec<PulledPage>> {
     let parent = root
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -975,14 +1032,13 @@ async fn pull_items(
         .tempdir_in(parent)
         .with_context(|| format!("failed to stage pull beside {}", root.display()))?;
     let staged_root = staging.path().join("snapshot");
-    let paths = if let Some(tree) = &tree {
-        tree.paths(&staged_root, &items)?
-    } else {
-        compute_paths(&staged_root, &items)
-    };
+    let paths = paths
+        .into_iter()
+        .map(|(id, path)| (id, staged_root.join(path)))
+        .collect();
     let (written, unconvertible, warnings) =
-        write_items(provider, &staged_root, &items, paths).await?;
-    if let Some(initial) = tree.and_then(|tree| tree.existing) {
+        write_items(provider, &staged_root, items, paths).await?;
+    if let Some(initial) = existing {
         let docs = validate_pull_destination(root, false)?;
         let current = ExistingTree::from_documents(root, &docs, provider)?;
         if current != initial {
@@ -1114,6 +1170,7 @@ fn unconvertible_pages_error(
                     "files": PULL_FAILURE_ARTIFACTS
                         .iter()
                         .filter(|name| page.generated_storage || **name != "generated.xml")
+                        .filter(|name| page.content_id.is_some() || **name != FAILED_PAGE_PLACEMENT_FILE)
                         .collect::<Vec<_>>(),
                 }))
                 .collect::<Vec<_>>(),
@@ -1248,7 +1305,12 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<Vec<LocalDocume
 }
 
 /// The files a pull keeps for a page it leaves out.
-const PULL_FAILURE_ARTIFACTS: [&str; 3] = ["generated.md", "generated.xml", "remote.xml"];
+const PULL_FAILURE_ARTIFACTS: [&str; 4] = [
+    "generated.md",
+    "generated.xml",
+    "remote.xml",
+    FAILED_PAGE_PLACEMENT_FILE,
+];
 
 /// Records the files kept for the pages a pull left out, which is what lets
 /// a later pull tell them from files of the user.
@@ -1731,6 +1793,17 @@ fn keep_unconvertible_page(root: &Path, left_out: &LeftOutPage) -> Result<Unconv
         write("generated.xml", storage)?;
     }
     write("remote.xml", &left_out.page.remote_storage)?;
+    if let Some(content_id) = document.sidecar.content_id.clone() {
+        let placement = FailedPagePlacement {
+            content_id,
+            parent_id: document.sidecar.remote_parent_id.clone(),
+            site_fingerprint: document.sidecar.site_fingerprint.clone(),
+        };
+        write(
+            FAILED_PAGE_PLACEMENT_FILE,
+            &serde_json::to_string_pretty(&placement)?,
+        )?;
+    }
     Ok(UnconvertiblePage {
         content_id: document.sidecar.content_id.clone(),
         title: document.frontmatter.title.clone(),
@@ -7737,7 +7810,12 @@ mod round_trip_tests {
         assert!(!generated.contains("index.md"), "{generated}");
         assert_eq!(
             details["pages"][0]["files"],
-            serde_json::json!(["generated.md", "generated.xml", "remote.xml"])
+            serde_json::json!([
+                "generated.md",
+                "generated.xml",
+                "remote.xml",
+                "placement.json"
+            ])
         );
 
         // Markdown that does not convert at all leaves no storage to keep,
@@ -7747,7 +7825,7 @@ mod round_trip_tests {
         assert!(failures.join("open-block--303/generated.md").is_file());
         assert_eq!(
             details["pages"][1]["files"],
-            serde_json::json!(["generated.md", "remote.xml"])
+            serde_json::json!(["generated.md", "remote.xml", "placement.json"])
         );
         let hint = error.hint.expect("hint");
         assert!(

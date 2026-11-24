@@ -930,7 +930,259 @@ async fn tree_refresh_keeps_folder_names_and_links_and_refuses_remote_moves() {
         assert_eq!(missing.status.code(), Some(7), "{missing:?}");
         let error: Value = serde_json::from_slice(&missing.stderr).unwrap();
         assert!(string_field(&error["error"], "message").contains("no longer in the remote tree"), "{error}");
+        let preview = cfg.run_json(&["pull", "preview-tree", &root_id, path]);
+        let missing = list_items(&preview, "pull preview-tree")
+            .iter()
+            .find(|row| row["content_id"] == chapter_id)
+            .unwrap();
+        assert_eq!(missing["change"], "missing");
+        assert_eq!(missing["previous_path"], "handbook-revised/appendix/first-chapter");
+        assert_eq!(missing["path"], Value::Null);
         assert!(tree.join("handbook-revised/appendix/first-chapter/index.md").is_file());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tree_pull_previews_and_can_accept_specific_remote_moves() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().unwrap();
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    let root = simulator.add_page("Guide", None, "<p>Intro</p>");
+    let source = simulator.add_page("Source", Some(&root), "<p>Source</p>");
+    let target = simulator.add_page("Target", Some(&root), "<p>Target</p>");
+    let moved = simulator.add_page("First page", Some(&source), "<p>First</p>");
+    let second = simulator.add_page("Second page", Some(&source), "<p>Second</p>");
+    let child = simulator.add_page("Child", Some(&moved), "<p>Child</p>");
+    simulator.add_page("Existing page", Some(&target), "<p>Existing</p>");
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let destination = TempDir::new().unwrap();
+        let tree = destination.path().join("tree");
+        let path = tree.to_str().unwrap();
+        let pull = ["pull", "tree", &root, path, "--layout", "slug"];
+        let fresh = destination.path().join("uncreated/tree");
+        let preview = cfg.run_json(&[
+            "pull",
+            "preview-tree",
+            &root,
+            fresh.to_str().unwrap(),
+            "--layout",
+            "slug",
+        ]);
+        assert!(
+            list_items(&preview, "pull preview-tree")
+                .iter()
+                .all(|row| row["change"] == "new")
+        );
+        assert!(!fresh.parent().unwrap().exists());
+        cfg.run_json(&pull);
+        let before = tree.join("guide/source/Custom Page");
+        fs::rename(tree.join("guide/source/first-page"), &before).unwrap();
+        fs::rename(before.join("child"), before.join("My Child")).unwrap();
+        let occupied = tree.join("guide/target/Custom Page");
+        fs::rename(tree.join("guide/target/existing-page"), &occupied).unwrap();
+        let old_markdown = fs::read(tree.join("guide/index.md")).unwrap();
+        for id in [&moved, &second] {
+            cfg.run_json(&["page", "update", id, "--parent", &target]);
+        }
+        let newcomer = simulator.add_page("Second-Page", Some(&source), "<p>New page</p>");
+        let body = format!(
+            r#"<p><a href="/wiki/pages/viewpage.action?pageId={child}">Read child</a></p>"#
+        );
+        cfg.run_json(&[
+            "page", "update", &root, "--format", "storage", "--body", &body,
+        ]);
+
+        let read_only = cfg
+            .command()
+            .env("CONFLUENCE_READ_ONLY", "true")
+            .args([
+                "pull",
+                "preview-tree",
+                &root,
+                path,
+                "--layout",
+                "slug",
+                "-o",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert!(read_only.status.success(), "{read_only:?}");
+        let preview: Value = serde_json::from_slice(&read_only.stdout).unwrap();
+        let rows = list_items(&preview, "pull preview-tree");
+        let row = |id: &str| rows.iter().find(|item| item["content_id"] == id).unwrap();
+        let proposed = format!("guide/target/Custom Page--{moved}");
+        assert_eq!(row(&moved)["change"], "move");
+        assert_eq!(row(&moved)["previous_path"], "guide/source/Custom Page");
+        assert_eq!(row(&moved)["path"], proposed);
+        assert_eq!(row(&moved)["parent_id"], target);
+        assert_eq!(row(&second)["change"], "move");
+        assert_eq!(
+            row(&newcomer)["path"],
+            format!("guide/source/second-page--{newcomer}")
+        );
+        assert_eq!(row(&child)["change"], "relocated");
+        assert_eq!(row(&child)["path"], format!("{proposed}/My Child"));
+        assert_eq!(fs::read(tree.join("guide/index.md")).unwrap(), old_markdown);
+        assert!(before.is_dir());
+        assert!(!tree.join(&proposed).exists());
+
+        let moved_arg = format!("{moved}={target}");
+        let second_arg = format!("{second}={target}");
+        let mut partial = pull.to_vec();
+        partial.extend(["--accept-move", &moved_arg]);
+        let rejected = cfg.command().args(partial).arg("--json").output().unwrap();
+        assert_eq!(rejected.status.code(), Some(7), "{rejected:?}");
+        assert!(before.is_dir());
+        let error: Value = serde_json::from_slice(&rejected.stderr).unwrap();
+        assert_eq!(error["error"]["details"]["moves"][0]["content_id"], second);
+
+        let mut accepted = pull.to_vec();
+        accepted.extend(["--accept-move", &moved_arg, "--accept-move", &second_arg]);
+        let changed_destination =
+            simulator.add_page("Different parent", Some(&root), "<p>Other</p>");
+        cfg.run_json(&["page", "update", &moved, "--parent", &changed_destination]);
+        let rejection = cfg
+            .command()
+            .args(&accepted)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert_eq!(rejection.status.code(), Some(7), "{rejection:?}");
+        assert!(String::from_utf8_lossy(&rejection.stderr).contains("current parent"));
+        assert!(before.is_dir());
+        cfg.run_json(&["page", "update", &moved, "--parent", &target]);
+        cfg.run_json(&accepted);
+        assert!(tree.join(&proposed).join("My Child/index.md").is_file());
+        assert!(tree.join("guide/target/second-page/index.md").is_file());
+        assert!(
+            tree.join(format!("guide/source/second-page--{newcomer}/index.md"))
+                .is_file()
+        );
+        assert!(occupied.join("index.md").is_file());
+        assert!(!before.exists());
+        let markdown = fs::read_to_string(tree.join("guide/index.md")).unwrap();
+        assert!(
+            markdown.contains(&format!(
+                "[Read child](target/Custom%20Page--{moved}/My%20Child/index.md)"
+            )),
+            "{markdown}"
+        );
+        assert!(
+            list_items(&cfg.run_json(&["plan", path]), "plan")
+                .iter()
+                .all(|item| item["action"] == "noop")
+        );
+        let stale = cfg.command().args(accepted).output().unwrap();
+        assert!(!stale.status.success(), "{stale:?}");
+        assert!(
+            String::from_utf8_lossy(&stale.stderr).contains("does not have a remote parent move")
+        );
+        cfg.run_json(&pull);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tree_pull_requires_acceptance_for_moves_of_previously_unconvertible_ancestors() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().unwrap();
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    let broken = r#"<ac:structured-macro ac:name="code"><ac:rich-text-body><p>x</p></ac:rich-text-body></ac:structured-macro>"#;
+    let root = simulator.add_page("Root", None, "<p>Root text</p>");
+    let parent = simulator.add_page("Old parent", Some(&root), broken);
+    let moved = simulator.add_page("Movable", Some(&parent), broken);
+    let leaf = simulator.add_page("Leaf", Some(&moved), "<p>Leaf text</p>");
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().unwrap();
+        let tree = temp.path().join("tree");
+        let path = tree.to_str().unwrap();
+        let pull = ["pull", "tree", &root, path, "--layout", "slug"];
+        let run = |args: &[&str]| cfg.command().args(args).arg("--json").output().unwrap();
+        let partial = run(&pull);
+        assert_eq!(partial.status.code(), Some(2), "{partial:?}");
+        let old_leaf = tree.join("root/old-parent/movable/leaf/index.md");
+        assert!(old_leaf.is_file());
+        assert!(!tree.join("root/old-parent/movable/index.md").exists());
+        let new_parent = simulator.add_page("New parent", Some(&root), "<p>New parent text</p>");
+        cfg.run_json(&[
+            "page",
+            "update",
+            &moved,
+            "--parent",
+            &new_parent,
+            "--format",
+            "storage",
+            "--body",
+            "<p>Recovered</p>",
+        ]);
+        let preview = cfg.run_json(&["pull", "preview-tree", &root, path, "--layout", "slug"]);
+        let rows = list_items(&preview, "pull preview-tree");
+        let row = |id: &str| rows.iter().find(|row| row["content_id"] == id).unwrap();
+        assert_eq!(row(&moved)["change"], "move");
+        assert_eq!(row(&moved)["previous_parent_id"], parent);
+        assert_eq!(row(&moved)["path"], "root/new-parent/movable");
+        assert_eq!(row(&leaf)["change"], "relocated");
+
+        let failures = tree.join(".confluence-pull-failures");
+        let manifest_path = failures.join("manifest.json");
+        let original_manifest = fs::read(&manifest_path).unwrap();
+        let mut legacy_manifest: serde_json::Value =
+            serde_json::from_slice(&original_manifest).unwrap();
+        let mut placements = Vec::new();
+        for artifact in [
+            format!("old-parent--{parent}/placement.json"),
+            format!("movable--{moved}/placement.json"),
+        ] {
+            let artifact_path = failures.join(&artifact);
+            placements.push((artifact_path.clone(), fs::read(&artifact_path).unwrap()));
+            fs::remove_file(&artifact_path).unwrap();
+            assert!(
+                legacy_manifest
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(&artifact)
+                    .is_some()
+            );
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec(&legacy_manifest).unwrap(),
+            )
+            .unwrap();
+            let legacy_preview = run(&["pull", "preview-tree", &root, path, "--layout", "slug"]);
+            if placements.len() == 1 {
+                assert!(legacy_preview.status.success(), "{legacy_preview:?}");
+                let legacy_rows: serde_json::Value =
+                    serde_json::from_slice(&legacy_preview.stdout).unwrap();
+                assert_eq!(legacy_rows, preview);
+            } else {
+                assert_eq!(legacy_preview.status.code(), Some(7), "{legacy_preview:?}");
+                assert!(old_leaf.is_file());
+            }
+        }
+        for (artifact_path, original) in placements {
+            fs::write(artifact_path, original).unwrap();
+        }
+        fs::write(manifest_path, original_manifest).unwrap();
+
+        let refused = run(&pull);
+        assert_eq!(refused.status.code(), Some(7), "{refused:?}");
+        assert!(old_leaf.is_file());
+        let acceptance = format!("{moved}={new_parent}");
+        let mut accepted = pull.to_vec();
+        accepted.extend(["--accept-move", &acceptance]);
+        let partial = run(&accepted);
+        assert_eq!(partial.status.code(), Some(2), "{partial:?}");
+        assert!(tree.join("root/new-parent/movable/leaf/index.md").is_file());
+        assert!(tree.join("root/new-parent/movable/index.md").is_file());
+        assert!(!old_leaf.exists());
     })
     .await
     .unwrap();
@@ -1312,8 +1564,12 @@ async fn test_ci_state(config: fn(&ConfluenceSimulator, &TempDir) -> E2eConfig) 
         let first_arg = first.to_str().unwrap();
         let second = checkout("second", "Second publish");
         let second_arg = second.to_str().unwrap();
+        let renamed = second.join("Publishing Guide");
+        fs::rename(second.join(page_dir), &renamed).unwrap();
         let third = checkout("third", "Third publish");
         let third_arg = third.to_str().unwrap();
+        let third_renamed = third.join("Publishing Guide v2");
+        fs::rename(third.join(page_dir), &third_renamed).unwrap();
 
         let run = |args: &[&str]| cfg.command().args(args).output().unwrap();
         let remote = || cfg.run_json(&["page", "get", &page_id, "--show-body"]);
@@ -1333,6 +1589,53 @@ async fn test_ci_state(config: fn(&ConfluenceSimulator, &TempDir) -> E2eConfig) 
             .expect("new CI page");
         let faq_id = string_field(created, "content_id");
         let before_preview = fs::read(&state).unwrap();
+        let ambiguous = checkout("ambiguous", "First publish");
+        let ambiguous_path = ambiguous.join(page_dir);
+        fs::rename(
+            ambiguous_path.join("faq"),
+            ambiguous_path.join("renamed-faq"),
+        )
+        .unwrap();
+        let missing_identity = run(&[
+            "plan",
+            ambiguous.to_str().unwrap(),
+            "--state-file",
+            state_arg,
+        ]);
+        assert!(!missing_identity.status.success(), "{missing_identity:?}");
+        assert!(
+            String::from_utf8_lossy(&missing_identity.stderr)
+                .contains("refers to missing document")
+        );
+
+        let reused_path = checkout("reused-path", "First publish");
+        fs::rename(reused_path.join(page_dir), reused_path.join("Moved Guide")).unwrap();
+        let newcomer_seed = temp.path().join("newcomer-seed");
+        let newcomer = simulator.add_page("Newcomer", None, "<p>Newcomer body</p>");
+        cfg.run_json(&["pull", "page", &newcomer, newcomer_seed.to_str().unwrap()]);
+        fs::rename(
+            find_index_md(&newcomer_seed).parent().unwrap(),
+            reused_path.join(page_dir),
+        )
+        .unwrap();
+        let reused_plan = [
+            "plan",
+            reused_path.to_str().unwrap(),
+            "--state-file",
+            state_arg,
+        ];
+        let overlap = run(&reused_plan);
+        assert!(!overlap.status.success(), "{overlap:?}");
+        assert!(String::from_utf8_lossy(&overlap.stderr).contains("both paths are in use"));
+        fs::rename(reused_path.join(page_dir), reused_path.join("Newcomer")).unwrap();
+        let resolved = cfg.run_json(&reused_plan);
+        assert!(
+            list_items(&resolved, "plan")
+                .iter()
+                .all(|item| item["action"] == "noop")
+        );
+        assert_eq!(fs::read(&state).unwrap(), before_preview);
+
         let lock_path = temp.path().join("production.json.lock");
         let reserved = run(&[
             "apply",
@@ -1374,10 +1677,10 @@ async fn test_ci_state(config: fn(&ConfluenceSimulator, &TempDir) -> E2eConfig) 
         );
         assert_eq!(fs::read(&state).unwrap(), before_preview);
         assert_eq!(
-            fs::read(second.join(page_dir).join(".confluence.json")).unwrap(),
+            fs::read(renamed.join(".confluence.json")).unwrap(),
             original_sidecar
         );
-        assert!(!second.join(page_dir).join("faq/.confluence.json").exists());
+        assert!(!renamed.join("faq/.confluence.json").exists());
         assert_eq!(first_item(&remote(), "page")["version"], 2);
 
         let lock = fs::OpenOptions::new().write(true).open(lock_path).unwrap();
@@ -1401,14 +1704,32 @@ async fn test_ci_state(config: fn(&ConfluenceSimulator, &TempDir) -> E2eConfig) 
         assert_eq!(first_item(&faq, "page")["parent_id"], page_id);
         assert_eq!(first_item(&faq, "page")["version"], 1);
         let deployed_state = fs::read(&state).unwrap();
+        let stored: Value = serde_json::from_slice(&deployed_state).unwrap();
+        assert_eq!(
+            stored["pages"]["Publishing Guide/index.md"]["sidecar"]["content_id"],
+            page_id
+        );
+        assert_eq!(
+            stored["pages"]["Publishing Guide/faq/index.md"]["sidecar"]["content_id"],
+            faq_id
+        );
+        assert_eq!(stored["pages"].as_object().unwrap().len(), 2);
 
-        let sidecar = third.join(page_dir).join(".confluence.json");
+        let sidecar = third_renamed.join(".confluence.json");
         let mut foreign: Value = serde_json::from_slice(&original_sidecar).unwrap();
         foreign["site_fingerprint"] = serde_json::json!("different-site");
         fs::write(&sidecar, serde_json::to_vec(&foreign).unwrap()).unwrap();
         let wrong_site = run(&["plan", third_arg, "--state-file", state_arg, "-o", "json"]);
         assert!(!wrong_site.status.success(), "{wrong_site:?}");
         assert!(String::from_utf8_lossy(&wrong_site.stderr).contains("different Confluence site"));
+        foreign.as_object_mut().unwrap().remove("site_fingerprint");
+        fs::write(&sidecar, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        let unknown_site = run(&["plan", third_arg, "--state-file", state_arg]);
+        assert!(!unknown_site.status.success(), "{unknown_site:?}");
+        assert!(
+            String::from_utf8_lossy(&unknown_site.stderr)
+                .contains("cannot verify the Confluence site")
+        );
         fs::write(&sidecar, &original_sidecar).unwrap();
 
         cfg.run_json(&[
@@ -1485,6 +1806,58 @@ async fn test_ci_state(config: fn(&ConfluenceSimulator, &TempDir) -> E2eConfig) 
             "<p>Independent edit and reconciled changes</p>"
         );
         assert_eq!(fs::read(&state).unwrap(), deployed_state);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ci_state_keeps_unrelated_paths_when_a_page_moves_to_the_checkout_root() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().unwrap();
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    let one = simulator.add_page("One", None, "<p>One body</p>");
+    let two = simulator.add_page("Two", None, "<p>Two body</p>");
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().unwrap();
+        let tree = temp.path().join("tree");
+        let state = temp.path().join("state.json");
+        let path = tree.to_str().unwrap();
+        let state_arg = state.to_str().unwrap();
+        let other = temp.path().join("other");
+        cfg.run_json(&["pull", "tree", &one, path, "--layout", "slug"]);
+        cfg.run_json(&[
+            "pull",
+            "tree",
+            &two,
+            other.to_str().unwrap(),
+            "--layout",
+            "slug",
+        ]);
+        fs::create_dir(tree.join("group")).unwrap();
+        fs::rename(other.join("two"), tree.join("group/two")).unwrap();
+        cfg.run_json(&["apply", path, "--state-file", state_arg, "--init-state"]);
+        let before = fs::read(&state).unwrap();
+        for name in ["index.md", ".confluence.json"] {
+            fs::rename(tree.join("one").join(name), tree.join(name)).unwrap();
+        }
+        let preview = cfg.run_json(&["plan", path, "--state-file", state_arg, "--check-remote"]);
+        assert!(
+            list_items(&preview, "plan")
+                .iter()
+                .all(|item| item["action"] == "noop")
+        );
+        assert_eq!(fs::read(&state).unwrap(), before);
+        cfg.run_json(&["apply", path, "--state-file", state_arg]);
+        let after: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+        assert_eq!(after["pages"]["index.md"]["sidecar"]["content_id"], one);
+        assert_eq!(
+            after["pages"]["group/two/index.md"]["sidecar"]["content_id"],
+            two
+        );
+        assert_eq!(after["pages"].as_object().unwrap().len(), 2);
     })
     .await
     .unwrap();

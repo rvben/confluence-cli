@@ -405,9 +405,22 @@ enum PullCommand {
         /// Name new folders with IDs (slug-id) or use readable slugs where available (slug)
         #[arg(long, value_enum, default_value = "slug-id")]
         layout: sync::TreeLayout,
+        /// Accept a page's proposed parent. Repeat for each move.
+        #[arg(long, value_name = "PAGE_ID=PARENT_ID", conflicts_with = "force")]
+        accept_move: Vec<sync::TreeMove>,
         /// Replace the destination using the selected layout, discarding local changes and names
         #[arg(long)]
         force: bool,
+    },
+    /// Preview the destination paths and remote moves for a tree without writing files
+    PreviewTree {
+        /// Root page ID, Confluence URL, or SPACE:Title
+        reference: String,
+        /// Destination directory to compare with the remote tree
+        output: PathBuf,
+        /// Name new folders with IDs (slug-id) or use readable slugs where available (slug)
+        #[arg(long, value_enum, default_value = "slug-id")]
+        layout: sync::TreeLayout,
     },
     /// Export every page in a space
     Space {
@@ -2289,8 +2302,49 @@ async fn handle_pull(
             reference,
             output,
             layout,
+            accept_move,
             force,
-        } => sync::pull_tree(provider, &reference, &output, layout, force).await?,
+        } => sync::pull_tree(provider, &reference, &output, layout, force, &accept_move).await?,
+        PullCommand::PreviewTree {
+            reference,
+            output: directory,
+            layout,
+        } => {
+            let changes = sync::preview_tree_pull(provider, &reference, &directory, layout).await?;
+            if output.is_json() {
+                return print_items_json(&changes, changes.len(), changes.len(), 0);
+            }
+            let display_path = |path: Option<&Path>| match path {
+                Some(path) if path.as_os_str().is_empty() => ".".to_string(),
+                Some(path) => path.display().to_string(),
+                None => "n/a".to_string(),
+            };
+            let rows = changes
+                .iter()
+                .map(|row| {
+                    vec![
+                        row.change.as_str().to_string(),
+                        row.content_id.clone(),
+                        row.title.clone(),
+                        display_path(row.previous_path.as_deref()),
+                        display_path(row.path.as_deref()),
+                        row.move_argument().unwrap_or_else(|| "n/a".to_string()),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            print_table(
+                &[
+                    "Change",
+                    "Page ID",
+                    "Title",
+                    "Current folder",
+                    "Proposed folder",
+                    "Accept move",
+                ],
+                &rows,
+            );
+            return Ok(());
+        }
         PullCommand::Space {
             space,
             output,

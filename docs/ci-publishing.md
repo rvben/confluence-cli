@@ -4,7 +4,7 @@ A CI publish needs the sidecars from the last successful deployment. They identi
 
 ## Bootstrap once
 
-1. Pull the full publishing tree from the target site. Review it, then commit the Markdown, attachments, and initial `.confluence.json` files. Keep the path of each page stable across checkouts.
+1. Pull the full publishing tree from the target site. Review it, then commit the Markdown, attachments, and initial `.confluence.json` files. Keep each sidecar with its page.
 2. Provision a private, durable directory outside the checkout. Use one state file per site and publishing tree, on a filesystem that supports file locks and atomic replacement. Choose a filename such as `handbook.json`. Confluence CLI uses the adjacent `.lock` file to coordinate publishers. The state file contains page metadata and the previous Markdown used for diffs. Allow state writes only from the publish job.
 3. From a trusted checkout, run the first preview with the committed sidecars. Initialize the persistent file with the first publish.
 
@@ -33,7 +33,9 @@ confluence apply ./handbook --state-file "$CONFLUENCE_STATE_FILE"
 
 The state file advances on success. Apply also writes sidecars into its working checkout. Keep those generated changes out of Git. A fresh checkout uses the persistent baseline for previously published pages and the checked-in sidecar for newly imported pages. A new Markdown page needs the usual `space_key` in its front matter properties. Once CI creates it, the file records its Confluence ID so future jobs update the same page.
 
-State follows relative document paths. Removing or moving a previously published document requires reconciling the baseline first. A change to a page title can leave its document path in place.
+State normally follows relative document paths. To rename or move a published folder, keep its checked-in `.confluence.json` beside `index.md` and update any relative links. If the sidecar matches a page ID and site in the publish state, the baseline follows the folder. This also carries state for descendants that keep their paths relative to that folder, including pages CI created without checked-in sidecars. A read-only preview uses the new paths in memory. A successful publish persists them and still checks for remote drift.
+
+Renaming a sidecar-free page itself requires first pulling that page's sidecar from the target site. If a later pull puts a new page at a path CI still associates with a moved page, give the new page its own folder before publishing. Keep its sidecar with it and update relative links. For removals or overlapping renames between published pages, reconcile the baseline first.
 
 ## Recover a publish
 

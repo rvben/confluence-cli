@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -114,7 +115,7 @@ impl PublishState {
     }
 
     pub(super) fn restore(
-        &self,
+        &mut self,
         root: &Path,
         docs: &mut [LocalDocument],
         provider: Option<&dyn ConfluenceProvider>,
@@ -123,11 +124,28 @@ impl PublishState {
             anyhow::bail!("publish state belongs to a different Confluence site");
         }
         self.validate_checkout(docs)?;
+        let renamed = self.renamed_folders(root, docs)?;
         let mut remaining: BTreeSet<_> = self.pages.keys().map(PathBuf::as_path).collect();
+        let mut rekey = Vec::new();
         for doc in &mut *docs {
             let key = publish_page_key(root, &doc.markdown_path);
-            if let Some(page) = self.pages.get(key) {
-                remaining.remove(key);
+            let mut original = original_page_key(key, &renamed);
+            if original != key && self.pages.contains_key(key) {
+                if self.pages.contains_key(original.as_ref()) {
+                    anyhow::bail!(
+                        "rename to {} overlaps an existing publish state path",
+                        key.display()
+                    );
+                }
+                original = Cow::Borrowed(key);
+            }
+            if let Some(page) = self.pages.get(original.as_ref()) {
+                if !remaining.remove(original.as_ref()) {
+                    anyhow::bail!(
+                        "multiple checkout documents match publish state path {}",
+                        original.display()
+                    );
+                }
                 if doc.sidecar.content_id.is_some()
                     && doc.sidecar.content_id != page.sidecar.content_id
                 {
@@ -146,6 +164,9 @@ impl PublishState {
                     );
                 }
                 doc.sidecar = page.sidecar.clone();
+                if original != key {
+                    rekey.push((original.into_owned(), key.to_path_buf()));
+                }
             }
         }
         if let Some(missing) = remaining.first() {
@@ -154,7 +175,68 @@ impl PublishState {
                 missing.display()
             );
         }
-        self.validate_checkout(docs)
+        self.validate_checkout(docs)?;
+        for (original, current) in rekey {
+            let page = self
+                .pages
+                .remove(&original)
+                .expect("matched publish state path");
+            self.pages.insert(current, page);
+        }
+        Ok(())
+    }
+
+    fn renamed_folders(
+        &self,
+        root: &Path,
+        docs: &[LocalDocument],
+    ) -> Result<BTreeMap<PathBuf, PathBuf>> {
+        let mut by_id = BTreeMap::new();
+        for (key, page) in &self.pages {
+            if let Some(id) = page.sidecar.content_id.as_deref()
+                && by_id.insert(id, key).is_some()
+            {
+                anyhow::bail!("publish state contains multiple documents for Confluence page {id}");
+            }
+        }
+        let local_keys: BTreeSet<_> = docs
+            .iter()
+            .map(|doc| publish_page_key(root, &doc.markdown_path))
+            .collect();
+        let mut renamed = BTreeMap::new();
+        for doc in docs {
+            let key = publish_page_key(root, &doc.markdown_path);
+            let Some(original) = doc
+                .sidecar
+                .content_id
+                .as_deref()
+                .and_then(|id| by_id.get(id))
+            else {
+                continue;
+            };
+            if original.as_path() == key {
+                continue;
+            }
+            if local_keys.contains(original.as_path()) || self.pages.contains_key(key) {
+                anyhow::bail!(
+                    "cannot match rename from {} to {} because both paths are in use",
+                    original.display(),
+                    key.display()
+                );
+            }
+            if doc.sidecar.site_fingerprint.as_deref() != Some(self.site.as_str()) {
+                anyhow::bail!(
+                    "cannot verify the Confluence site for renamed document {}. Pull the page again to refresh its sidecar",
+                    key.display()
+                );
+            }
+            let current_dir = key.parent().expect("document path has a parent folder");
+            let original_dir = original
+                .parent()
+                .context("publish state document path has no parent folder")?;
+            renamed.insert(current_dir.to_path_buf(), original_dir.to_path_buf());
+        }
+        Ok(renamed)
     }
 
     fn validate_checkout(&self, docs: &[LocalDocument]) -> Result<()> {
@@ -216,6 +298,18 @@ impl PublishState {
         page.sidecar.remote_version = created.version;
         self.write(path)
     }
+}
+
+fn original_page_key<'a>(key: &'a Path, renamed: &BTreeMap<PathBuf, PathBuf>) -> Cow<'a, Path> {
+    for folder in key.ancestors().skip(1) {
+        if let Some(original) = renamed.get(folder) {
+            let suffix = key
+                .strip_prefix(folder)
+                .expect("document is below its ancestor");
+            return Cow::Owned(original.join(suffix));
+        }
+    }
+    Cow::Borrowed(key)
 }
 
 fn publish_page_key<'a>(root: &Path, markdown: &'a Path) -> &'a Path {

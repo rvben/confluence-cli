@@ -55,8 +55,12 @@ fn arg_to_json(arg: &clap::Arg) -> Value {
     Value::Object(obj)
 }
 
+fn is_pull_export(path: &str) -> bool {
+    matches!(path, "pull page" | "pull tree" | "pull space")
+}
+
 fn is_mutating(path: &str) -> bool {
-    if path.starts_with("pull ") || path == "attachment download" || path == "convert" {
+    if is_pull_export(path) || path == "attachment download" || path == "convert" {
         return true;
     }
     let mutating_verbs = [
@@ -277,6 +281,15 @@ fn output_fields_for(path: &str) -> Vec<Value> {
         "pull page" | "pull tree" | "pull space" => vec![
             json!({"name": "path", "type": "string"}),
             json!({"name": "storage_differs_from_remote", "type": "boolean"}),
+        ],
+        "pull preview-tree" => vec![
+            json!({"name": "content_id", "type": "string"}),
+            json!({"name": "title", "type": "string"}),
+            json!({"name": "change", "type": "string"}),
+            json!({"name": "previous_path", "type": "string", "nullable": true}),
+            json!({"name": "path", "type": "string", "nullable": true}),
+            json!({"name": "previous_parent_id", "type": "string", "nullable": true}),
+            json!({"name": "parent_id", "type": "string", "nullable": true}),
         ],
 
         "doctor" => vec![
@@ -609,12 +622,14 @@ fn enrich_v03(document: &mut Value) {
             object.insert("destructive_when".into(), json!(["--force"]));
             object.insert("partial_success_possible".into(), json!(true));
         }
-        if name.starts_with("pull ") {
+        if is_pull_export(&name) {
             object.insert("partial_success_possible".into(), json!(true));
             object.insert("mutating".into(), json!(true));
             object.insert("idempotent".into(), json!(false));
             object.insert("overwrites_when".into(), json!(["--force"]));
             object.insert("destructive_when".into(), json!(["--force"]));
+        }
+        if is_pull_export(&name) || name == "pull preview-tree" {
             object.insert("pagination".into(), json!({"style":"none"}));
             object.insert(
                 "output_envelope".into(),
@@ -768,6 +783,7 @@ mod tests {
         assert_eq!(command("profile use")["effects"], "idempotent");
         assert_eq!(command("page create")["effects"], "non_idempotent");
         assert_eq!(command("pull page")["effects"], "non_idempotent");
+        assert_eq!(command("pull preview-tree")["effects"], "read_only");
         assert_eq!(command("attachment download")["effects"], "non_idempotent");
     }
 
@@ -977,7 +993,7 @@ mod tests {
                 .unwrap()
         };
 
-        for name in ["pull page", "pull tree", "pull space"] {
+        for name in ["pull page", "pull tree", "pull space", "pull preview-tree"] {
             let entry = command(name);
             assert_eq!(entry["cardinality"], "bounded");
             assert_eq!(entry["pagination"], json!({"style":"none"}));
