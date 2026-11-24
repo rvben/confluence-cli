@@ -194,10 +194,15 @@ Export one page, a page tree, or an entire space:
 ```bash
 confluence pull page 'DOCS:Getting Started' ./docs/getting-started
 confluence pull tree 'DOCS:Handbook' ./docs/handbook
+confluence pull tree 'DOCS:Handbook' ./docs/handbook --layout slug
 confluence pull space DOCS ./docs
 ```
 
 Pulls are staged beside the destination and installed as one snapshot. A pull refuses to replace local Markdown changes or unmanaged files. Use `--force` only when the remote snapshot should replace the entire destination.
+
+`pull tree` keeps existing folder names by matching the page IDs in `.confluence.json`. You can rename a page folder without changing its parent. If other pages link to that folder, update their relative links alongside the rename. Remote title changes leave existing paths in place, and the pull writes relative links using the retained paths.
+
+For new folders, `pull tree` defaults to `--layout slug-id` (`<slug>--<content-id>`). Pass `--layout slug` on each pull where you want new folders to use the title slug alone. If a name is taken or reserved, the new folder gets an ID suffix. The layout flag leaves existing names in place. A remote move that changes the hierarchy within the tree or a page missing from the selected remote tree stops the refresh and reports the affected page. Inspect the new tree in a fresh destination, or use `--force` to replace the snapshot and regenerate all folder names with the selected layout.
 
 Filtered `pull space --since ...` exports require a new or empty destination because a partial result cannot safely replace a complete snapshot. Attachment names are confined to their page's `attachments/` directory.
 
@@ -209,10 +214,10 @@ A mention of a user is pulled as a link that shows the user's name, such as `[@J
 
 ### Edit
 
-Each page has a predictable local layout:
+Each page folder contains:
 
 ```text
-<slug>--<content-id>/
+<page-folder>/
 ├── index.md
 ├── .confluence.json
 └── attachments/

@@ -1,4 +1,5 @@
 mod publish_state;
+mod tree_layout;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -15,6 +16,8 @@ use tempfile::Builder;
 use walkdir::WalkDir;
 
 use self::publish_state::{PublishState, lock_state, state_path};
+pub(crate) use self::tree_layout::TreeLayout;
+use self::tree_layout::{ExistingTree, TreePull};
 
 use crate::markdown::{
     Frontmatter, LocalDocument, PULL_FAILURES_DIR, PULL_FAILURES_MANIFEST, PageLinkPlaceholder,
@@ -82,20 +85,43 @@ pub async fn pull_page(
     provider: &dyn ConfluenceProvider,
     reference: &str,
     root: &Path,
-    recursive: bool,
     force: bool,
 ) -> Result<Vec<PulledPage>> {
     validate_pull_destination(root, force)?;
     let root_id = provider.resolve_page_ref(reference).await?;
+    let item = provider
+        .get_content(ContentKind::Page, &root_id, true)
+        .await?;
+    pull_items(provider, root, vec![item], None).await
+}
+
+pub(crate) async fn pull_tree(
+    provider: &dyn ConfluenceProvider,
+    reference: &str,
+    root: &Path,
+    layout: TreeLayout,
+    force: bool,
+) -> Result<Vec<PulledPage>> {
+    let existing = {
+        let docs = validate_pull_destination(root, force)?;
+        if force {
+            None
+        } else {
+            Some(ExistingTree::from_documents(root, &docs, provider)?)
+        }
+    };
+    let root_id = provider.resolve_page_ref(reference).await?;
     let root_item = provider
         .get_content(ContentKind::Page, &root_id, true)
         .await?;
-    let mut items = vec![root_item];
-    if recursive {
-        let children = provider.list_children(&root_id, true).await?;
-        items.extend(children);
-    }
-    pull_items(provider, root, items).await
+    let mut items = provider.list_children(&root_id, true).await?;
+    items.push(root_item);
+    let tree = TreePull {
+        root_id,
+        layout,
+        existing,
+    };
+    pull_items(provider, root, items, Some(tree)).await
 }
 
 pub async fn pull_space(
@@ -113,7 +139,7 @@ pub async fn pull_space(
             .list_space_content(ContentKind::BlogPost, space)
             .await?,
     );
-    pull_items(provider, root, items).await
+    pull_items(provider, root, items, None).await
 }
 
 pub async fn pull_space_since(
@@ -143,7 +169,7 @@ pub async fn pull_space_since(
     for result in listed {
         items.push(provider.get_content(result.kind, &result.id, true).await?);
     }
-    pull_items(provider, root, items).await
+    pull_items(provider, root, items, None).await
 }
 
 pub fn plan_path(
@@ -933,7 +959,12 @@ async fn pull_items(
     provider: &dyn ConfluenceProvider,
     root: &Path,
     items: Vec<ContentItem>,
+    tree: Option<TreePull>,
 ) -> Result<Vec<PulledPage>> {
+    let items: BTreeMap<_, _> = items
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect();
     let parent = root
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -944,7 +975,27 @@ async fn pull_items(
         .tempdir_in(parent)
         .with_context(|| format!("failed to stage pull beside {}", root.display()))?;
     let staged_root = staging.path().join("snapshot");
-    let (written, unconvertible, warnings) = write_items(provider, &staged_root, items).await?;
+    let paths = if let Some(tree) = &tree {
+        tree.paths(&staged_root, &items)?
+    } else {
+        compute_paths(&staged_root, &items)
+    };
+    let (written, unconvertible, warnings) =
+        write_items(provider, &staged_root, &items, paths).await?;
+    if let Some(initial) = tree.and_then(|tree| tree.existing) {
+        let docs = validate_pull_destination(root, false)?;
+        let current = ExistingTree::from_documents(root, &docs, provider)?;
+        if current != initial {
+            return Err(crate::output::typed_error_with_hint(
+                crate::output::ErrorKind::Conflict,
+                format!(
+                    "pull destination `{}` changed during the pull",
+                    root.display()
+                ),
+                "rerun the pull against the current destination",
+            ));
+        }
+    }
     install_pulled_pages(&staged_root, root, written, unconvertible, warnings)
 }
 
@@ -1116,7 +1167,7 @@ fn install_staged_snapshot(staged_root: &Path, root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_pull_destination(root: &Path, force: bool) -> Result<()> {
+fn validate_pull_destination(root: &Path, force: bool) -> Result<Vec<LocalDocument>> {
     let destination_metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1133,7 +1184,7 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<()> {
         ));
     }
     if destination_metadata.is_none() || force {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if !destination_metadata.is_some_and(|metadata| metadata.is_dir()) {
         return Err(crate::output::typed_error(
@@ -1153,12 +1204,12 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<()> {
                 return Err(dirty_pull_destination_error(root));
             }
         }
-        return Ok(());
+        return Ok(docs);
     }
 
     // Missing pulled attachments are local changes even when a normal plan would
     // not schedule remote deletion without --delete-remote.
-    let plan = plan_path(root, false, true, false)?;
+    let plan = plan_documents(root, &docs, false, true, false)?;
     if plan
         .items
         .iter()
@@ -1193,7 +1244,7 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<()> {
             return Err(dirty_pull_destination_error(root));
         }
     }
-    Ok(())
+    Ok(docs)
 }
 
 /// The files a pull keeps for a page it leaves out.
@@ -1318,14 +1369,9 @@ fn dirty_pull_destination_error(root: &Path) -> anyhow::Error {
 async fn write_items(
     provider: &dyn ConfluenceProvider,
     root: &Path,
-    items: Vec<ContentItem>,
+    item_map: &BTreeMap<String, ContentItem>,
+    paths: BTreeMap<String, PathBuf>,
 ) -> Result<(Vec<PulledPage>, Vec<UnconvertiblePage>, Vec<String>)> {
-    let mut item_map = BTreeMap::new();
-    for item in items {
-        item_map.insert(item.id.clone(), item);
-    }
-
-    let paths = compute_paths(root, &item_map);
     let mut path_owners = BTreeMap::new();
     for (content_id, path) in &paths {
         if !path.starts_with(root) {
@@ -1385,7 +1431,7 @@ async fn write_items(
             attachment_map,
             markdown_linking_all: String::new(),
         };
-        item.markdown_linking_all = item.markdown(&paths, &item_map);
+        item.markdown_linking_all = item.markdown(&paths, item_map);
         for user in unnamed_mentions(&item.markdown_linking_all) {
             if let std::collections::btree_map::Entry::Vacant(entry) = user_names.entry(user) {
                 // A name is a convenience for the reader, so a lookup that
@@ -1429,12 +1475,12 @@ async fn write_items(
                 let markdown = if left_out.is_empty() {
                     std::borrow::Cow::Borrowed(item.markdown_linking_all.as_str())
                 } else {
-                    std::borrow::Cow::Owned(item.markdown(&link_paths, &item_map))
+                    std::borrow::Cow::Owned(item.markdown(&link_paths, item_map))
                 };
                 let body_markdown = name_user_mentions(&markdown, &user_names);
                 item.fetched_page(
                     body_markdown,
-                    &item_map,
+                    item_map,
                     provider_kind,
                     web_path_prefix.clone(),
                     &site_fingerprint,
@@ -2629,10 +2675,7 @@ fn rewrite_page_links(
         {
             return None;
         }
-        let mut local = diff_paths(&index, current_dir)
-            .unwrap_or(index)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let mut local = relative_markdown_link(index, current_dir);
         // Apply writes what follows the file back after the address of the
         // page.
         if !address.query.is_empty() {
@@ -3053,15 +3096,22 @@ fn resolve_placeholder_to_local_path(
         find_item_by_title(items, &link).and_then(|item| paths.get(&item.id).cloned())
     }?;
     let target_index = target_dir.join("index.md");
-    let mut replacement = diff_paths(&target_index, current_dir)
-        .unwrap_or(target_index)
-        .to_string_lossy()
-        .replace('\\', "/");
+    let mut replacement = relative_markdown_link(target_index, current_dir);
     if let Some(anchor) = link.anchor {
         replacement.push('#');
         replacement.push_str(&anchor);
     }
     Some(replacement)
+}
+
+fn relative_markdown_link(index: PathBuf, current_dir: &Path) -> String {
+    diff_paths(&index, current_dir)
+        .unwrap_or(index)
+        .to_string_lossy()
+        .split(std::path::MAIN_SEPARATOR)
+        .map(|segment| urlencoding::encode(segment).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn find_item_by_title<'a>(

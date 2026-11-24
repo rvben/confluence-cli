@@ -811,6 +811,132 @@ async fn plan_and_apply_resolve_pulled_links_for_equivalent_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tree_refresh_keeps_folder_names_and_links_and_refuses_remote_moves() {
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().unwrap();
+    let cfg = simulated_cloud_config(&simulator, &config_home);
+    let root_id = simulator.add_page("Handbook", Some("100"), "<p>Intro</p>");
+    let outside_id = simulator.add_page("Outside", Some("100"), "<p>Outside tree</p>");
+    let chapter_id = simulator.add_page("First Chapter", Some(&root_id), "<p>Chapter text</p>");
+    let appendix_id = simulator.add_page("Appendix", Some(&root_id), "<p>Appendix text</p>");
+    let reserved_id = simulator.add_page("Attachments", Some(&root_id), "<p>Page text</p>");
+
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().unwrap();
+        let tree = temp.path().join("tree");
+        let path = tree.to_str().unwrap();
+        let refresh = ["pull", "tree", &root_id, path, "--layout", "slug"];
+        cfg.run_json(&refresh);
+        let generated_root = tree.join("handbook");
+        assert!(generated_root.join("first-chapter/index.md").is_file());
+        assert!(generated_root.join("appendix/index.md").is_file());
+        assert!(
+            generated_root
+                .join(format!("attachments--{reserved_id}/index.md"))
+                .is_file()
+        );
+
+        let handbook = tree.join("Handbook Manual");
+        fs::rename(&generated_root, &handbook).unwrap();
+        let chapter = handbook.join("Chapter Notes (#1)");
+        fs::rename(handbook.join("first-chapter"), &chapter).unwrap();
+        fs::rename(handbook.join("appendix"), handbook.join("Chapter")).unwrap();
+        let newcomer_id = simulator.add_page("Chapter", Some(&root_id), "<p>New page</p>");
+        let body = format!(
+            r#"<p><a href="/wiki/pages/viewpage.action?pageId={chapter_id}">Read chapter</a></p><p><ac:link><ri:page ri:content-title="First Chapter" /><ac:plain-text-link-body><![CDATA[Read again]]></ac:plain-text-link-body></ac:link></p>"#
+        );
+        cfg.run_json(&[
+            "page",
+            "update",
+            &root_id,
+            "--title",
+            "Handbook Revised",
+            "--format",
+            "storage",
+            "--body",
+            &body,
+        ]);
+        cfg.run_json(&refresh);
+        let index = handbook.join("index.md");
+        let markdown = fs::read_to_string(&index).unwrap();
+        assert!(markdown.contains("title: Handbook Revised"), "{markdown}");
+        for text in ["Read chapter", "Read again"] {
+            assert!(markdown.contains(&format!("[{text}](Chapter%20Notes%20%28%231%29/index.md)")), "{markdown}");
+        }
+        assert!(chapter.join("index.md").is_file());
+        assert!(
+            handbook
+                .join(format!("chapter--{newcomer_id}/index.md"))
+                .is_file()
+        );
+        assert!(!generated_root.exists());
+        cfg.run_json(&["pull", "tree", &root_id, path]);
+        assert_eq!(fs::read_to_string(&index).unwrap(), markdown);
+        assert!(!tree.join("handbook-revised").exists());
+        assert!(
+            list_items(&cfg.run_json(&["plan", path]), "plan")
+                .iter()
+                .all(|item| item["action"] == "noop")
+        );
+
+        let chapter_index = chapter.join("index.md");
+        let contents = fs::read_to_string(&chapter_index)
+            .unwrap()
+            .replace("Chapter text", "Published text");
+        fs::write(&chapter_index, &contents).unwrap();
+        let rejected = cfg.command().args(refresh).output().unwrap();
+        assert!(!rejected.status.success(), "{rejected:?}");
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("contains local changes"));
+        assert_eq!(fs::read_to_string(&chapter_index).unwrap(), contents);
+        let applied = cfg.run_json(&["--yes", "apply", path]);
+        assert_eq!(list_items(&applied, "apply")[0]["content_id"], chapter_id);
+
+        cfg.run_json(&["page", "update", &root_id, "--parent", &outside_id]);
+        cfg.run_json(&refresh);
+        assert!(chapter_index.is_file());
+        let sidecar: Value = serde_json::from_slice(&fs::read(handbook.join(".confluence.json")).unwrap()).unwrap();
+        assert_eq!(sidecar["remote_parent_id"], outside_id);
+
+        let subset = temp.path().join("subset");
+        let subset_arg = subset.to_str().unwrap();
+        cfg.run_json(&["pull", "tree", &chapter_id, subset_arg, "--layout", "slug"]);
+        let expanded = cfg.command().args(["pull", "tree", &root_id, subset_arg]).output().unwrap();
+        assert_eq!(expanded.status.code(), Some(7), "{expanded:?}");
+        assert!(subset.join("first-chapter/index.md").is_file());
+        assert!(!subset.join("index.md").exists());
+
+        cfg.run_json(&["page", "update", &chapter_id, "--parent", &appendix_id]);
+        let rejected = cfg.command().args(refresh).output().unwrap();
+        assert_eq!(rejected.status.code(), Some(7), "{rejected:?}");
+        let error: Value = serde_json::from_slice(&rejected.stderr).unwrap();
+        assert!(
+            string_field(&error["error"], "message").contains("changed parent"),
+            "{error}"
+        );
+        assert!(chapter_index.is_file());
+        assert!(!handbook.join("Chapter/first-chapter").exists());
+
+        cfg.run_json(&[
+            "pull", "tree", &root_id, path, "--layout", "slug", "--force",
+        ]);
+        assert!(
+            tree.join("handbook-revised/appendix/first-chapter/index.md")
+                .is_file()
+        );
+        assert!(!handbook.exists());
+        cfg.run_json(&["page", "update", &chapter_id, "--parent", &outside_id]);
+        let missing = cfg.command().args(refresh).output().unwrap();
+        assert_eq!(missing.status.code(), Some(7), "{missing:?}");
+        let error: Value = serde_json::from_slice(&missing.stderr).unwrap();
+        assert!(string_field(&error["error"], "message").contains("no longer in the remote tree"), "{error}");
+        assert!(tree.join("handbook-revised/appendix/first-chapter/index.md").is_file());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_page_resolves_links_to_a_sibling_without_applying_it() {
     let simulator = ConfluenceSimulator::start().await;
     let config_home = TempDir::new().expect("simulator config home");
@@ -1119,6 +1245,22 @@ async fn pull_writes_the_rest_of_a_tree_when_a_page_does_not_convert() {
                 .expect("leaf markdown")
                 .contains("Edited leaf")
         );
+
+        cfg.run_json(&[
+            "page",
+            "update",
+            &broken_id,
+            "--title",
+            "Recovered parent",
+            "--format",
+            "storage",
+            "--body",
+            "<p>Recovered text</p>",
+        ]);
+        cfg.run_json(&["pull", "tree", &root_id, &pull_arg, "--layout", "slug"]);
+        assert!(broken_dir.join("index.md").is_file());
+        assert!(leaf_index.is_file());
+        assert!(!root_index.with_file_name("recovered-parent").exists());
     })
     .await
     .expect("simulated pull task");

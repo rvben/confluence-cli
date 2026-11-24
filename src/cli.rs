@@ -402,7 +402,10 @@ enum PullCommand {
         reference: String,
         /// Destination directory
         output: PathBuf,
-        /// Replace a dirty or unmanaged destination with the remote snapshot
+        /// Name new folders with IDs (slug-id) or use readable slugs where available (slug)
+        #[arg(long, value_enum, default_value = "slug-id")]
+        layout: sync::TreeLayout,
+        /// Replace the destination using the selected layout, discarding local changes and names
         #[arg(long)]
         force: bool,
     },
@@ -2281,12 +2284,13 @@ async fn handle_pull(
             reference,
             output,
             force,
-        } => sync::pull_page(provider, &reference, &output, false, force).await?,
+        } => sync::pull_page(provider, &reference, &output, force).await?,
         PullCommand::Tree {
             reference,
             output,
+            layout,
             force,
-        } => sync::pull_page(provider, &reference, &output, true, force).await?,
+        } => sync::pull_tree(provider, &reference, &output, layout, force).await?,
         PullCommand::Space {
             space,
             output,
