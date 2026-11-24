@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.44](https://github.com/rvben/confluence-cli/compare/v0.1.43...v0.1.44) - 2026-11-24
+
+### Added
+
+- **sync**: preview tree moves and preserve CI state across renames ([32d287f](https://github.com/rvben/confluence-cli/commit/32d287f14477038f6a8e92a7d1f23f08326d6621))
+- **sync**: preserve folder names when refreshing pulled trees ([8a19161](https://github.com/rvben/confluence-cli/commit/8a1916117774c78ec3c0f2513ad8b94cca40f174))
+
 ## [0.1.43](https://github.com/rvben/confluence-cli/compare/v0.1.42...v0.1.43) - 2026-11-23
 
 ### Added
