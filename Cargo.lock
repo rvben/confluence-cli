@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "confluence-cli"
-version = "0.1.44"
+version = "0.1.45"
 dependencies = [
  "anyhow",
  "async-trait",

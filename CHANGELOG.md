@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.45](https://github.com/rvben/confluence-cli/compare/v0.1.44...v0.1.45) - 2026-11-25
+
+### Fixed
+
+- **sync**: omit emoji from slug folders and identify pull blockers ([87e0a76](https://github.com/rvben/confluence-cli/commit/87e0a763c404fed149a83c905ab9319e2235a3a1))
+
 ## [0.1.44](https://github.com/rvben/confluence-cli/compare/v0.1.43...v0.1.44) - 2026-11-24
 
 ### Added
