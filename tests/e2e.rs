@@ -815,11 +815,13 @@ async fn tree_refresh_keeps_folder_names_and_links_and_refuses_remote_moves() {
     let simulator = ConfluenceSimulator::start().await;
     let config_home = TempDir::new().unwrap();
     let cfg = simulated_cloud_config(&simulator, &config_home);
-    let root_id = simulator.add_page("Handbook", Some("100"), "<p>Intro</p>");
+    let root_id = simulator.add_page("✨ Handbook", Some("100"), "<p>Intro</p>");
     let outside_id = simulator.add_page("Outside", Some("100"), "<p>Outside tree</p>");
     let chapter_id = simulator.add_page("First Chapter", Some(&root_id), "<p>Chapter text</p>");
     let appendix_id = simulator.add_page("Appendix", Some(&root_id), "<p>Appendix text</p>");
     let reserved_id = simulator.add_page("Attachments", Some(&root_id), "<p>Page text</p>");
+    let collision_id =
+        simulator.add_page("👩‍💻 First Chapter", Some(&root_id), "<p>Another chapter</p>");
 
     tokio::task::spawn_blocking(move || {
         let _config_home = config_home;
@@ -830,6 +832,11 @@ async fn tree_refresh_keeps_folder_names_and_links_and_refuses_remote_moves() {
         cfg.run_json(&refresh);
         let generated_root = tree.join("handbook");
         assert!(generated_root.join("first-chapter/index.md").is_file());
+        assert!(
+            generated_root
+                .join(format!("first-chapter--{collision_id}/index.md"))
+                .is_file()
+        );
         assert!(generated_root.join("appendix/index.md").is_file());
         assert!(
             generated_root
@@ -885,9 +892,14 @@ async fn tree_refresh_keeps_folder_names_and_links_and_refuses_remote_moves() {
             .unwrap()
             .replace("Chapter text", "Published text");
         fs::write(&chapter_index, &contents).unwrap();
-        let rejected = cfg.command().args(refresh).output().unwrap();
+        let rejected = cfg.command().args(refresh).args(["-o", "json"]).output().unwrap();
         assert!(!rejected.status.success(), "{rejected:?}");
-        assert!(String::from_utf8_lossy(&rejected.stderr).contains("contains local changes"));
+        let error: Value = serde_json::from_slice(&rejected.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "conflict");
+        assert_eq!(
+            error["error"]["details"]["blockers"][0]["path"],
+            "Handbook Manual/Chapter Notes (#1)/index.md"
+        );
         assert_eq!(fs::read_to_string(&chapter_index).unwrap(), contents);
         let applied = cfg.run_json(&["--yes", "apply", path]);
         assert_eq!(list_items(&applied, "apply")[0]["content_id"], chapter_id);
@@ -2491,8 +2503,11 @@ fn run_cli_lifecycle(cfg: E2eConfig) {
     );
 
     let pull_arg = pull_dir.to_string_lossy().into_owned();
-    cfg.run(&["pull", "page", &page_id, &pull_arg]);
-    let index_md = find_index_md(&pull_dir);
+    cfg.run(&["pull", "tree", &page_id, &pull_arg, "--layout", "slug"]);
+    let original_index = find_index_md(&pull_dir);
+    let renamed_page = pull_dir.join("manually-renamed-page");
+    fs::rename(original_index.parent().unwrap(), &renamed_page).expect("rename pulled page");
+    let index_md = renamed_page.join("index.md");
     let original_markdown = fs::read_to_string(&index_md).expect("read pulled markdown");
     let updated_markdown = format!("{original_markdown}\nApplied from Rust e2e.\n");
     fs::write(&index_md, updated_markdown).expect("update pulled markdown");
@@ -2510,6 +2525,15 @@ fn run_cli_lifecycle(cfg: E2eConfig) {
         "expected plan to include update_content: {plan_before}"
     );
     let _apply = cfg.run_json(&["apply", &pull_arg]);
+    let remote = cfg.run_json(&["page", "get", &page_id, "--show-body"]);
+    let remote = first_item(&remote, "page get");
+    assert_eq!(remote["id"], page_id);
+    assert!(
+        remote["body_storage"]
+            .as_str()
+            .is_some_and(|body| body.contains("Applied from Rust e2e.")),
+        "expected apply on renamed folder to update original page: {remote}"
+    );
     let plan_after = cfg.run_json(&["plan", &pull_arg]);
     assert!(
         plan_after

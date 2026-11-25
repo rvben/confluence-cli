@@ -937,24 +937,24 @@ mod tests {
     async fn get_space_asks_for_the_space_by_key() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/wiki/rest/api/space/HDA"))
+            .and(path("/wiki/rest/api/space/EXAMPLE"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": 4242,
-                "key": "HDA",
-                "name": "Data Platform",
+                "key": "EXAMPLE",
+                "name": "Example Space",
                 "type": "global",
-                "_links": { "webui": "/spaces/HDA" }
+                "_links": { "webui": "/spaces/EXAMPLE" }
             })))
             .expect(1)
             .mount(&server)
             .await;
 
         let space = cloud_provider(&server.uri())
-            .get_space("HDA")
+            .get_space("EXAMPLE")
             .await
             .unwrap();
 
-        assert_eq!(space.key, "HDA");
+        assert_eq!(space.key, "EXAMPLE");
         assert_eq!(space.id, "4242");
     }
 
@@ -971,7 +971,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "results": [
                     { "id": 1, "key": "DOCS", "name": "Docs", "_links": {} },
-                    { "id": 4242, "key": "HDA", "name": "Data Platform", "_links": {} }
+                    { "id": 4242, "key": "EXAMPLE", "name": "Example Space", "_links": {} }
                 ],
                 "limit": 200,
                 "size": 2,
@@ -986,7 +986,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(space.key, "HDA");
+        assert_eq!(space.key, "EXAMPLE");
     }
 
     #[tokio::test]

@@ -198,11 +198,11 @@ confluence pull tree 'DOCS:Handbook' ./docs/handbook --layout slug
 confluence pull space DOCS ./docs
 ```
 
-Pulls are staged beside the destination and installed as one snapshot. A pull refuses to replace local Markdown changes or unmanaged files. Use `--force` only when the remote snapshot should replace the entire destination.
+Pulls are staged beside the destination and installed as one snapshot. A pull refuses to overwrite local changes or unmanaged files and identifies at least one blocking path. Use `--force` only when the remote snapshot should replace the entire destination.
 
 `pull tree` keeps existing folder names by matching the page IDs in `.confluence.json`. You can rename a page folder without changing its parent. If other pages link to that folder, update their relative links alongside the rename. Remote title changes leave existing paths in place, and the pull writes relative links using the retained paths.
 
-For new folders, `pull tree` defaults to `--layout slug-id` (`<slug>--<content-id>`). Pass `--layout slug` on each pull where you want new folders to use the title slug alone. If a name is taken or reserved, the new folder gets an ID suffix. The layout flag leaves existing names in place.
+For new folders, `pull tree` defaults to `--layout slug-id` (`<slug>--<content-id>`). Pass `--layout slug` on each pull where you want new folders to use the title slug with emoji and pictographic symbols omitted. If a name is taken or reserved, the new folder gets an ID suffix. The layout flag leaves existing names in place.
 
 `pull preview-tree` shows current and proposed paths relative to the destination. A `move` marks a page whose parent changed within the tree. `relocated` marks a descendant whose path changes because an ancestor moved. The preview works with read-only credentials and leaves the destination untouched. Conversion and attachment downloads happen during the pull.
 

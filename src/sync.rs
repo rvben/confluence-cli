@@ -1251,14 +1251,21 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<Vec<LocalDocume
     }
 
     let failures_dir = root.join(PULL_FAILURES_DIR);
-    if !holds_only_pull_failure_artifacts(&failures_dir)? {
-        return Err(dirty_pull_destination_error(root));
+    if let Some(path) = first_changed_pull_failure_artifact(&failures_dir)? {
+        return Err(dirty_pull_destination_error(
+            root,
+            [(path, "changed or unmanaged pull failure artifact".into())],
+        ));
     }
     let docs = load_local_documents(root)?;
     if docs.is_empty() {
         for entry in fs::read_dir(root)? {
-            if entry?.path() != failures_dir {
-                return Err(dirty_pull_destination_error(root));
+            let path = entry?.path();
+            if path != failures_dir {
+                return Err(dirty_pull_destination_error(
+                    root,
+                    [(path, "unmanaged destination entry".into())],
+                ));
             }
         }
         return Ok(docs);
@@ -1267,12 +1274,21 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<Vec<LocalDocume
     // Missing pulled attachments are local changes even when a normal plan would
     // not schedule remote deletion without --delete-remote.
     let plan = plan_documents(root, &docs, false, true, false)?;
-    if plan
+    let mut changes = plan
         .items
-        .iter()
-        .any(|item| item.action != PlanActionKind::Noop)
-    {
-        return Err(dirty_pull_destination_error(root));
+        .into_iter()
+        .filter(|item| item.action != PlanActionKind::Noop)
+        .map(|item| {
+            let path = match item.action {
+                PlanActionKind::UpdateContent => item.path.join("index.md"),
+                PlanActionKind::DeleteAttachment => item.path.join(&item.title),
+                _ => item.path,
+            };
+            (path, item.details)
+        })
+        .peekable();
+    if changes.peek().is_some() {
+        return Err(dirty_pull_destination_error(root, changes));
     }
 
     for entry in WalkDir::new(root) {
@@ -1287,7 +1303,10 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<Vec<LocalDocume
                     || doc.directory.starts_with(entry.path())
             });
             if !managed_directory {
-                return Err(dirty_pull_destination_error(root));
+                return Err(dirty_pull_destination_error(
+                    root,
+                    [(entry.into_path(), "unmanaged directory".into())],
+                ));
             }
             continue;
         }
@@ -1298,7 +1317,10 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<Vec<LocalDocume
                     || entry.path().parent() == Some(doc.directory.join("attachments").as_path()))
         });
         if !managed {
-            return Err(dirty_pull_destination_error(root));
+            return Err(dirty_pull_destination_error(
+                root,
+                [(entry.into_path(), "unmanaged file or special entry".into())],
+            ));
         }
     }
     Ok(docs)
@@ -1335,28 +1357,25 @@ fn write_pull_failures_manifest(root: &Path, unconvertible: &[UnconvertiblePage]
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-/// Whether a pull may replace `failures_dir`: it is absent, or it holds
-/// only files its manifest records, each as the pull wrote it, and no
-/// directory but the ones those files were written in. Anything else is
-/// somebody's own data. A file that was removed leaves nothing to keep.
-fn holds_only_pull_failure_artifacts(failures_dir: &Path) -> Result<bool> {
+/// Finds the first entry that cannot be replaced using the pull failure manifest.
+fn first_changed_pull_failure_artifact(failures_dir: &Path) -> Result<Option<PathBuf>> {
     let metadata = match fs::symlink_metadata(failures_dir) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     if !metadata.is_dir() {
-        return Ok(false);
+        return Ok(Some(failures_dir.to_path_buf()));
     }
     let manifest_path = failures_dir.join(PULL_FAILURES_MANIFEST);
     let is_file = |path: &Path| fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file());
     if !is_file(&manifest_path) {
-        return Ok(false);
+        return Ok(Some(failures_dir.to_path_buf()));
     }
     let Ok(manifest) =
         serde_json::from_slice::<BTreeMap<String, String>>(&fs::read(&manifest_path)?)
     else {
-        return Ok(false);
+        return Ok(Some(manifest_path));
     };
     for entry in WalkDir::new(failures_dir).min_depth(1) {
         let entry = entry?;
@@ -1375,7 +1394,7 @@ fn holds_only_pull_failure_artifacts(failures_dir: &Path) -> Result<bool> {
             })
             .map(|parts| parts.join("/"))
         else {
-            return Ok(false);
+            return Ok(Some(entry.into_path()));
         };
         let as_written = if entry.file_type().is_dir() {
             let below = format!("{relative}/");
@@ -1388,10 +1407,10 @@ fn holds_only_pull_failure_artifacts(failures_dir: &Path) -> Result<bool> {
             false
         };
         if !as_written {
-            return Ok(false);
+            return Ok(Some(entry.into_path()));
         }
     }
-    Ok(true)
+    Ok(None)
 }
 
 fn validate_filtered_pull_destination(root: &Path) -> Result<()> {
@@ -1417,14 +1436,43 @@ fn validate_filtered_pull_destination(root: &Path) -> Result<()> {
     ))
 }
 
-fn dirty_pull_destination_error(root: &Path) -> anyhow::Error {
-    crate::output::typed_error_with_hint(
+fn dirty_pull_destination_error(
+    root: &Path,
+    blockers: impl IntoIterator<Item = (PathBuf, String)>,
+) -> anyhow::Error {
+    let blockers: Vec<_> = blockers
+        .into_iter()
+        .map(|(path, reason)| {
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            let path = relative
+                .iter()
+                .map(|part| part.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            (path, reason)
+        })
+        .collect();
+    let mut summary: Vec<_> = blockers
+        .iter()
+        .take(5)
+        .map(|(path, reason)| format!("{path:?} ({reason})"))
+        .collect();
+    if blockers.len() > summary.len() {
+        summary.push(format!("{} more", blockers.len() - summary.len()));
+    }
+    crate::output::typed_error_with_details(
         crate::output::ErrorKind::Conflict,
         format!(
-            "pull destination `{}` contains local changes or unmanaged files",
-            root.display()
+            "pull destination `{}` contains local changes or unmanaged files: {}",
+            root.display(),
+            summary.join(", ")
         ),
-        "choose an empty destination, apply or preserve local changes first, or rerun pull with --force to replace the destination",
+        Some("choose an empty destination, apply or preserve local changes first, or rerun pull with --force to replace the destination".into()),
+        serde_json::json!({
+            "blockers": blockers.into_iter().map(|(path, reason)| {
+                serde_json::json!({ "path": path, "reason": reason })
+            }).collect::<Vec<_>>()
+        }),
     )
 }
 
@@ -3853,6 +3901,7 @@ mod tests {
                 .to_string()
                 .contains("local changes or unmanaged files")
         );
+        assert!(error.to_string().contains("root-page--123/index.md"));
         validate_pull_destination(dir.path(), true).expect("force permits replacement");
     }
 
@@ -3862,7 +3911,48 @@ mod tests {
         write_clean_managed_document(dir.path(), "# Root");
         fs::write(dir.path().join("notes.txt"), "keep me").expect("write unmanaged file");
 
-        assert!(validate_pull_destination(dir.path(), false).is_err());
+        let error = validate_pull_destination(dir.path(), false).unwrap_err();
+        assert!(error.to_string().contains("notes.txt"));
+    }
+
+    #[test]
+    fn pull_destination_reports_modified_or_missing_attachment() {
+        let dir = tempdir().expect("tempdir");
+        let page_dir = write_clean_managed_document(dir.path(), "# Root");
+        let sidecar_path = page_dir.join(".confluence.json");
+        let mut sidecar: Sidecar =
+            serde_json::from_slice(&fs::read(&sidecar_path).unwrap()).unwrap();
+        let original = b"original attachment bytes";
+        sidecar.attachment_map.insert(
+            "diagram.png".to_string(),
+            crate::model::AttachmentState {
+                id: "456".to_string(),
+                file_name: "remote diagram.png".to_string(),
+                remote_version: Some(1),
+                media_type: Some("image/png".to_string()),
+                sha256: Some(sha256_hex(original)),
+            },
+        );
+        fs::write(sidecar_path, serde_json::to_vec(&sidecar).unwrap()).unwrap();
+        let attachments = page_dir.join("attachments");
+        fs::create_dir(&attachments).unwrap();
+        let image = attachments.join("diagram.png");
+        fs::write(&image, original).unwrap();
+        validate_pull_destination(dir.path(), false).expect("unchanged attachment");
+
+        fs::write(&image, b"recompressed attachment bytes").unwrap();
+        let error = validate_pull_destination(dir.path(), false).unwrap_err();
+        assert!(error.to_string().contains("attachments/diagram.png"));
+        assert!(
+            error
+                .to_string()
+                .contains("new or changed local attachment")
+        );
+
+        fs::remove_file(&image).unwrap();
+        let error = validate_pull_destination(dir.path(), false).unwrap_err();
+        assert!(error.to_string().contains("attachments/diagram.png"));
+        assert!(error.to_string().contains("attachment removed locally"));
     }
 
     #[test]

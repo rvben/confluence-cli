@@ -819,24 +819,27 @@ mod tests {
     async fn get_space_asks_for_the_space_by_key() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/rest/api/space/HDA"))
+            .and(path("/rest/api/space/EXAMPLE"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": 4242,
-                "key": "HDA",
-                "name": "Data Platform",
+                "key": "EXAMPLE",
+                "name": "Example Space",
                 "type": "global",
                 "homepage": { "id": "77" },
-                "_links": { "webui": "/display/HDA" }
+                "_links": { "webui": "/display/EXAMPLE" }
             })))
             .expect(1)
             .mount(&server)
             .await;
 
-        let space = dc_provider(&server.uri()).get_space("HDA").await.unwrap();
+        let space = dc_provider(&server.uri())
+            .get_space("EXAMPLE")
+            .await
+            .unwrap();
 
-        assert_eq!(space.key, "HDA");
+        assert_eq!(space.key, "EXAMPLE");
         assert_eq!(space.id, "4242");
-        assert_eq!(space.name, "Data Platform");
+        assert_eq!(space.name, "Example Space");
         assert_eq!(space.homepage_id.as_deref(), Some("77"));
     }
 
@@ -1070,13 +1073,13 @@ mod tests {
     async fn get_space_surfaces_a_failed_lookup_instead_of_not_found() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/rest/api/space/HDA"))
+            .and(path("/rest/api/space/EXAMPLE"))
             .respond_with(ResponseTemplate::new(403))
             .mount(&server)
             .await;
 
         let err = dc_provider(&server.uri())
-            .get_space("HDA")
+            .get_space("EXAMPLE")
             .await
             .unwrap_err();
 

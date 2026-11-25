@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind as IoErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
 
@@ -495,19 +496,43 @@ impl TreeLayout {
         is_child: bool,
         occupied: &mut BTreeSet<String>,
     ) -> PathBuf {
-        if matches!(self, Self::Slug) {
-            let slug = document_dir_name(&item.title, None);
-            let candidate = parent.join(&slug);
-            if attachment_file_name_is_safe(&slug)
-                && !(is_child && page_uses_name(&slug))
-                && occupied.insert(path_key(&candidate))
-            {
-                return candidate;
+        let title = match self {
+            Self::SlugId => {
+                return unique_path(
+                    parent,
+                    OsStr::new(&document_dir_name(&item.title, Some(&item.id))),
+                    occupied,
+                );
             }
+            Self::Slug => emoji_pattern().replace_all(&item.title, " "),
+        };
+        let slug = document_dir_name(&title, None);
+        let candidate = parent.join(&slug);
+        if attachment_file_name_is_safe(&slug)
+            && !(is_child && page_uses_name(&slug))
+            && occupied.insert(path_key(&candidate))
+        {
+            return candidate;
         }
-        let name = document_dir_name(&item.title, Some(&item.id));
+        let name = document_dir_name(&title, Some(&item.id));
         unique_path(parent, OsStr::new(&name), occupied)
     }
+}
+
+fn emoji_pattern() -> &'static regex::Regex {
+    static EMOJI: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?x)
+            [0-9\x{23}*]\x{FE0F}?\x{20E3}
+            | [\p{Extended_Pictographic}\p{Emoji_Presentation}]
+              [\x{FE0E}\x{FE0F}]? [\p{Emoji_Modifier}\x{E0020}-\x{E007F}]*
+              (?:\x{200D}[\p{Extended_Pictographic}\p{Emoji_Presentation}]
+                 [\x{FE0E}\x{FE0F}]?\p{Emoji_Modifier}?)*
+            ",
+        )
+        .expect("valid emoji sequence pattern")
+    });
+    &EMOJI
 }
 
 fn unique_path(parent: &Path, name: &OsStr, occupied: &mut BTreeSet<String>) -> PathBuf {
