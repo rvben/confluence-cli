@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.46](https://github.com/rvben/confluence-cli/compare/v0.1.45...v0.1.46) - 2026-11-26
+
+### Added
+
+- publish Mermaid diagrams from Markdown ([f7430aa](https://github.com/rvben/confluence-cli/commit/f7430aa0d60478d42a5997ea613aea6cd921af94))
+
 ## [0.1.45](https://github.com/rvben/confluence-cli/compare/v0.1.44...v0.1.45) - 2026-11-25
 
 ### Fixed
