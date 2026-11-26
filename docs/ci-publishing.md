@@ -2,6 +2,8 @@
 
 A CI publish needs the sidecars from the last successful deployment. They identify the remote pages and attachments and carry the baseline needed to detect independent edits. Keep that baseline in a persistent state file so each checkout can begin with the current deployment state.
 
+For pages authored with Mermaid fences, the [Mermaid example](../examples/mermaid/README.md) shows how to render and publish them as attachments. Install the same pinned Mermaid CLI and browser in preview and publish jobs. When upgrading the renderer, use `--refresh-mermaid` with both commands to regenerate unchanged diagrams.
+
 ## Bootstrap once
 
 1. Pull the full publishing tree from the target site. Review it, then commit the Markdown, attachments, and initial `.confluence.json` files. Keep each sidecar with its page.
@@ -42,3 +44,8 @@ Renaming a sidecar-free page itself requires first pulling that page's sidecar f
 If preflight finds remote drift, the file still contains the last published baseline. If an apply stops after preflight, the file may record an unfinished publish. Retain that file and the failed workspace. Use the reported completed actions and the page IDs saved in the pending state to investigate. Check the current remote pages if a create response was lost or a state write failed.
 
 To adopt remote edits or recover from an interrupted publish or lost state, pause publishing jobs for this tree and pull a fresh snapshot into a separate directory. Reconcile the desired changes onto that snapshot, preserving the existing remote page IDs and the source paths. For pages that CI created, start from the pulled front matter so the source carries current metadata and drops the original `space_key` bootstrap hint. Commit the reconciled Markdown, attachments, and sidecars together and integrate that commit into the branch CI publishes. Run the bootstrap commands from a checkout of that branch at the reconciled revision with a new state file. After bootstrap succeeds, point CI at the new file, cancel any queued publishes of older revisions, and resume publishing. Reinitializing from stale sidecars can cause CI to create duplicate pages.
+
+An interrupted Mermaid publish can leave a PNG attached before its source block
+is written to the page. Reconcile the Markdown source and review the pulled
+attachments before initializing the replacement state file. A PNG without a
+matching image and source block is pulled as an ordinary attachment.

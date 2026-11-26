@@ -19,6 +19,7 @@ include = [
     "LICENSE",
     "assets/**",
     "docs/**",
+    "examples/mermaid/**",
     "src/**",
     "skills/confluence/**",
     "tests/**",

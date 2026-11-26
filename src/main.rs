@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod credentials;
 mod markdown;
+mod mermaid;
 mod model;
 mod output;
 mod provider;

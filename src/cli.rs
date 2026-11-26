@@ -447,6 +447,9 @@ struct PlanArgs {
     /// Plan deletion of remote attachments removed from the local tree
     #[arg(long)]
     delete_remote: bool,
+    /// Re-render unchanged Mermaid diagrams, for example after upgrading mmdc
+    #[arg(long)]
+    refresh_mermaid: bool,
     /// Include unified body diffs in text output
     #[arg(long)]
     diff: bool,
@@ -484,6 +487,9 @@ struct ApplyArgs {
     /// Delete remote attachments removed from the local tree; requires confirmation
     #[arg(long)]
     delete_remote: bool,
+    /// Re-render unchanged Mermaid diagrams, for example after upgrading mmdc
+    #[arg(long)]
+    refresh_mermaid: bool,
     /// Overwrite content despite remote-version drift
     #[arg(long)]
     force: bool,
@@ -1124,6 +1130,7 @@ pub async fn run() -> Result<()> {
                 sync::PublishOptions {
                     allow_lossy: args.allow_lossy,
                     delete_remote: args.delete_remote,
+                    refresh_mermaid: args.refresh_mermaid,
                     ..Default::default()
                 },
                 args.diff,
@@ -1183,6 +1190,7 @@ pub async fn run() -> Result<()> {
                     allow_lossy: args.allow_lossy,
                     delete_remote: args.delete_remote,
                     force: args.force,
+                    refresh_mermaid: args.refresh_mermaid,
                 },
                 args.state_file.as_deref(),
                 args.init_state,

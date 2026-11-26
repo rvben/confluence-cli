@@ -58,6 +58,13 @@ pub struct Sidecar {
     pub remote_storage_hash: Option<String>,
     #[serde(default)]
     pub attachment_map: BTreeMap<String, AttachmentState>,
+    /// Native images paired with Mermaid fences, in the order of the fences.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mermaid_attachments: Vec<Option<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mermaid_rendered_sources: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mermaid_pending: Option<crate::mermaid::PendingPublish>,
     /// Title as of the last pull/apply, used by plan to detect title changes.
     #[serde(default)]
     pub last_pulled_title: Option<String>,
@@ -100,12 +107,7 @@ pub struct ConversionOutput {
 }
 
 pub fn storage_to_markdown(storage: &str) -> String {
-    let trimmed = storage.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    storage_to_markdown_xml(trimmed).unwrap_or_else(|| storage_to_markdown_fallback(trimmed))
+    storage_to_markdown_xml(storage.trim(), false).0
 }
 
 const AC_NS: &str = "urn:confluence-ac";
@@ -161,7 +163,14 @@ pub(crate) struct StatusMacroPlaceholder {
     pub colour: Option<String>,
 }
 
-fn storage_to_markdown_xml(storage: &str) -> Option<String> {
+pub(crate) fn storage_to_markdown_with_mermaid(storage: &str) -> (String, Vec<Option<String>>) {
+    storage_to_markdown_xml(storage.trim(), true)
+}
+
+fn storage_to_markdown_xml(storage: &str, restore_mermaid: bool) -> (String, Vec<Option<String>>) {
+    if storage.is_empty() {
+        return (String::new(), Vec::new());
+    }
     // Storage names characters by the entities of HTML, which XML knows
     // only when they are declared.
     let wrapped = wrap_storage_fragment(storage);
@@ -169,16 +178,120 @@ fn storage_to_markdown_xml(storage: &str) -> Option<String> {
         allow_dtd: true,
         ..roxmltree::ParsingOptions::default()
     };
-    let document = Document::parse_with_options(&wrapped, options).ok()?;
+    let Ok(document) = Document::parse_with_options(&wrapped, options) else {
+        return (storage_to_markdown_fallback(storage), Vec::new());
+    };
     let mut blocks = Vec::new();
-    for child in document.root_element().children() {
-        if let Some(block) = render_top_level_block(child, &wrapped)
+    let mut generated_images = Vec::new();
+    let mut children = document
+        .root_element()
+        .children()
+        .filter(|child| {
+            !child.is_text() || child.text().is_some_and(|text| !text.trim().is_empty())
+        })
+        .peekable();
+    while let Some(child) = children.next() {
+        if restore_mermaid
+            && let Some(sibling) = children.peek().copied()
+            && let Some((filename, fence)) = mermaid_image_and_source(child, sibling)
+        {
+            generated_images.push(Some(filename.to_string()));
+            blocks.push(fence);
+            children.next();
+        } else if let Some(block) = render_top_level_block(child, &wrapped)
             && !block.trim().is_empty()
         {
-            blocks.push(block.trim().to_string());
+            let block = block.trim();
+            if restore_mermaid {
+                generated_images.extend(crate::mermaid::fences(block).into_iter().map(|_| None));
+            }
+            blocks.push(block.to_string());
         }
     }
-    Some(blocks.join("\n\n"))
+    (blocks.join("\n\n"), generated_images)
+}
+
+fn mermaid_image_and_source<'a>(
+    image: Node<'a, '_>,
+    expand: Node<'a, '_>,
+) -> Option<(&'a str, String)> {
+    let only_element = |node: Node<'a, '_>| {
+        let mut children = node.children().filter(|child| {
+            !child.is_text() || child.text().is_some_and(|text| !text.trim().is_empty())
+        });
+        let child = children.next().filter(Node::is_element)?;
+        children.next().is_none().then_some(child)
+    };
+    let image = if image.has_tag_name("p") {
+        only_element(image)?
+    } else {
+        image
+    };
+    if !image.has_tag_name((AC_NS, "image"))
+        || !expand.has_tag_name((AC_NS, "structured-macro"))
+        || expand.attribute((AC_NS, "name")) != Some("expand")
+    {
+        return None;
+    }
+    let attachment = only_element(image)?;
+    let filename = attachment.attribute((RI_NS, "filename"))?;
+    if !attachment.has_tag_name((RI_NS, "attachment"))
+        || attachment.children().any(|child| {
+            !child.is_text() || child.text().is_some_and(|text| !text.trim().is_empty())
+        })
+        || !crate::mermaid::generated_name(filename)
+    {
+        return None;
+    }
+    let mut title = false;
+    let mut rich_body = None;
+    for child in expand.children().filter(Node::is_element) {
+        if child.has_tag_name((AC_NS, "parameter")) {
+            match child.attribute((AC_NS, "name")) {
+                Some("title") if !title && child.text() == Some(crate::mermaid::SOURCE_TITLE) => {
+                    title = true;
+                }
+                // The Cloud editor adds the expand block's width on save.
+                Some("breakoutWidth" | "breakoutMode") => {}
+                _ => return None,
+            }
+        } else if child.has_tag_name((AC_NS, "rich-text-body")) && rich_body.is_none() {
+            rich_body = Some(child);
+        } else {
+            return None;
+        }
+    }
+    if !title {
+        return None;
+    }
+    let code = only_element(rich_body?)?;
+    if !code.has_tag_name((AC_NS, "structured-macro"))
+        || !matches!(code.attribute((AC_NS, "name")), Some("noformat" | "code"))
+    {
+        return None;
+    }
+    let mut body = None;
+    for child in code.children().filter(Node::is_element) {
+        if child.has_tag_name((AC_NS, "plain-text-body")) && body.is_none() {
+            body = Some(child);
+        } else if !child.has_tag_name((AC_NS, "parameter")) {
+            return None;
+        }
+    }
+    let body = body?;
+    if body.children().any(|node| !node.is_text()) {
+        return None;
+    }
+    let fence: String = body.children().filter_map(|node| node.text()).collect();
+    let fence = fence.trim_matches('\n');
+    let diagrams = crate::mermaid::fences(fence);
+    let [diagram] = diagrams.as_slice() else {
+        return None;
+    };
+    if diagram.range != (0..fence.len()) || !has_closing_fence(fence, &diagram.source) {
+        return None;
+    }
+    Some((filename, fence.to_string()))
 }
 
 fn storage_to_markdown_fallback(storage: &str) -> String {
@@ -3701,6 +3814,62 @@ fn fallback_block_markdown(node: Node<'_, '_>, source: &str) -> String {
     }
 }
 
+pub(crate) fn publishable_mermaid_diagrams(
+    markdown: &str,
+    doc: &LocalDocument,
+) -> Result<Vec<crate::mermaid::Diagram>> {
+    let mut diagrams = crate::mermaid::fences(markdown);
+    if diagrams.is_empty() {
+        return Ok(diagrams);
+    }
+    let blocks = Reading::of(markdown).blocks()?;
+    for diagram in &diagrams {
+        let line = markdown[..diagram.range.start].matches('\n').count() + 1;
+        let source = &markdown[diagram.range.clone()];
+        anyhow::ensure!(
+            diagram.top_level
+                && !blocks
+                    .iter()
+                    .any(|block| block.range.contains(&diagram.range.start)),
+            "Mermaid diagram on body line {line} must be a top-level Markdown block"
+        );
+        anyhow::ensure!(
+            has_closing_fence(source, &diagram.source),
+            "Mermaid diagram on body line {line} needs a closing fence"
+        );
+    }
+    crate::mermaid::name_diagrams(doc, &mut diagrams);
+    Ok(diagrams)
+}
+
+pub(crate) fn project_mermaid<'a>(markdown: &'a str, doc: &LocalDocument) -> Result<Cow<'a, str>> {
+    let diagrams = publishable_mermaid_diagrams(markdown, doc)?;
+    if diagrams.is_empty() {
+        return Ok(Cow::Borrowed(markdown));
+    }
+    let mut output = String::new();
+    let mut offset = 0;
+    for diagram in diagrams {
+        output.push_str(&markdown[offset..diagram.range.start]);
+        let fence = markdown[diagram.range.clone()].trim_end_matches('\n');
+        let alt = diagram.title().unwrap_or("Mermaid diagram");
+        let alt = escape_inline_tag_attribute(alt);
+        let source = fence.replace("]]>", "]]]]><![CDATA[>");
+        let storage = format!(
+            r#"<ac:image ac:alt="{alt}"><ri:attachment ri:filename="{}" /></ac:image><ac:structured-macro ac:name="expand"><ac:parameter ac:name="title">{}</ac:parameter><ac:rich-text-body><ac:structured-macro ac:name="noformat"><ac:plain-text-body><![CDATA[{source}]]></ac:plain-text-body></ac:structured-macro></ac:rich-text-body></ac:structured-macro>"#,
+            diagram.filename,
+            crate::mermaid::SOURCE_TITLE,
+        );
+        output.push_str(&confluence_raw_block(&storage));
+        if markdown[diagram.range.clone()].ends_with('\n') {
+            output.push('\n');
+        }
+        offset = diagram.range.end;
+    }
+    output.push_str(&markdown[offset..]);
+    Ok(Cow::Owned(output))
+}
+
 fn confluence_raw_block(raw: &str) -> String {
     let raw = raw.trim();
     let fence = backtick_fence(raw);
@@ -6324,11 +6493,14 @@ pub fn save_document(doc: &LocalDocument) -> Result<()> {
         &doc.markdown_path,
         render_document(&doc.frontmatter, &doc.body_markdown)?.as_bytes(),
     )?;
+    save_sidecar(doc)
+}
+
+pub(crate) fn save_sidecar(doc: &LocalDocument) -> Result<()> {
     atomic_write(
         &doc.sidecar_path,
         serde_json::to_string_pretty(&doc.sidecar)?.as_bytes(),
-    )?;
-    Ok(())
+    )
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
@@ -6407,6 +6579,76 @@ pub fn scan_local_documents(root: &Path) -> Result<Vec<LocalContentIndex>> {
 
 #[cfg(test)]
 mod tests {
+
+    fn create_test_document(directory: &Path) -> LocalDocument {
+        fs::write(
+            directory.join("index.md"),
+            "---\ntitle: Mermaid\ntype: page\n---\n",
+        )
+        .unwrap();
+        load_document(directory).unwrap()
+    }
+
+    #[test]
+    fn mermaid_publishing_restores_closed_fences_and_ignores_literal_examples() {
+        let diagram = "~~~~mermaid\nflowchart LR\n%% contains ]]> to test CDATA\n\nA --> B\n~~~~";
+        let literal = "````md\n```mermaid\nLiteral code example\n```\n````";
+        let input = format!("{diagram}\n\n{literal}");
+        let temp = tempfile::tempdir().unwrap();
+        let doc = create_test_document(temp.path());
+        let staged = project_mermaid(&input, &doc).unwrap();
+        let storage = markdown_to_storage(&staged, false).unwrap().storage;
+        let (markdown, generated) = storage_to_markdown_with_mermaid(&storage);
+        assert!(markdown.starts_with(diagram), "{markdown}");
+        assert!(markdown.contains("Literal code example"), "{markdown}");
+        assert_eq!(
+            generated,
+            [Some("confluence-cli-mermaid-1.png".to_string())]
+        );
+    }
+
+    #[test]
+    fn mermaid_pull_accepts_the_cloud_editors_source_macro() {
+        let fence = "```mermaid\nflowchart LR\nA --> B\n```";
+        let storage = format!(
+            r#"<ac:image ac:align="left" ac:layout="align-start" ac:alt="Example"><ri:attachment ri:filename="confluence-cli-mermaid-2.png" ri:version-at-save="1" /></ac:image><ac:structured-macro ac:name="expand" ac:schema-version="1" data-layout="wide"><ac:parameter ac:name="title">Mermaid source (confluence-cli)</ac:parameter><ac:parameter ac:name="breakoutWidth">760</ac:parameter><ac:rich-text-body><ac:structured-macro ac:name="code" ac:schema-version="1"><ac:plain-text-body><![CDATA[{fence}]]></ac:plain-text-body></ac:structured-macro></ac:rich-text-body></ac:structured-macro>"#,
+        );
+        let (markdown, images) = storage_to_markdown_with_mermaid(&storage);
+        assert_eq!(markdown, fence);
+        assert_eq!(images, [Some("confluence-cli-mermaid-2.png".to_string())]);
+        let unrelated = storage.replace("Mermaid source (confluence-cli)", "Notes");
+        assert!(storage_to_markdown_with_mermaid(&unrelated).1.is_empty());
+
+        let code = "<pre><code class=\"language-mermaid\">flowchart LR\nB --&gt; C</code></pre>";
+        let (mixed, names) = storage_to_markdown_with_mermaid(&format!("{code}{storage}"));
+        assert_eq!(crate::mermaid::fences(&mixed).len(), 2, "{mixed}");
+        assert_eq!(
+            names,
+            [None, Some("confluence-cli-mermaid-2.png".to_string())]
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let mut doc = create_test_document(temp.path());
+        doc.sidecar.last_pulled_body_markdown = Some(mixed.clone());
+        doc.sidecar.mermaid_attachments = names;
+        let diagrams = publishable_mermaid_diagrams(&mixed, &doc).unwrap();
+        assert_eq!(diagrams[1].filename, "confluence-cli-mermaid-2.png");
+    }
+
+    #[test]
+    fn mermaid_publishing_needs_a_closed_top_level_block() {
+        let temp = tempfile::tempdir().unwrap();
+        let doc = create_test_document(temp.path());
+        let unclosed = project_mermaid("```mermaid\nflowchart LR\n", &doc).unwrap_err();
+        assert!(
+            unclosed.to_string().contains("needs a closing fence"),
+            "{unclosed}"
+        );
+        let nested = project_mermaid("> ```mermaid\n> flowchart LR\n> ```", &doc).unwrap_err();
+        assert!(
+            nested.to_string().contains("top-level Markdown block"),
+            "{nested}"
+        );
+    }
     use super::*;
 
     fn conversion_error(markdown: &str) -> crate::output::CliError {

@@ -1530,9 +1530,836 @@ async fn pull_writes_the_rest_of_a_tree_when_a_page_does_not_convert() {
     .expect("simulated pull task");
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_mermaid_round_trips_and_updates_its_attachment_in_place() {
+    test_mermaid_sync(simulated_cloud_config).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_center_mermaid_round_trips_and_updates_its_attachment_in_place() {
+    test_mermaid_sync(simulated_data_center_config).await;
+}
+
+#[cfg(unix)]
+async fn with_mermaid_simulator(
+    config: fn(&ConfluenceSimulator, &TempDir) -> E2eConfig,
+    test: impl FnOnce(E2eConfig, ConfluenceSimulator, &TempDir) + Send + 'static,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let simulator = ConfluenceSimulator::start().await;
+    let config_home = TempDir::new().unwrap();
+    let mut cfg = config(&simulator, &config_home);
+    tokio::task::spawn_blocking(move || {
+        let _config_home = config_home;
+        let temp = TempDir::new().unwrap();
+        let renderer = temp.path().join("mmdc");
+        fs::write(
+            &renderer,
+            r#"#!/bin/sh
+set -eu
+[ "$1" = "-i" ] && [ "$3" = "-o" ] || exit 2
+if /usr/bin/grep -q 'render-error' "$2"; then
+    echo "invalid Mermaid" >&2
+    exit 1
+fi
+printf '\211PNG\r\n\032\n' > "$4"
+/usr/bin/awk '!/^[[:space:]]*%%/' "$2" >> "$4"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&renderer, fs::Permissions::from_mode(0o755)).unwrap();
+        cfg.envs
+            .push(("PATH".into(), temp.path().to_string_lossy().into_owned()));
+
+        test(cfg, simulator, &temp);
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+async fn test_mermaid_sync(config: fn(&ConfluenceSimulator, &TempDir) -> E2eConfig) {
+    with_mermaid_simulator(config, verify_mermaid_sync).await;
+}
+
+#[cfg(unix)]
+fn verify_mermaid_sync(cfg: E2eConfig, simulator: ConfluenceSimulator, temp: &TempDir) {
+    use std::collections::BTreeMap;
+
+    let renderer = temp.path().join("mmdc");
+    let page = temp.path().join("page");
+    let path = page.to_str().unwrap();
+    fs::create_dir(&page).unwrap();
+    let index = page.join("index.md");
+    let fence = "~~~mermaid\nflowchart LR\n    accTitle: Checkout & fulfillment\n    A --> B\n~~~";
+    fs::write(
+        &index,
+        format!(
+            "---\ntitle: Mermaid e2e\ntype: page\nproperties:\n  space_key: TEST\n  confluence-cli.render-mermaid: true\n---\n\n{fence}\n"
+        ),
+    )
+    .unwrap();
+
+    let plan = cfg.run_json(&["plan", path, "--check-remote"]);
+    assert_eq!(
+        list_items(&plan, "plan")
+            .iter()
+            .map(|item| string_field(item, "action"))
+            .collect::<Vec<_>>(),
+        ["create_content", "upload_attachment"]
+    );
+    assert!(!page.join("attachments").exists());
+    let apply = cfg.run_json(&["apply", path]);
+    let page_id = string_field(
+        list_items(&apply, "apply")
+            .iter()
+            .find(|item| item["action"] == "create_content")
+            .unwrap(),
+        "content_id",
+    );
+    let requests = tokio::runtime::Handle::current().block_on(simulator.received_requests());
+    let upload = requests
+        .iter()
+        .position(|request| request.url.path().ends_with("/attachment") && !request.body.is_empty())
+        .expect("PNG upload request");
+    let write = requests
+        .iter()
+        .position(|request| {
+            request
+                .body
+                .windows(b"<ac:image".len())
+                .any(|bytes| bytes == b"<ac:image")
+        })
+        .expect("content write containing the image reference");
+    assert!(
+        upload < write,
+        "upload request {upload} must precede body write {write}"
+    );
+    let stored = cfg.run_json(&["page", "get", page_id, "--show-body"]);
+    let body = string_field(first_item(&stored, "page get"), "body_storage");
+    assert!(
+        body.contains(r#"ac:alt="Checkout &amp; fulfillment""#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"ri:filename="confluence-cli-mermaid-1.png""#),
+        "{body}"
+    );
+    assert!(body.contains("Mermaid source (confluence-cli)"), "{body}");
+    let disabled = temp.path().join("mmdc-disabled");
+    fs::rename(&renderer, &disabled).unwrap();
+    assert_eq!(
+        list_items(&cfg.run_json(&["plan", path]), "preview without renderer")
+            .iter()
+            .map(|item| string_field(item, "action"))
+            .collect::<Vec<_>>(),
+        ["noop"]
+    );
+    assert_eq!(
+        list_items(&cfg.run_json(&["apply", path]), "repeat apply")
+            .iter()
+            .map(|item| string_field(item, "action"))
+            .collect::<Vec<_>>(),
+        ["noop"]
+    );
+    let refresh = cfg
+        .command()
+        .args(["plan", path, "--refresh-mermaid"])
+        .output()
+        .unwrap();
+    assert!(!refresh.status.success());
+    assert!(String::from_utf8_lossy(&refresh.stderr).contains("mmdc"));
+    fs::rename(&disabled, &renderer).unwrap();
+
+    let script = fs::read_to_string(&renderer).unwrap();
+    fs::write(
+        &renderer,
+        format!("{script}\nprintf 'updated renderer' >> \"$4\"\n"),
+    )
+    .unwrap();
+    let refresh_plan = cfg.run_json(&["plan", path, "--refresh-mermaid"]);
+    assert_eq!(
+        list_items(&refresh_plan, "plan refresh")
+            .iter()
+            .map(|item| string_field(item, "action"))
+            .collect::<Vec<_>>(),
+        ["update_content", "upload_attachment"]
+    );
+    let refresh_apply = cfg.run_json(&["apply", path, "--refresh-mermaid"]);
+    assert_eq!(
+        list_items(&refresh_apply, "apply refresh")
+            .iter()
+            .map(|item| string_field(item, "action"))
+            .collect::<Vec<_>>(),
+        ["upload_attachment", "update_content"]
+    );
+    fs::write(&renderer, script).unwrap();
+
+    let before = cfg.run_json(&["attachment", "list", page_id]);
+    let original = list_items(&before, "attachment list")
+        .first()
+        .expect("single uploaded PNG");
+    assert_eq!(original["media_type"], "image/png");
+    let edited = fs::read_to_string(&index)
+        .unwrap()
+        .replace("A --> B", "A --> C");
+    fs::write(&index, &edited).unwrap();
+    let updated = cfg.run_json(&["apply", path]);
+    assert!(
+        list_items(&updated, "apply")
+            .iter()
+            .any(|item| item["action"] == "upload_attachment")
+    );
+    let after = cfg.run_json(&["attachment", "list", page_id]);
+    let current = list_items(&after, "attachment list")
+        .first()
+        .expect("single uploaded PNG");
+    assert_eq!(current["id"], original["id"]);
+    assert_eq!(
+        current["version"].as_u64(),
+        original["version"].as_u64().map(|v| v + 1)
+    );
+
+    let snapshot = temp.path().join("snapshot");
+    let snapshot_arg = snapshot.to_str().unwrap();
+    cfg.run_json(&["pull", "page", page_id, snapshot_arg]);
+    let pulled = find_index_md(&snapshot);
+    let pulled_text = fs::read_to_string(&pulled).unwrap();
+    assert!(
+        pulled_text.contains(&fence.replace("A --> B", "A --> C")),
+        "{pulled_text}"
+    );
+    assert!(
+        !pulled
+            .with_file_name("attachments")
+            .join("confluence-cli-mermaid-1.png")
+            .exists()
+    );
+    fs::rename(&renderer, &disabled).unwrap();
+    assert_eq!(
+        list_items(&cfg.run_json(&["plan", snapshot_arg]), "pulled plan")
+            .iter()
+            .map(|item| string_field(item, "action"))
+            .collect::<Vec<_>>(),
+        ["noop"]
+    );
+    fs::rename(&disabled, &renderer).unwrap();
+    cfg.run_json(&["pull", "page", page_id, snapshot_arg]);
+
+    let previous_page = cfg.run_json(&["page", "get", page_id, "--show-body"]);
+    let broken = edited.replace("A --> C", "render-error");
+    let line = broken
+        .lines()
+        .position(|line| line == "~~~mermaid")
+        .unwrap()
+        + 1;
+    fs::write(&index, broken).unwrap();
+    let result = cfg.command().args(["apply", path]).output().unwrap();
+    assert!(!result.status.success());
+    let error = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stderr),
+        String::from_utf8_lossy(&result.stdout)
+    );
+    assert!(
+        error.contains(&format!(
+            "index.md:{line}: could not render Mermaid diagram"
+        )),
+        "{error}"
+    );
+    assert_eq!(
+        cfg.run_json(&["page", "get", page_id, "--show-body"]),
+        previous_page
+    );
+    assert_eq!(cfg.run_json(&["attachment", "list", page_id]), after);
+
+    // A publish without --delete-remote leaves attachments available.
+    // Once the diagram is removed they pull as regular attachments.
+    fs::write(
+        &index,
+        edited.replace(&fence.replace("A --> B", "A --> C"), "Diagram removed."),
+    )
+    .unwrap();
+    cfg.run_json(&["apply", path]);
+    cfg.run_json(&["pull", "page", page_id, snapshot_arg]);
+    assert!(
+        pulled
+            .with_file_name("attachments")
+            .join("confluence-cli-mermaid-1.png")
+            .is_file()
+    );
+    assert_eq!(
+        list_items(
+            &cfg.run_json(&["plan", snapshot_arg]),
+            "plan after diagram removal"
+        )
+        .iter()
+        .map(|item| string_field(item, "action"))
+        .collect::<Vec<_>>(),
+        ["noop"]
+    );
+
+    // The retained orphan keeps its filename when new diagrams are added.
+    let last_fence = "```mermaid\nflowchart LR\nD --> E\n```";
+    fs::write(&index, format!("{edited}\n\n{last_fence}")).unwrap();
+    let added = cfg.run_json(&["apply", path]);
+    let uploads = list_items(&added, "add two diagrams")
+        .iter()
+        .filter(|item| item["action"] == "upload_attachment")
+        .collect::<Vec<_>>();
+    let [first, second] = uploads.as_slice() else {
+        panic!("expected two uploaded images: {uploads:?}");
+    };
+    let active_first = string_field(first, "title");
+    let active_second = string_field(second, "title");
+    let active_first_id = string_field(first, "content_id");
+    assert_ne!(active_first, "confluence-cli-mermaid-1.png");
+
+    let first_fence = fence.replace("A --> B", "A --> C");
+    let just_second = edited.replace(&first_fence, last_fence);
+    fs::write(&index, format!("{just_second}\n\n{first_fence}\n")).unwrap();
+    let reorder = cfg.run_json(&["apply", path]);
+    assert_eq!(
+        list_items(&reorder, "reorder diagrams")
+            .iter()
+            .map(|item| string_field(item, "action"))
+            .collect::<Vec<_>>(),
+        ["update_content"]
+    );
+
+    fs::write(&index, format!("{edited}\n\n{last_fence}\n")).unwrap();
+    let restore_order = cfg.run_json(&["apply", path]);
+    assert_eq!(
+        list_items(&restore_order, "restore diagram order")
+            .iter()
+            .map(|item| string_field(item, "action"))
+            .collect::<Vec<_>>(),
+        ["update_content"]
+    );
+
+    fs::write(&index, &just_second).unwrap();
+    let remove = cfg.run_json(&["plan", path, "--delete-remote"]);
+    assert_eq!(
+        list_items(&remove, "remove earlier diagram")
+            .iter()
+            .map(|item| (string_field(item, "action"), string_field(item, "title")))
+            .collect::<Vec<_>>(),
+        [
+            ("update_content", "Mermaid e2e"),
+            ("delete_attachment", "confluence-cli-mermaid-1.png"),
+            ("delete_attachment", active_first)
+        ]
+    );
+    fs::write(&index, format!("{edited}\n\n{last_fence}\n")).unwrap();
+    let page = cfg.run_json(&["page", "get", page_id, "--show-body"]);
+    let body = string_field(first_item(&page, "page get"), "body_storage");
+    let second = body
+        .match_indices("<ac:image")
+        .nth(1)
+        .expect("second diagram")
+        .0;
+    cfg.run_json(&[
+        "page",
+        "update",
+        page_id,
+        "--format",
+        "storage",
+        "--body",
+        &body[second..],
+    ]);
+    cfg.run_json(&["pull", "page", page_id, snapshot_arg]);
+    let restored = fs::read_to_string(&pulled).unwrap();
+    assert!(restored.contains(last_fence), "{restored}");
+    assert!(!restored.contains("A --> C"), "{restored}");
+    let snapshot_attachments = pulled.with_file_name("attachments");
+    assert!(snapshot_attachments.join(active_first).is_file());
+    assert!(!snapshot_attachments.join(active_second).exists());
+    let plan = cfg.run_json(&["plan", snapshot_arg, "--check-remote"]);
+    assert_eq!(
+        list_items(&plan, "plan after remote diagram removal")
+            .iter()
+            .map(|item| string_field(item, "action"))
+            .collect::<Vec<_>>(),
+        ["noop"]
+    );
+    cfg.run_json(&["pull", "page", page_id, snapshot_arg]);
+
+    // The surviving image identity stays the same when the old PNG is
+    // also removed by the remote editor.
+    cfg.run_json(&["--yes", "attachment", "delete", page_id, active_first_id]);
+    cfg.run_json(&["pull", "page", page_id, snapshot_arg]);
+    assert!(!snapshot_attachments.join(active_first).exists());
+    fs::write(&pulled, restored.replace("D --> E", "D --> F")).unwrap();
+    let remaining = cfg.run_json(&["apply", snapshot_arg]);
+    let uploads = list_items(&remaining, "apply after remote deletion")
+        .iter()
+        .filter(|item| item["action"] == "upload_attachment")
+        .map(|item| string_field(item, "title"))
+        .collect::<Vec<_>>();
+    assert_eq!(uploads, [active_second]);
+
+    let remote = cfg.run_json(&["page", "get", page_id, "--show-body"]);
+    let remote_storage = string_field(first_item(&remote, "page get"), "body_storage");
+    let edited_source = remote_storage.replace("D --> F", "D --> G");
+    cfg.run_json(&[
+        "page",
+        "update",
+        page_id,
+        "--format",
+        "storage",
+        "--body",
+        &edited_source,
+    ]);
+    let source_snapshot = temp.path().join("remote-source-update");
+    let source_snapshot_arg = source_snapshot.to_str().unwrap();
+    cfg.run_json(&["pull", "page", page_id, source_snapshot_arg]);
+    let source_plan = cfg.run_json(&["plan", source_snapshot_arg]);
+    assert!(
+        list_items(&source_plan, "changed remote Mermaid source")
+            .iter()
+            .any(|item| {
+                item["action"] == "upload_attachment" && item["title"] == active_second
+            }),
+        "{source_plan}"
+    );
+
+    let retry = temp.path().join("retry");
+    fs::create_dir(&retry).unwrap();
+    fs::write(
+        retry.join("index.md"),
+        format!("---\ntitle: Retry Mermaid e2e\ntype: page\nproperties:\n  space_key: TEST\n  confluence-cli.render-mermaid: true\n---\n\n{first_fence}\n\n{last_fence}\n"),
+    ).unwrap();
+    let retry_arg = retry.to_str().unwrap();
+    simulator.fail_next_attachment_upload("confluence-cli-mermaid-2.png");
+    let failed = cfg.command().args(["apply", retry_arg]).output().unwrap();
+    assert!(!failed.status.success());
+    let error = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        error.contains("simulated attachment upload failure"),
+        "{error}"
+    );
+    let checkpoint: Value =
+        serde_json::from_slice(&fs::read(retry.join(".confluence.json")).unwrap()).unwrap();
+    let retry_id = string_field(&checkpoint, "content_id");
+    let retry_index = retry.join("index.md");
+    let changed = fs::read_to_string(&retry_index)
+        .unwrap()
+        .replace("A --> C", "A --> Revised");
+    fs::write(&retry_index, changed).unwrap();
+    let recovered = cfg.run_json(&["apply", retry_arg]);
+    let items = list_items(&recovered, "retry successful apply");
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| string_field(item, "action"))
+            .collect::<Vec<_>>(),
+        ["upload_attachment", "upload_attachment", "update_content"]
+    );
+    assert_eq!(string_field(&items[2], "content_id"), retry_id);
+    let retry_stored = cfg.run_json(&["page", "get", retry_id, "--show-body"]);
+    let retry_body = string_field(first_item(&retry_stored, "retry page"), "body_storage");
+    assert_eq!(retry_body.matches("<ac:image").count(), 2);
+    let retry_attachments = cfg.run_json(&["attachment", "list", retry_id]);
+    let versions = list_items(&retry_attachments, "retry attachments")
+        .iter()
+        .map(|item| {
+            (
+                string_field(item, "title"),
+                item["version"].as_u64().unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        versions,
+        BTreeMap::from([
+            ("confluence-cli-mermaid-1.png", 2),
+            ("confluence-cli-mermaid-2.png", 1)
+        ])
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_mermaid_recovers_after_an_ambiguous_upload_response() {
+    with_mermaid_simulator(simulated_cloud_config, verify_mermaid_ambiguous_upload).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_center_mermaid_recovers_after_an_ambiguous_upload_response() {
+    with_mermaid_simulator(
+        simulated_data_center_config,
+        verify_mermaid_ambiguous_upload,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+fn verify_mermaid_ambiguous_upload(cfg: E2eConfig, simulator: ConfluenceSimulator, temp: &TempDir) {
+    let first_fence =
+        "~~~mermaid\nflowchart LR\n    accTitle: Checkout & fulfillment\n    A --> C\n~~~";
+    let ambiguous = temp.path().join("ambiguous-upload");
+    fs::create_dir(&ambiguous).unwrap();
+    let ambiguous_arg = ambiguous.to_str().unwrap();
+    let ambiguous_index = ambiguous.join("index.md");
+    let input = format!(
+        "---\ntitle: Interrupted Mermaid upload\ntype: page\nproperties:\n  space_key: TEST\n  confluence-cli.render-mermaid: true\n---\n\n{first_fence}\n"
+    );
+    let generated_name = "confluence-cli-mermaid-1.png";
+    let interrupt_upload = || {
+        simulator.corrupt_next_attachment_upload_response(generated_name);
+        let failed = cfg
+            .command()
+            .args(["apply", ambiguous_arg])
+            .output()
+            .unwrap();
+        assert!(!failed.status.success(), "{failed:?}");
+    };
+    fs::write(&ambiguous_index, &input).unwrap();
+    interrupt_upload();
+    let checkpoint_path = ambiguous.join(".confluence.json");
+    let checkpoint: Value = serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+    let page_id = string_field(&checkpoint, "content_id");
+    let list_attachments = || cfg.run_json(&["attachment", "list", page_id]);
+    let initial = list_attachments();
+    let initial_attachments = list_items(&initial, "attachment accepted before invalid response");
+    assert_eq!(initial_attachments.len(), 1);
+    assert_eq!(initial_attachments[0]["title"], generated_name);
+    assert_eq!(initial_attachments[0]["version"], 1);
+    let attachment_id = string_field(&initial_attachments[0], "id");
+
+    let other_site = tokio::runtime::Handle::current().block_on(ConfluenceSimulator::start());
+    assert_eq!(
+        other_site.add_page("Interrupted Mermaid upload", None, ""),
+        page_id,
+        "both sites have a page with the same ID"
+    );
+    let mut other_profile = cfg.clone();
+    other_profile
+        .envs
+        .push(("CONFLUENCE_DOMAIN".into(), other_site.base_url()));
+    for args in [
+        vec!["plan", ambiguous_arg, "--check-remote"],
+        vec!["apply", ambiguous_arg],
+        vec!["apply", ambiguous_arg, "--force"],
+    ] {
+        let rejected = other_profile.command().args(args).output().unwrap();
+        assert_eq!(rejected.status.code(), Some(7), "{rejected:?}");
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("different Confluence site"));
+    }
+    let unrelated = other_profile.run_json(&["page", "get", page_id, "--show-body"]);
+    assert_eq!(first_item(&unrelated, "unrelated page")["version"], 1);
+    let unrelated_attachments = other_profile.run_json(&["attachment", "list", page_id]);
+    assert!(list_items(&unrelated_attachments, "unrelated attachments").is_empty());
+
+    let sidecar_before_plan = fs::read(&checkpoint_path).unwrap();
+    let plan = cfg.run_json(&["plan", ambiguous_arg, "--check-remote"]);
+    let items = list_items(&plan, "plan after server accepted the upload");
+    assert_eq!(items.len(), 1, "{plan}");
+    assert_eq!(items[0]["action"], "update_content");
+    assert_eq!(fs::read(&checkpoint_path).unwrap(), sidecar_before_plan);
+
+    let assert_recovered = |applied: Value, expected_version| {
+        let items = list_items(&applied, "retry ambiguous upload");
+        assert_eq!(items.len(), 2, "{applied}");
+        assert_eq!(items[0]["action"], "upload_attachment");
+        assert_eq!(items[0]["content_id"], attachment_id);
+        assert_eq!(items[1]["action"], "update_content");
+        assert_eq!(items[1]["content_id"], page_id);
+        let remote = list_attachments();
+        let attachments = list_items(&remote, "retried attachment");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0]["version"], expected_version);
+    };
+
+    let revised = input.replace("A --> C", "A --> Revised");
+    fs::write(&ambiguous_index, &revised).unwrap();
+    assert_recovered(cfg.run_json(&["apply", ambiguous_arg, "--force"]), 2);
+
+    let interrupted = input.replace("A --> C", "A --> Intermediate");
+    fs::write(&ambiguous_index, &interrupted).unwrap();
+    interrupt_upload();
+    let remote = list_attachments();
+    assert_eq!(
+        list_items(&remote, "replacement accepted before invalid response")[0]["version"],
+        3
+    );
+    fs::write(&ambiguous_index, &revised).unwrap();
+    assert_recovered(cfg.run_json(&["apply", ambiguous_arg]), 4);
+
+    fs::write(&ambiguous_index, &interrupted).unwrap();
+    interrupt_upload();
+    let remote = list_attachments();
+    let attempts = list_items(&remote, "second interrupted replacement");
+    assert_eq!(attempts[0]["version"], 5);
+    let provenance = string_field(&attempts[0], "comment");
+    let conflicting = temp.path().join(generated_name);
+    fs::write(&conflicting, b"independent attachment content").unwrap();
+    cfg.run_json(&[
+        "attachment",
+        "upload",
+        page_id,
+        "--file",
+        conflicting.to_str().unwrap(),
+        "--replace",
+        "--yes",
+        "--comment",
+        provenance,
+    ]);
+
+    let changed = input.replace("A --> C", "A --> Different");
+    fs::write(&ambiguous_index, changed).unwrap();
+    for args in [
+        vec!["plan", ambiguous_arg, "--check-remote"],
+        vec!["apply", ambiguous_arg],
+    ] {
+        let rejected = cfg.command().args(args).output().unwrap();
+        assert_eq!(rejected.status.code(), Some(7), "{rejected:?}");
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("remote attachment drift"));
+    }
+    let remote = list_attachments();
+    assert_eq!(
+        list_items(&remote, "independent attachment preserved")[0]["version"],
+        6
+    );
+    let page = cfg.run_json(&["page", "get", page_id, "--show-body"]);
+    assert!(
+        string_field(
+            first_item(&page, "body after rejected overwrite"),
+            "body_storage"
+        )
+        .contains("A --> Revised")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_mermaid_records_a_source_change_with_identical_png_bytes() {
+    with_mermaid_simulator(simulated_cloud_config, verify_mermaid_equal_png_source_edit).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_center_mermaid_records_a_source_change_with_identical_png_bytes() {
+    with_mermaid_simulator(
+        simulated_data_center_config,
+        verify_mermaid_equal_png_source_edit,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+fn verify_mermaid_equal_png_source_edit(
+    cfg: E2eConfig,
+    _simulator: ConfluenceSimulator,
+    temp: &TempDir,
+) {
+    let page = temp.path().join("mermaid-comment");
+    fs::create_dir(&page).unwrap();
+    let path = page.to_str().unwrap();
+    let index = page.join("index.md");
+    let source = "\
+---\ntitle: Mermaid source comment\ntype: page\nproperties:\n  space_key: TEST\n  confluence-cli.render-mermaid: true\n---\n\
+\n~~~mermaid\nflowchart LR\nA --> B\n~~~\n";
+    fs::write(&index, source).unwrap();
+    let applied = cfg.run_json(&["apply", path]);
+    let items = list_items(&applied, "first publish");
+    let page_id = string_field(&items[0], "content_id");
+    let attachment_id = string_field(&items[1], "content_id");
+    let list_attachments = || cfg.run_json(&["attachment", "list", page_id]);
+    let before = list_attachments();
+    let before = &list_items(&before, "original image")[0];
+    assert_eq!(before["version"], 1);
+    let download = |name| {
+        let image = temp.path().join(name);
+        cfg.run_json(&[
+            "attachment",
+            "download",
+            page_id,
+            attachment_id,
+            image.to_str().unwrap(),
+        ]);
+        fs::read(image).unwrap()
+    };
+    let old_image = download("before.png");
+
+    let edited = fs::read_to_string(&index)
+        .unwrap()
+        .replace("A --> B", "%% Maintainer note\nA --> B");
+    fs::write(&index, edited).unwrap();
+    let preview = cfg.run_json(&["plan", path, "--check-remote"]);
+    let items = list_items(&preview, "source-only edit plan");
+    assert_eq!(items.len(), 2, "{preview}");
+    assert_eq!(items[1]["action"], "upload_attachment");
+    let applied = cfg.run_json(&["apply", path]);
+    let items = list_items(&applied, "source-only edit apply");
+    assert_eq!(items.len(), 2, "{applied}");
+    assert_eq!(items[0]["action"], "upload_attachment");
+    assert_eq!(items[0]["content_id"], attachment_id);
+    assert_eq!(items[1]["action"], "update_content");
+    let after = list_attachments();
+    let after = &list_items(&after, "image with current source metadata")[0];
+    assert_eq!(after["version"], 2);
+    assert_ne!(after["comment"], before["comment"]);
+    assert_eq!(old_image, download("after.png"));
+
+    let snapshot = temp.path().join("source-comment-pull");
+    let snapshot_arg = snapshot.to_str().unwrap();
+    cfg.run_json(&["pull", "page", page_id, snapshot_arg]);
+    let text = fs::read_to_string(find_index_md(&snapshot)).unwrap();
+    assert!(
+        text.contains("~~~mermaid\nflowchart LR\n%% Maintainer note\nA --> B\n~~~"),
+        "{text}"
+    );
+    let mut without_renderer = cfg;
+    without_renderer.envs.push(("PATH".into(), String::new()));
+    let unchanged = without_renderer.run_json(&["plan", snapshot_arg, "--check-remote"]);
+    assert_eq!(
+        list_items(&unchanged, "plan without renderer after pull")[0]["action"],
+        "noop"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cloud_ci_state_publishes_from_clean_checkouts_and_preserves_remote_edits() {
     test_ci_state(simulated_cloud_config).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cloud_mermaid_publishes_from_clean_ci_checkouts() {
+    with_mermaid_simulator(simulated_cloud_config, verify_mermaid_ci_state).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_center_mermaid_publishes_from_clean_ci_checkouts() {
+    with_mermaid_simulator(simulated_data_center_config, verify_mermaid_ci_state).await;
+}
+
+#[cfg(unix)]
+fn verify_mermaid_ci_state(cfg: E2eConfig, simulator: ConfluenceSimulator, temp: &TempDir) {
+    let committed = "\
+---\ntitle: Mermaid CI\ntype: page\nproperties:\n  space_key: TEST\n  confluence-cli.render-mermaid: true\n---\n\
+\n~~~mermaid\nflowchart LR\nA --> B\n~~~\n";
+    let checkout = |name: &str, source: &str| {
+        let path = temp.path().join(name);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("index.md"), source).unwrap();
+        path
+    };
+    let state = temp.path().join("mermaid-ci.json");
+    let state_arg = state.to_str().unwrap();
+    let first = checkout("first", committed);
+    let applied = cfg.run_json(&[
+        "apply",
+        first.to_str().unwrap(),
+        "--state-file",
+        state_arg,
+        "--init-state",
+    ]);
+    let items = list_items(&applied, "first Mermaid CI apply");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["action"], "create_content");
+    assert_eq!(items[1]["action"], "upload_attachment");
+    let page_id = string_field(&items[0], "content_id");
+    let attachment_id = string_field(&items[1], "content_id");
+    let attachment_name = string_field(&items[1], "title");
+
+    let mut without_renderer = cfg.clone();
+    without_renderer.envs.push(("PATH".into(), String::new()));
+    let unchanged = checkout("unchanged", committed);
+    let unchanged_arg = unchanged.to_str().unwrap();
+    let baseline = fs::read(&state).unwrap();
+    let plan = without_renderer.run_json(&[
+        "plan",
+        unchanged_arg,
+        "--check-remote",
+        "--state-file",
+        state_arg,
+    ]);
+    assert_eq!(list_items(&plan, "unchanged CI plan")[0]["action"], "noop");
+    assert_eq!(fs::read(&state).unwrap(), baseline);
+    assert!(!unchanged.join(".confluence.json").exists());
+    assert!(!unchanged.join("attachments").exists());
+    let applied = without_renderer.run_json(&["apply", unchanged_arg, "--state-file", state_arg]);
+    assert_eq!(
+        list_items(&applied, "unchanged CI apply")[0]["action"],
+        "noop"
+    );
+
+    let revised = checkout("revised", &committed.replace("A --> B", "A --> C"));
+    let revised_arg = revised.to_str().unwrap();
+    let missing_renderer = without_renderer
+        .command()
+        .args(["plan", revised_arg, "--state-file", state_arg])
+        .output()
+        .unwrap();
+    assert!(!missing_renderer.status.success(), "{missing_renderer:?}");
+    assert!(String::from_utf8_lossy(&missing_renderer.stderr).contains("run mmdc"));
+
+    simulator.corrupt_next_attachment_upload_response(attachment_name);
+    let failed = cfg
+        .command()
+        .args(["apply", revised_arg, "--state-file", state_arg])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success(), "{failed:?}");
+    let interrupted_state = fs::read(&state).unwrap();
+    let pending: Value = serde_json::from_slice(&interrupted_state).unwrap();
+    assert_eq!(pending["pending"], true);
+    assert_eq!(
+        pending["pages"]["index.md"]["sidecar"]["content_id"],
+        page_id
+    );
+    let retried = cfg
+        .command()
+        .args(["apply", revised_arg, "--state-file", state_arg])
+        .output()
+        .unwrap();
+    assert_eq!(retried.status.code(), Some(7), "{retried:?}");
+    assert!(String::from_utf8_lossy(&retried.stderr).contains("unfinished apply"));
+    let attachments = cfg.run_json(&["attachment", "list", page_id]);
+    let attachments = list_items(&attachments, "attachments after CI interruption");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0]["id"], attachment_id);
+    assert_eq!(attachments[0]["version"], 2);
+
+    let recovered = temp.path().join("reconciled");
+    let recovered_arg = recovered.to_str().unwrap();
+    cfg.run_json(&["pull", "page", page_id, recovered_arg]);
+    let index = find_index_md(&recovered);
+    let pulled = fs::read_to_string(&index).unwrap();
+    assert!(pulled.contains("A --> B"), "{pulled}");
+    fs::write(&index, pulled.replace("A --> B", "A --> C")).unwrap();
+    let replacement = temp.path().join("reconciled.json");
+    let applied = cfg.run_json(&[
+        "apply",
+        recovered_arg,
+        "--state-file",
+        replacement.to_str().unwrap(),
+        "--init-state",
+    ]);
+    let items = list_items(&applied, "reconciled Mermaid CI apply");
+    assert_eq!(items.len(), 1, "{applied}");
+    assert_eq!(items[0]["action"], "update_content");
+    assert_eq!(items[0]["content_id"], page_id);
+    let attachments = cfg.run_json(&["attachment", "list", page_id]);
+    let attachments = list_items(&attachments, "reconciled Mermaid attachments");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0]["id"], attachment_id);
+    assert_eq!(attachments[0]["version"], 2);
+    let snapshot = temp.path().join("reconciled-pull");
+    cfg.run_json(&["pull", "page", page_id, snapshot.to_str().unwrap()]);
+    let pulled = fs::read_to_string(find_index_md(&snapshot)).unwrap();
+    assert!(
+        pulled.contains("~~~mermaid\nflowchart LR\nA --> C\n~~~"),
+        "{pulled}"
+    );
+    assert_eq!(fs::read(&state).unwrap(), interrupted_state);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

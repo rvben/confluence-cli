@@ -30,6 +30,7 @@ use crate::markdown::{
     parse_user_placeholder_url, rewrite_outside_cdata, rewrite_outside_literal_sections,
     save_document, scan_local_documents, sha256_hex, split_target_fragment, storage_to_markdown,
 };
+use crate::mermaid;
 use crate::model::{
     AttachmentState, ContentItem, ContentKind, PlanActionKind, PlanItem, SyncPlan, UserReference,
 };
@@ -222,7 +223,15 @@ pub fn plan_path(
     show_diff: bool,
 ) -> Result<SyncPlan> {
     let docs = load_required_local_documents(root)?;
-    plan_documents(root, &docs, allow_lossy, delete_remote, show_diff)
+    let mermaid = mermaid::Rendered::render(&docs, false)?;
+    plan_documents(
+        root,
+        &docs,
+        allow_lossy,
+        delete_remote,
+        show_diff,
+        Some(&mermaid),
+    )
 }
 
 fn plan_documents(
@@ -231,6 +240,7 @@ fn plan_documents(
     allow_lossy: bool,
     delete_remote: bool,
     show_diff: bool,
+    mermaid: Option<&mermaid::Rendered>,
 ) -> Result<SyncPlan> {
     let parent_ids = document_ids(docs);
     let link_index = LinkIndex::for_sync(docs, None);
@@ -259,6 +269,10 @@ fn plan_documents(
             let body_is_changed = body_changed(&doc.sidecar, &current_hash, &storage_hash);
             if body_is_changed {
                 changes.push("body");
+            } else if doc.sidecar.mermaid_pending.is_some()
+                || mermaid.is_some_and(|rendered| rendered.images_changed(doc))
+            {
+                changes.push("Mermaid images");
             }
             if doc.sidecar.last_pulled_hash.as_deref() != Some(current_hash.as_str())
                 && doc.sidecar.storage_hash.as_deref() != Some(storage_hash.as_str())
@@ -344,20 +358,28 @@ fn plan_documents(
             }
         }
 
-        let local_attachments = local_attachment_hashes(&doc.directory)?;
+        let local_attachments = attachment_hashes(doc, mermaid)?;
         let known = doc.sidecar.attachment_map.clone();
         for (file_name, hash) in &local_attachments {
-            if known
+            let bytes_match = known
                 .get(file_name)
                 .and_then(|attachment| attachment.sha256.as_deref())
-                != Some(hash.as_str())
-            {
+                == Some(hash.as_str());
+            let source_changed = mermaid
+                .and_then(|rendered| rendered.images(doc))
+                .and_then(|images| images.get(file_name))
+                .is_some_and(|image| !image.has_published_source(doc, file_name));
+            if !bytes_match || source_changed {
                 plan.items.push(PlanItem {
                     action: PlanActionKind::UploadAttachment,
                     title: file_name.clone(),
                     content_id: doc.sidecar.content_id.clone(),
                     path: doc.directory.join("attachments").join(file_name),
-                    details: "new or changed local attachment".to_string(),
+                    details: if bytes_match {
+                        "Mermaid source changed with identical PNG bytes".to_string()
+                    } else {
+                        "new or changed local attachment".to_string()
+                    },
                     diff: None,
                 });
             }
@@ -498,6 +520,7 @@ pub(crate) struct PublishOptions {
     pub allow_lossy: bool,
     pub delete_remote: bool,
     pub force: bool,
+    pub refresh_mermaid: bool,
 }
 
 pub(crate) async fn preview_path(
@@ -512,26 +535,27 @@ pub(crate) async fn preview_path(
         let mut state = PublishState::read_for_preview(&state_path(root, path)?)?;
         state.restore(root, &mut docs, provider)?;
     }
-    let plan = plan_documents(
+    let mermaid = mermaid::Rendered::render(&docs, options.refresh_mermaid || options.force)?;
+    if let Some(provider) = provider {
+        let links = LinkIndex::for_sync(&docs, Some(provider_site_fingerprint(provider)));
+        preflight(provider, &mut docs, &links, options, &mermaid).await?;
+    }
+    plan_documents(
         root,
         &docs,
         options.allow_lossy,
         options.delete_remote,
         show_diff,
-    )?;
-    if let Some(provider) = provider {
-        docs.sort_by_key(|doc| doc.directory.components().count());
-        let links = LinkIndex::for_sync(&docs, Some(provider_site_fingerprint(provider)));
-        preflight(provider, &docs, &links, options).await?;
-    }
-    Ok(plan)
+        Some(&mermaid),
+    )
 }
 
 async fn preflight(
     provider: &dyn ConfluenceProvider,
-    docs: &[LocalDocument],
+    docs: &mut [LocalDocument],
     link_index: &LinkIndex,
     options: PublishOptions,
+    mermaid: &mermaid::Rendered,
 ) -> Result<BTreeMap<String, ContentItem>> {
     let web_path_prefix = provider.web_path_prefix();
     let parent_ids = document_ids(docs);
@@ -545,27 +569,39 @@ async fn preflight(
             web_path_prefix.as_str(),
         )?;
         publish_parent_id(doc, &parent_ids)?;
-        local_attachment_hashes(&doc.directory)?;
-        if let Some(content_id) = &doc.sidecar.content_id {
+        let attachments = attachment_hashes(doc, Some(mermaid))?;
+        if let Some(content_id) = doc.sidecar.content_id.clone() {
+            if (mermaid::enabled(doc) || doc.sidecar.mermaid_pending.is_some())
+                && let Some(site) = &doc.sidecar.site_fingerprint
+                && link_index.active_site.as_ref() != Some(site)
+            {
+                return Err(crate::output::typed_error_with_hint(
+                    crate::output::ErrorKind::Conflict,
+                    format!(
+                        "Mermaid document {} belongs to a different Confluence site",
+                        doc.directory.display()
+                    ),
+                    "select the original Confluence profile or pull a fresh snapshot from the target site",
+                ));
+            }
             let remote = provider
-                .get_content(doc.frontmatter.content_kind(), content_id, false)
+                .get_content(doc.frontmatter.content_kind(), &content_id, false)
                 .await?;
             if !options.force {
                 if doc.sidecar.remote_version != remote.version {
-                    return Err(remote_drift_error(doc, content_id, remote.version));
+                    return Err(remote_drift_error(doc, &content_id, remote.version));
                 }
                 let metadata_drift = remote_metadata_drift(doc, &remote);
                 if !metadata_drift.is_empty() {
                     return Err(remote_metadata_drift_error(
                         doc,
-                        content_id,
+                        &content_id,
                         &metadata_drift,
                     ));
                 }
-                validate_remote_attachment_drift(provider, doc, content_id, options.delete_remote)
-                    .await?;
             }
-            preflight_remotes.insert(content_id.clone(), remote);
+            preflight_remote_attachments(provider, doc, &content_id, &attachments, options).await?;
+            preflight_remotes.insert(content_id, remote);
         } else {
             let has_space = doc.sidecar.space_key.is_some()
                 || doc
@@ -609,15 +645,19 @@ pub(crate) async fn apply_path(
         }
         None => None,
     };
+    let mermaid = mermaid::Rendered::render(&docs, options.refresh_mermaid || options.force)?;
     docs.sort_by_key(|doc| doc.directory.components().count());
-    let mut link_index = LinkIndex::for_sync(&docs, Some(site));
+    let local_checkpoint_site = state_file.is_none().then_some(site.as_str());
+    let mut link_index = LinkIndex::for_sync(&docs, Some(site.clone()));
     let web_path_prefix = provider.web_path_prefix();
     let PublishOptions {
         allow_lossy,
         delete_remote,
         force,
+        ..
     } = options;
-    let mut preflight_remotes = preflight(provider, &docs, &link_index, options).await?;
+    let mut preflight_remotes =
+        preflight(provider, &mut docs, &link_index, options, &mermaid).await?;
 
     if let (Some(path), Some(state)) = (&state_file, &mut state) {
         state.capture(root, &docs);
@@ -644,52 +684,15 @@ pub(crate) async fn apply_path(
         let kind = doc.frontmatter.content_kind();
         let title = doc.frontmatter.title.clone();
 
-        let mut body_published = true;
-        let content = if let Some(content_id) = doc.sidecar.content_id.clone() {
-            let remote = preflight_remotes.remove(&content_id).ok_or_else(|| {
+        let is_new = doc.sidecar.content_id.is_none();
+        let defer_body = is_new && mermaid.images(doc).is_some();
+        let mut content = if let Some(content_id) = doc.sidecar.content_id.clone() {
+            preflight_remotes.remove(&content_id).ok_or_else(|| {
                 crate::output::typed_error(
                     crate::output::ErrorKind::Unexpected,
                     format!("missing preflight state for remote content {content_id}"),
                 )
-            })?;
-            let needs_update = body_changed(&doc.sidecar, &markdown_hash, &storage_hash)
-                || doc.sidecar.remote_parent_id != derived_parent_id
-                || metadata_needs_update(doc, &remote);
-            if needs_update {
-                let version = remote.version.ok_or_else(|| {
-                    crate::output::typed_error(
-                        crate::output::ErrorKind::Api,
-                        format!("remote content {content_id} has no version"),
-                    )
-                })?;
-                let updated = provider
-                    .update_content(&crate::model::UpdateContentRequest {
-                        id: content_id.clone(),
-                        kind,
-                        title: title.clone(),
-                        parent_id: derived_parent_id.clone(),
-                        body_storage: body_storage.clone(),
-                        version,
-                        message: Some("Updated via confluence-cli".to_string()),
-                        status: desired_status(&doc.frontmatter.status).to_string(),
-                        labels: doc.frontmatter.labels.clone(),
-                        properties: doc.frontmatter.properties.clone(),
-                    })
-                    .await
-                    .map_err(|error| partial_apply_error(error, &applied))?;
-                applied.items.push(PlanItem {
-                    action: PlanActionKind::UpdateContent,
-                    title: title.clone(),
-                    content_id: Some(updated.id.clone()),
-                    path: doc.directory.clone(),
-                    details: "remote content updated".to_string(),
-                    diff: None,
-                });
-                updated
-            } else {
-                body_published = false;
-                remote
-            }
+            })?
         } else {
             let space_key = space_key.clone().ok_or_else(|| {
                 anyhow!(
@@ -711,7 +714,11 @@ pub(crate) async fn apply_path(
                     title: title.clone(),
                     space: space_key.clone(),
                     parent_id: derived_parent_id.clone(),
-                    body_storage: body_storage.clone(),
+                    body_storage: if defer_body {
+                        String::new()
+                    } else {
+                        body_storage.clone()
+                    },
                     status: desired_status(&doc.frontmatter.status).to_string(),
                     labels: doc.frontmatter.labels.clone(),
                     properties: create_properties,
@@ -731,16 +738,100 @@ pub(crate) async fn apply_path(
                     .record_creation(root, path, doc, &created)
                     .map_err(|error| partial_apply_error(error, &applied))?;
             }
+            if defer_body && let Some(site) = local_checkpoint_site {
+                // Keep the created page's identity if an upload or the final
+                // body write fails. The next apply can finish this page.
+                doc.sidecar.content_id = Some(created.id.clone());
+                doc.sidecar.space_key = created.space_key.clone().or(Some(space_key));
+                doc.sidecar.provider = Some(provider.kind());
+                doc.sidecar.web_path_prefix = Some(web_path_prefix.clone());
+                doc.sidecar.site_fingerprint = Some(site.to_string());
+                doc.sidecar.remote_version = created.version;
+                doc.sidecar.remote_parent_id = created.parent_id.clone();
+                doc.sidecar.mermaid_pending = Some(mermaid.pending_publish(doc, None));
+                save_document(doc).map_err(|error| partial_apply_error(error, &applied))?;
+            }
             created
         };
+
+        // The editor resolves image references when the body is saved.
+        // Upload new and changed images before writing storage that uses them.
+        let images_changed = mermaid.images_changed(doc);
+        let images_uploaded = upload_mermaid_images(
+            provider,
+            doc,
+            &content.id,
+            &mermaid,
+            local_checkpoint_site,
+            force,
+            &mut applied,
+        )
+        .await
+        .map_err(|error| partial_apply_error(error, &applied))?;
+        let needs_update = defer_body
+            || (!is_new
+                && (body_changed(&doc.sidecar, &markdown_hash, &storage_hash)
+                    || doc.sidecar.remote_parent_id != derived_parent_id
+                    || images_uploaded
+                    || images_changed
+                    || doc.sidecar.mermaid_pending.is_some()
+                    || metadata_needs_update(doc, &content)));
+        if needs_update {
+            let version = content.version.ok_or_else(|| {
+                crate::output::typed_error(
+                    crate::output::ErrorKind::Api,
+                    format!("remote content {} has no version", content.id),
+                )
+            })?;
+            content = provider
+                .update_content(&crate::model::UpdateContentRequest {
+                    id: content.id.clone(),
+                    kind,
+                    title: title.clone(),
+                    parent_id: if defer_body {
+                        content.parent_id.clone()
+                    } else {
+                        derived_parent_id.clone()
+                    },
+                    body_storage,
+                    version,
+                    message: Some("Updated via confluence-cli".to_string()),
+                    status: desired_status(&doc.frontmatter.status).to_string(),
+                    labels: doc.frontmatter.labels.clone(),
+                    properties: doc.frontmatter.properties.clone(),
+                })
+                .await
+                .map_err(|error| partial_apply_error(error, &applied))?;
+            if !is_new {
+                applied.items.push(PlanItem {
+                    action: PlanActionKind::UpdateContent,
+                    title: title.clone(),
+                    content_id: Some(content.id.clone()),
+                    path: doc.directory.clone(),
+                    details: "remote content updated".to_string(),
+                    diff: None,
+                });
+            }
+        }
+        let body_published = is_new || needs_update;
 
         doc.sidecar.content_id = Some(content.id.clone());
         parent_ids.insert(doc.directory.clone(), content.id.clone());
         link_index.set_content_id(&doc.directory, &content.id);
-        sync_attachments(provider, doc, &content.id, delete_remote, &mut applied)
-            .await
-            .map_err(|error| partial_apply_error(error, &applied))?;
+        sync_attachments(
+            provider,
+            doc,
+            &content.id,
+            delete_remote,
+            &mermaid,
+            &mut applied,
+        )
+        .await
+        .map_err(|error| partial_apply_error(error, &applied))?;
 
+        doc.sidecar.mermaid_attachments = mermaid.names(doc);
+        doc.sidecar.mermaid_rendered_sources = mermaid.sources(doc);
+        doc.sidecar.mermaid_pending = None;
         doc.sidecar.provider = Some(provider.kind());
         doc.sidecar.web_path_prefix = Some(web_path_prefix.clone());
         doc.sidecar.space_key = content.space_key.clone().or(space_key);
@@ -865,18 +956,59 @@ fn remote_metadata_drift_error(
     )
 }
 
-async fn validate_remote_attachment_drift(
+async fn preflight_remote_attachments(
     provider: &dyn ConfluenceProvider,
-    doc: &LocalDocument,
+    doc: &mut LocalDocument,
     content_id: &str,
-    delete_remote: bool,
+    local: &BTreeMap<String, String>,
+    options: PublishOptions,
 ) -> Result<()> {
-    let local = local_attachment_hashes(&doc.directory)?;
+    if options.force
+        && doc
+            .sidecar
+            .mermaid_pending
+            .as_ref()
+            .is_none_or(|pending| pending.upload.is_none())
+    {
+        return Ok(());
+    }
     let remote = provider.list_attachments(content_id).await?;
     let remote_by_title = remote
         .iter()
         .map(|attachment| (attachment.title.as_str(), attachment))
         .collect::<BTreeMap<_, _>>();
+
+    if let Some(pending) = doc.sidecar.mermaid_pending.as_mut()
+        && let Some(upload) = pending.upload.take()
+        && let Some(current) = remote_by_title.get(upload.name.as_str())
+    {
+        let bytes = provider
+            .download_attachment(content_id, &current.id)
+            .await?;
+        let hash = sha256_hex(&bytes);
+        if hash == upload.image_hash
+            && mermaid::source_hash_from_comment(current.comment.as_deref(), &hash)
+                == Some(upload.source_hash.as_str())
+        {
+            doc.sidecar.attachment_map.insert(
+                upload.name.clone(),
+                AttachmentState {
+                    id: current.id.clone(),
+                    file_name: upload.name.clone(),
+                    remote_version: current.version,
+                    media_type: current.media_type.clone(),
+                    sha256: Some(hash),
+                },
+            );
+            doc.sidecar
+                .mermaid_rendered_sources
+                .insert(upload.name, upload.source_hash);
+        }
+    }
+
+    if options.force {
+        return Ok(());
+    }
 
     for (title, previous) in &doc.sidecar.attachment_map {
         let local_hash = local.get(&previous.file_name);
@@ -895,7 +1027,32 @@ async fn validate_remote_attachment_drift(
         }
     }
 
-    if delete_remote {
+    if mermaid::enabled(doc) {
+        for attachment in &remote {
+            if mermaid::generated_name(&attachment.title)
+                && local.contains_key(&attachment.title)
+                && !doc
+                    .directory
+                    .join("attachments")
+                    .join(&attachment.title)
+                    .exists()
+                && !doc.sidecar.attachment_map.contains_key(&attachment.title)
+            {
+                let bytes = provider
+                    .download_attachment(content_id, &attachment.id)
+                    .await?;
+                if local.get(&attachment.title) != Some(&sha256_hex(&bytes)) {
+                    return Err(remote_attachment_drift_error(
+                        doc,
+                        content_id,
+                        &attachment.title,
+                    ));
+                }
+            }
+        }
+    }
+
+    if options.delete_remote {
         for attachment in &remote {
             if !doc.sidecar.attachment_map.contains_key(&attachment.title)
                 && !local.contains_key(&attachment.title)
@@ -1273,7 +1430,7 @@ fn validate_pull_destination(root: &Path, force: bool) -> Result<Vec<LocalDocume
 
     // Missing pulled attachments are local changes even when a normal plan would
     // not schedule remote deletion without --delete-remote.
-    let plan = plan_documents(root, &docs, false, true, false)?;
+    let plan = plan_documents(root, &docs, false, true, false, None)?;
     let mut changes = plan
         .items
         .into_iter()
@@ -1513,15 +1670,35 @@ async fn write_items(
         fs::create_dir_all(&attachments_dir)
             .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
 
+        let storage = item.body_storage.as_deref().unwrap_or_default();
+        let (markdown, generated_images) = if mermaid::enabled_in_properties(&item.properties) {
+            crate::markdown::storage_to_markdown_with_mermaid(storage)
+        } else {
+            (storage_to_markdown(storage), Default::default())
+        };
         let mut attachment_map = BTreeMap::new();
+        let mut mermaid_rendered_sources = BTreeMap::new();
         for attachment in &attachments {
             let file_name = safe_attachment_file_name(&attachment.title)?;
             let attachment_path = attachments_dir.join(file_name);
             let bytes = provider
                 .download_attachment(&item.id, &attachment.id)
                 .await?;
-            fs::write(&attachment_path, &bytes)
-                .with_context(|| format!("failed to write {}", attachment_path.display()))?;
+            let hash = sha256_hex(&bytes);
+            if generated_images
+                .iter()
+                .flatten()
+                .any(|name| name == file_name)
+            {
+                if let Some(source_hash) =
+                    mermaid::source_hash_from_comment(attachment.comment.as_deref(), &hash)
+                {
+                    mermaid_rendered_sources.insert(file_name.to_string(), source_hash.to_string());
+                }
+            } else {
+                fs::write(&attachment_path, &bytes)
+                    .with_context(|| format!("failed to write {}", attachment_path.display()))?;
+            }
             attachment_map.insert(
                 attachment.title.clone(),
                 AttachmentState {
@@ -1529,7 +1706,7 @@ async fn write_items(
                     file_name: attachment.title.clone(),
                     remote_version: attachment.version,
                     media_type: attachment.media_type.clone(),
-                    sha256: Some(sha256_hex(&bytes)),
+                    sha256: Some(hash),
                 },
             );
         }
@@ -1539,6 +1716,9 @@ async fn write_items(
             directory: dir,
             attachments,
             attachment_map,
+            mermaid_attachments: generated_images,
+            mermaid_rendered_sources,
+            markdown,
             markdown_linking_all: String::new(),
         };
         item.markdown_linking_all = item.markdown(&paths, item_map);
@@ -1608,6 +1788,9 @@ struct PulledItem<'a> {
     directory: &'a Path,
     attachments: Vec<crate::model::AttachmentInfo>,
     attachment_map: BTreeMap<String, AttachmentState>,
+    mermaid_attachments: Vec<Option<String>>,
+    mermaid_rendered_sources: BTreeMap<String, String>,
+    markdown: String,
     /// The item's Markdown with links to every page of the pull, which is
     /// what is written unless a page is left out.
     markdown_linking_all: String,
@@ -1621,10 +1804,9 @@ impl PulledItem<'_> {
         link_paths: &BTreeMap<String, PathBuf>,
         item_map: &BTreeMap<String, ContentItem>,
     ) -> String {
-        let mut markdown =
-            storage_to_markdown(self.item.body_storage.as_deref().unwrap_or_default());
-        markdown = rewrite_page_links(&markdown, self.directory, link_paths, item_map);
-        markdown = rewrite_macro_page_placeholders(&markdown, self.directory, link_paths, item_map);
+        let markdown = rewrite_page_links(&self.markdown, self.directory, link_paths, item_map);
+        let markdown =
+            rewrite_macro_page_placeholders(&markdown, self.directory, link_paths, item_map);
         rewrite_attachment_links(&markdown, &self.item.id, &self.attachments)
     }
 
@@ -1665,6 +1847,9 @@ impl PulledItem<'_> {
                 item.body_storage.as_deref().unwrap_or_default().as_bytes(),
             )),
             attachment_map: self.attachment_map.clone(),
+            mermaid_attachments: self.mermaid_attachments.clone(),
+            mermaid_rendered_sources: self.mermaid_rendered_sources.clone(),
+            mermaid_pending: None,
             last_pulled_title: Some(item.title.clone()),
             last_pulled_labels: item.labels.clone(),
             last_pulled_status: Some(item.status.clone()),
@@ -2265,11 +2450,13 @@ fn render_storage_of_body(
     let rewritten_markdown =
         rewrite_macro_page_references(&doc.body_markdown, &doc.directory, &resolver);
     resolver.check()?;
-    let converted = crate::markdown::markdown_to_storage_in_file(
-        &rewritten_markdown,
-        allow_lossy,
-        lines_before,
-    )?;
+    let projected = if mermaid::enabled(doc) {
+        crate::markdown::project_mermaid(&rewritten_markdown, doc)?
+    } else {
+        Cow::Borrowed(rewritten_markdown.as_str())
+    };
+    let converted =
+        crate::markdown::markdown_to_storage_in_file(&projected, allow_lossy, lines_before)?;
     let storage = rewrite_local_links_to_remote(
         &converted.storage,
         &doc.directory,
@@ -2292,7 +2479,12 @@ fn unvalidated_storage_of_body(
     let rewritten_markdown =
         rewrite_macro_page_references(&doc.body_markdown, &doc.directory, &resolver);
     resolver.check()?;
-    let converted = crate::markdown::render_markdown_storage(&rewritten_markdown, false)?;
+    let projected = if mermaid::enabled(doc) {
+        crate::markdown::project_mermaid(&rewritten_markdown, doc)?
+    } else {
+        Cow::Borrowed(rewritten_markdown.as_str())
+    };
+    let converted = crate::markdown::render_markdown_storage(&projected, false)?;
     let storage = rewrite_local_links_to_remote(
         &converted.storage,
         &doc.directory,
@@ -2306,7 +2498,7 @@ fn unvalidated_storage_of_body(
 /// The number of lines of `file` that precede the first line of `body`, when
 /// the file ends with that body. The body is read with a line feed alone at
 /// the end of each line, whichever way the file ends its lines.
-fn lines_before_body(file: &str, body: &str) -> Option<usize> {
+pub(crate) fn lines_before_body(file: &str, body: &str) -> Option<usize> {
     let file = crate::markdown::unix_line_endings(file);
     let before = file.trim_end().strip_suffix(body.trim())?;
     let leading = &body[..body.len() - body.trim_start().len()];
@@ -3574,6 +3766,52 @@ fn escape_xml_attr(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn attachment_hashes(
+    doc: &LocalDocument,
+    rendered: Option<&mermaid::Rendered>,
+) -> Result<BTreeMap<String, String>> {
+    let mut hashes = local_attachment_hashes(&doc.directory)?;
+    if !mermaid::enabled(doc) {
+        return Ok(hashes);
+    }
+    if let Some(rendered) = rendered {
+        if let Some(images) = rendered.images(doc) {
+            for (name, image) in images {
+                ensure_mermaid_name_available(doc, &hashes, name)?;
+                hashes.insert(name.clone(), image.hash.clone());
+            }
+        }
+    } else {
+        // Checking a pull destination uses the captured hashes of its derived
+        // images. The source Markdown is checked independently.
+        for diagram in crate::markdown::publishable_mermaid_diagrams(&doc.body_markdown, doc)? {
+            ensure_mermaid_name_available(doc, &hashes, &diagram.filename)?;
+            if let Some(hash) = doc
+                .sidecar
+                .attachment_map
+                .get(&diagram.filename)
+                .and_then(|attachment| attachment.sha256.clone())
+            {
+                hashes.insert(diagram.filename, hash);
+            }
+        }
+    }
+    Ok(hashes)
+}
+
+fn ensure_mermaid_name_available(
+    doc: &LocalDocument,
+    hashes: &BTreeMap<String, String>,
+    name: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        !hashes.contains_key(name),
+        "{}: attachment {name} conflicts with a generated Mermaid image",
+        doc.markdown_path.display()
+    );
+    Ok(())
+}
+
 fn local_attachment_hashes(doc_dir: &Path) -> Result<BTreeMap<String, String>> {
     let attachments_dir = doc_dir.join("attachments");
     if !attachments_dir.exists() {
@@ -3611,17 +3849,122 @@ fn local_attachment_hashes(doc_dir: &Path) -> Result<BTreeMap<String, String>> {
     Ok(hashes)
 }
 
+async fn upload_mermaid_images(
+    provider: &dyn ConfluenceProvider,
+    doc: &mut LocalDocument,
+    content_id: &str,
+    mermaid: &mermaid::Rendered,
+    checkpoint_site: Option<&str>,
+    force: bool,
+    applied: &mut SyncPlan,
+) -> Result<bool> {
+    let Some(images) = mermaid.images(doc) else {
+        return Ok(false);
+    };
+    let mut staged = images
+        .iter()
+        .filter_map(|(name, image)| Some((name, image, image.path.as_deref()?)))
+        .peekable();
+    if staged.peek().is_none() {
+        return Ok(false);
+    }
+    let remote = provider.list_attachments(content_id).await?;
+    let mut uploaded = false;
+    for (name, image, source) in staged {
+        let comment = image.comment();
+        if let Some(existing) = remote.iter().find(|item| item.title == *name) {
+            let bytes = provider
+                .download_attachment(content_id, &existing.id)
+                .await?;
+            let hash = sha256_hex(&bytes);
+            if hash == image.hash
+                && (image.has_published_source(doc, name)
+                    || existing.comment.as_deref() == Some(comment.as_str()))
+            {
+                continue;
+            }
+            if !force
+                && doc.sidecar.attachment_map.get(name).is_none_or(|previous| {
+                    previous.sha256.as_deref().is_some_and(|base| base != hash)
+                })
+            {
+                return Err(remote_attachment_drift_error(doc, content_id, name));
+            }
+        }
+        if let Some(site) = checkpoint_site {
+            doc.sidecar.site_fingerprint = Some(site.to_string());
+            doc.sidecar.mermaid_pending = Some(mermaid.pending_publish(
+                doc,
+                Some(mermaid::PendingUpload {
+                    name: name.clone(),
+                    source_hash: image.source_hash.clone(),
+                    image_hash: image.hash.clone(),
+                }),
+            ));
+            crate::markdown::save_sidecar(doc)?;
+        }
+        let attachment =
+            upload_sync_attachment(provider, doc, content_id, name, source, &comment, applied)
+                .await?;
+        if checkpoint_site.is_some() {
+            doc.sidecar.attachment_map.insert(
+                name.clone(),
+                AttachmentState {
+                    id: attachment.id,
+                    file_name: name.clone(),
+                    remote_version: attachment.version,
+                    media_type: attachment.media_type,
+                    sha256: Some(image.hash.clone()),
+                },
+            );
+            doc.sidecar
+                .mermaid_rendered_sources
+                .insert(name.clone(), image.source_hash.clone());
+            if let Some(pending) = doc.sidecar.mermaid_pending.as_mut() {
+                pending.upload = None;
+            }
+            crate::markdown::save_sidecar(doc)?;
+        }
+        uploaded = true;
+    }
+    Ok(uploaded)
+}
+
+async fn upload_sync_attachment(
+    provider: &dyn ConfluenceProvider,
+    doc: &LocalDocument,
+    content_id: &str,
+    name: &str,
+    source: &Path,
+    comment: &str,
+    applied: &mut SyncPlan,
+) -> Result<crate::model::AttachmentInfo> {
+    let uploaded = provider
+        .upload_attachment(content_id, source, Some(comment), true, false)
+        .await?;
+    applied.items.push(PlanItem {
+        action: PlanActionKind::UploadAttachment,
+        title: name.to_string(),
+        content_id: Some(uploaded.id.clone()),
+        path: doc.directory.join("attachments").join(name),
+        details: "attachment uploaded or replaced".to_string(),
+        diff: None,
+    });
+    Ok(uploaded)
+}
+
 async fn sync_attachments(
     provider: &dyn ConfluenceProvider,
     doc: &mut LocalDocument,
     content_id: &str,
     delete_remote: bool,
+    mermaid: &mermaid::Rendered,
     applied: &mut SyncPlan,
 ) -> Result<()> {
     let attachments_dir = doc.directory.join("attachments");
     fs::create_dir_all(&attachments_dir)
         .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
-    let local_hashes = local_attachment_hashes(&doc.directory)?;
+    let local_hashes = attachment_hashes(doc, Some(mermaid))?;
     let current_remote = provider.list_attachments(content_id).await?;
 
     for (file_name, hash) in &local_hashes {
@@ -3638,23 +3981,24 @@ async fn sync_attachments(
             None
         };
         if remote_hash.as_deref() != Some(hash.as_str()) {
-            let uploaded = provider
-                .upload_attachment(
-                    content_id,
-                    &attachments_dir.join(file_name),
-                    Some("Uploaded via confluence-cli"),
-                    true,
-                    false,
-                )
-                .await?;
-            applied.items.push(PlanItem {
-                action: PlanActionKind::UploadAttachment,
-                title: file_name.clone(),
-                content_id: Some(uploaded.id.clone()),
-                path: attachments_dir.join(file_name),
-                details: "attachment uploaded or replaced".to_string(),
-                diff: None,
-            });
+            // Generated images have already been uploaded before the body
+            // write. A mismatch means the remote attachment changed since.
+            if mermaid
+                .images(doc)
+                .is_some_and(|images| images.contains_key(file_name))
+            {
+                return Err(remote_attachment_drift_error(doc, content_id, file_name));
+            }
+            upload_sync_attachment(
+                provider,
+                doc,
+                content_id,
+                file_name,
+                &attachments_dir.join(file_name),
+                "Uploaded via confluence-cli",
+                applied,
+            )
+            .await?;
         }
     }
 

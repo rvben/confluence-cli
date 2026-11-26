@@ -238,6 +238,12 @@ The Markdown frontmatter contains editable metadata such as `title`, `type`, `la
 
 The sidecar records remote IDs, versions, hashes, and attachment mappings. It is the baseline that makes offline planning and drift detection possible.
 
+Put screenshots and photos in the page's `attachments/` folder and reference them with standard Markdown, such as `![Order confirmation](attachments/confirmation.png)`.
+
+### Mermaid diagrams
+
+Use top-level `mermaid` fences and set `confluence-cli.render-mermaid: true` in the page's front matter `properties`. With `mmdc` on your PATH, `plan` previews the generated attachments and `apply` publishes them as images. Each image has a collapsed source block so `pull` can restore the original fence. The [Mermaid example](examples/mermaid/README.md) shows the full workflow.
+
 ### Plan
 
 ```bash

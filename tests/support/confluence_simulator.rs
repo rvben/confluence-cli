@@ -63,6 +63,21 @@ impl ConfluenceSimulator {
         self.server.received_requests().await.unwrap().len()
     }
 
+    pub fn fail_next_attachment_upload(&self, name: &str) {
+        self.state.lock().unwrap().attachment_upload_failure = Some(name.to_string());
+    }
+
+    pub fn corrupt_next_attachment_upload_response(&self, name: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .attachment_upload_response_failure = Some(name.to_string());
+    }
+
+    pub async fn received_requests(&self) -> Vec<Request> {
+        self.server.received_requests().await.unwrap()
+    }
+
     pub fn fail_cloud_create_response_after(&self, successful_creates: usize) {
         self.state
             .lock()
@@ -79,6 +94,8 @@ struct SimulatorResponder {
 struct SimulatorState {
     next_id: u64,
     cloud_creates_before_failed_response: Option<usize>,
+    attachment_upload_failure: Option<String>,
+    attachment_upload_response_failure: Option<String>,
     content: BTreeMap<String, SimulatedContent>,
     comments: BTreeMap<String, SimulatedComment>,
     attachments: BTreeMap<String, SimulatedAttachment>,
@@ -100,6 +117,8 @@ impl Default for SimulatorState {
         Self {
             next_id: 0,
             cloud_creates_before_failed_response: None,
+            attachment_upload_failure: None,
+            attachment_upload_response_failure: None,
             content: BTreeMap::from([(homepage.id.clone(), homepage)]),
             comments: BTreeMap::new(),
             attachments: BTreeMap::new(),
@@ -623,6 +642,10 @@ fn upload_attachment(
     let Some(upload) = parse_multipart_upload(request) else {
         return bad_request("multipart request did not contain a file");
     };
+    if state.attachment_upload_failure.as_deref() == Some(upload.file_name.as_str()) {
+        state.attachment_upload_failure = None;
+        return bad_request("simulated attachment upload failure");
+    }
     let replacing = existing_id.is_some();
     let id = if let Some(existing_id) = existing_id {
         existing_id.to_string()
@@ -645,7 +668,13 @@ fn upload_attachment(
         comment: upload.comment,
     };
     let payload = attachment_json(&attachment);
+    let corrupt_response =
+        state.attachment_upload_response_failure.as_deref() == Some(attachment.title.as_str());
     state.attachments.insert(id, attachment);
+    if corrupt_response {
+        state.attachment_upload_response_failure = None;
+        return ResponseTemplate::new(200).set_body_string("invalid upload response");
+    }
     if replacing {
         ResponseTemplate::new(200).set_body_json(payload)
     } else {
@@ -678,10 +707,10 @@ fn parse_multipart_upload(request: &Request) -> Option<MultipartUpload> {
         body = body.strip_suffix(b"\r\n").unwrap_or(body);
         if headers.contains("name=\"file\"") {
             file_name = header_parameter(&headers, "filename");
-            if let Some(value) = headers
-                .lines()
-                .find_map(|line| line.strip_prefix("content-type: "))
-            {
+            if let Some(value) = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("Content-Type").then_some(value)
+            }) {
                 media_type = value.trim().to_string();
             }
             bytes = Some(body.to_vec());
